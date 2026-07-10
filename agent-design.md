@@ -1,8 +1,11 @@
 # Juice Agent Design
 
-Version: 0.1
+Version: 0.1.1
 Status: design document
 Codename: `juice-agent`
+
+Revision 0.1.1 adds named-agent **identity** (`juice-agent @handle`, §7), authored **persona +
+knowledge** injected as a real system prompt (§5c), and durable **cross-task memory** (§5c).
 
 ## 1. Purpose and position
 
@@ -28,6 +31,11 @@ No special agent API exists on the kernel side, and none is needed: the kernel a
 agent. Other agents (e.g. `@chat`) are simply other users; the multi-agent system is emergent,
 mediated by the kernel, never orchestrated by a private protocol.
 
+**One binary, many named agents.** `juice-agent @research` and `juice-agent @triage` launch the same
+binary as two kernel users, each with its own **home** — a directory of config, persona/knowledge,
+and memory (§5c, §7). Being ordinary accounts, they coexist and address one another through the
+kernel. (pi runs processes under an orchestrator; here each agent is a named citizen of one kernel.)
+
 The daemon holds **no model credentials, no API keys, no provider adapters**. pi needs ~34
 provider transports and a normalized event vocabulary because it faces many vendors; `juice-agent`
 faces exactly one interface — the kernel — which validates structure on its behalf.
@@ -38,14 +46,17 @@ pi's load-bearing seam is that the loop lives in a tiny core that knows nothing 
 sessions, or UI, with policy wired around it via interfaces. We keep that seam exactly:
 
 ```text
-cmd/juice-agent/    entrypoint: config, wiring, lifecycle (serve, drain, recovery)
+cmd/juice-agent/    entrypoint: config, wiring, lifecycle (serve, drain, recovery), handle→home resolution
 channel/       task intake surfaces (pi's "front-ends"): replaceable, concurrent
-session/       policy shell (pi's coding-agent layer): persistence, compaction, retries
+session/       policy shell (pi's coding-agent layer): persistence, compaction, retries,
+               system-prompt assembly (persona + knowledge + memory), post-task memory update
 agent/         THE LOOP (pi's agent-core): pure, interface-driven, no I/O imports
 juice/         kernel client: typed HTTP client implementing agent's interfaces
 bench/         experiment suite: quantitative performance measurement
 flows/         end-to-end shell flows against the compiled surface (not Go)
 ```
+
+The 0.1.1 additions (§5c) live in `session/` and `cmd/`; the pure loop is unchanged.
 
 Dependency law, mirroring the kernel's own (`kernel` must not import SQLite/wazero/…):
 
@@ -175,15 +186,11 @@ Decisions / Next Steps / Critical Context), keeping a recent tail verbatim and c
 turn boundaries. The kernel does not report token usage, so the trigger is a configurable byte
 budget — a proxy, chosen for legibility over precision.
 
-**Memory philosophy.** As pi and opencode: legible, no embeddings, no semantic store. Memory is
-(a) the transcript, (b) its lossy compaction summary, and (c) nothing else in v1. Durable
-cross-task memory, if ever added, will be a hand-editable file the operator can read and diff.
-
-**Prompting.** One builder, no per-model variation (there is no "model family" — the kernel is the
-provider). The system context states the agent's role, the decide protocol, budget discipline, and
-the terminal-action contract. Most contract knowledge travels in-band: `decide` receives each
-candidate's canonical description and schemas from the kernel DB, so the prompt does not restate
-the catalog.
+**Within-task memory.** This section covers only the *working* memory of a single task: the
+transcript and its compaction summary. Two other memories — the **authored** persona/knowledge the
+agent is given, and the **learned** cross-task memory it accumulates — are the subject of §5c, which
+also specifies the system prompt that carries them into each task. Both stay legible files in pi's
+spirit (readable, greppable, diffable), not a semantic store.
 
 ## 5b. Stats, ratings, and self-extension
 
@@ -234,6 +241,36 @@ whose execution the harness intercepts rather than dispatching. The core exposes
 table `map[ref]handler`; `reply` is the terminal handler, `publish` the maker handler. Adding an
 agent-native capability is adding a table entry plus a bootstrap registration.
 
+## 5c. Identity, persona, knowledge, and memory
+
+Beyond the per-task working memory of §5, an agent has two durable memories, both **legible files**
+(pi's stance: readable, greppable, correctable), differing only in authorship:
+
+- **Authored** — `persona.md` (tone, standing instructions) and `knowledge.md` (durable domain
+  knowledge, e.g. how Juice works). Human-written.
+- **Learned** — `memory.md`, the agent's own running summary of past tasks.
+
+Both live in the **agent home**, a directory keyed by handle (`<agents_dir>/<handle>/`) that also
+holds `agent.json` and `data/` (transcripts, maker index). `juice-agent @research serve` resolves
+this home, so a differently-behaved agent is a directory, not new code. This splits pi's `AGENTS.md`
+along the authorship seam.
+
+**System prompt.** Before each task the policy layer (`session/`, not the pure loop) assembles one
+`system` message — role line + `persona.md` + `knowledge.md` + `memory.md` digest + the operating
+contract (decide protocol, budget, terminal action) — and prepends it. This is the builder 0.1's §5
+claimed but never wired. One builder, no per-model variation (the kernel is the one provider); the
+catalog isn't restated (decide already gets each candidate's schema/price, §5b carries stats). The
+loop is unchanged — it receives messages and never knows a prompt exists.
+
+**Learned memory.** After a task settles (alongside the rating pass, §5b), one `@sys/llm/chat` call
+summarises what it did and learned into a dated `memory.md` entry; the next task loads `memory.md`
+into the system prompt, so the agent carries history forward. Update is best-effort (never fails the
+task) and lives in `session/`. `memory.md` is byte-bounded (`memory_bytes`): over budget, §5's
+compaction folds the oldest entries into a digest. Representation is a summarised file, not an
+embedding store — the middle path between pi (no automatic memory) and OpenClaw (vectors + wiki);
+escalate to a `@sys/llm/embed` index only if a readable file stops scaling. `memory.enabled=false`
+reverts to pi's strict stance.
+
 ## 6. Channels (intake abstraction)
 
 Where work comes from is a replaceable boundary — pi's "surfaces" seam. A channel converts an
@@ -261,31 +298,44 @@ not architecture. The loop never knows which channel a task came from.
 
 ## 7. Daemon lifecycle and configuration
 
-`juice-agent serve` runs continuously: load config → authenticate (password grant; refresh-token
-rotation; re-login on revocation) → bootstrap (register `@agent/reply` if absent — idempotent,
-like kernel native-action bootstrap) → run startup recovery (mark interrupted tasks) → start
-channels and the worker pool. `SIGTERM`/`SIGINT` drains as `juice serve` does: stop intake, let
-in-flight turns finish, persist, exit. There is no `juice-agent stop`.
+`juice-agent [@handle] serve` runs continuously: resolve the agent home from the handle → load
+config → authenticate as that handle (password grant; refresh-token rotation; re-login on
+revocation) → bootstrap (register `@handle/reply` and `@handle/publish` if absent — idempotent, like
+kernel native-action bootstrap) → load `persona.md` / `knowledge.md` / `memory.md` from the home and
+build the system prompt → run startup recovery (mark interrupted tasks) → start channels and the
+worker pool. Each task settles with the rating pass (§5b) and a best-effort **memory update** (§5c).
+`SIGTERM`/`SIGINT` drains as `juice serve` does: stop intake, let in-flight turns finish, persist,
+exit. There is no `juice-agent stop`.
 
-Config lives in `agent.json` (path from `AGENT_CONFIG`, default `./agent.json`), kernel-style:
-flat keys, safe local defaults when absent, invalid config rejected at startup, no committed
-secrets (the password comes from `AGENT_PASSWORD` or a mode-0600 file):
+Handle comes from the CLI arg (`juice-agent @research serve`), else `AGENT_HANDLE`, else config
+`handle`; the home is `<agents_dir>/<handle>/` (`--home` overrides). Per-agent `agent.json` is read
+from the home, falling back to `AGENT_CONFIG`.
+
+Config is `agent.json` — kernel-style: flat keys, safe defaults, rejected if invalid at startup, no
+committed secrets (password from `AGENT_PASSWORD` or a mode-0600 file). Paths default inside the home:
 
 ```json
 {
   "server_url": "http://localhost:4040",
   "handle": "@agent",
-  "data_dir": "./agent-data",
+  "agents_dir": "./agents",
   "default_budget": 100,
   "max_turns": 32,
   "concurrency": 4,
   "candidate_limit": 24,
   "compact_bytes": 262144,
   "rate_tasks": true,
+  "memory": { "enabled": true, "memory_bytes": 65536 },
+  "persona_file": "persona.md",
+  "knowledge_file": "knowledge.md",
   "maker": { "enabled": true, "min_repeats": 3, "window": 50, "budget": 40 },
   "channels": { "step": { "poll_seconds": 5 }, "http": { "addr": "" }, "cli": {} }
 }
 ```
+
+`persona_file` / `knowledge_file` are resolved relative to the home (absent files are simply
+skipped); transcripts and the maker's index live under `<home>/data/`; `memory.md` under the home.
+`memory.enabled=false` reverts to pi's strict stance (no automatic cross-task memory).
 
 Logging mirrors the kernel: structured lines to stderr, stdout reserved for resource payloads;
 required fields `time level event task_id channel turn action tx_id status duration_ms error`.
@@ -296,7 +346,10 @@ Every turn logs the selection, price, and outcome; the ledger remains the financ
 **Unit (`go test ./...`).** Offline, no kernel, no LLM. `agent` is tested against fake `Decider`/
 `Catalog`/`Runner`/`Transcript` implementations: stop rule, budget refusal, turn cap, steering
 injection, candidate-set merging and eviction, compaction triggering, recovery idempotence.
-`juice` is tested against `httptest` kernels. Every production file has its `_test.go`.
+`session` additionally covers the new 0.1.1 policy: system-prompt assembly (role + persona + knowledge
++ memory digest, with absent files skipped), the post-task memory update and its byte-bounded
+self-compaction, and agent-home / handle resolution. `juice` is tested against `httptest` kernels.
+Every production file has its `_test.go`.
 
 **Flows (`flows/`).** End-to-end shell scripts against the *compiled* surface, exactly as
 `../juice/flows`: a `lib.sh` (start a real `juice serve` on a temp DB, start `juice-agent`, `assert_*`
@@ -325,6 +378,11 @@ flow_task       real task in via http; terminates answered; ISO answer; spend �
 flow_role_law   a step addressed to @agent is picked up, worked, and completed under the role law   [real LLM]
 flow_rating     a dispatched tool call is rated 0/1 after the task, held in the kernel ledger       [real LLM]
 flow_maker      two similar requests trip the repetition trigger (real embeddings)                  [real LLM+embed]
+flow_persona    an agent whose persona.md demands a distinctive marker produces it in the answer    [real LLM]
+flow_named      juice-agent @alice and @bob launch as distinct users; each registers @x/reply;
+                a task addressed to @alice is answered as @alice                                     [real LLM]
+flow_memory     after task 1 an entry lands in memory.md; task 2 (even across restart) loads it,
+                and the memory survives byte-bounded compaction                                      [real LLM]
 ```
 
 Per project law, nothing is committed until unit tests and flows pass.
@@ -359,6 +417,14 @@ discovered, not declared, because a fixed menu would forfeit the platform's cent
 open, priced, rated action space that grows without the agent changing. Channels are an
 abstraction because intake is genuinely undecided and will include Juice-independent surfaces;
 binding the loop to any transport would repeat the mistake the kernel avoided by keeping
-federation out of `Call()`. Finally, the experiment suite exists because this agent will be
+federation out of `Call()`. The experiment suite exists because this agent will be
 developed over time: without a fixed task set and a committed metric series, "better" would be
 anecdote; with them, it is a measurement.
+
+The 0.1.1 additions follow the same discipline. Identity is a *directory* because what distinguishes
+`@research` from `@triage` is data, not code — so a new agent is a new home and the binary stays
+single, and multi-agent composition falls out of the shared-kernel identity model rather than a
+supervisor. Persona and knowledge are *authored files* because tone and priming are what an operator
+should own and version. Learned memory is a *summarised legible file*: the middle path between pi (a
+human transcribes every lesson) and a vector store (recall no one can read), keeping accumulation
+automatic and auditable, with embeddings held in reserve for demonstrated scale.

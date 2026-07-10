@@ -12,8 +12,8 @@ source "$here/lib.sh"
 source "$here/flows_agent.sh"
 
 # Mechanism flows (no LLM) run first and fast; LLM flows (real Ollama) follow.
-ALL=(flow_bootstrap flow_recovery flow_drain
-     flow_task flow_role_law flow_rating flow_maker)
+ALL=(flow_bootstrap flow_recovery flow_drain flow_named
+     flow_task flow_persona flow_rating flow_role_law flow_memory flow_maker)
 
 if [ "$#" -gt 0 ]; then
     RUN=("$@")

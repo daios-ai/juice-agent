@@ -27,20 +27,26 @@ var (
 )
 
 func main() {
-	if len(os.Args) < 2 {
+	args := os.Args[1:]
+	// An optional leading @handle names the agent to launch: `juice-agent @research serve`.
+	handle := ""
+	if len(args) > 0 && strings.HasPrefix(args[0], "@") {
+		handle = args[0]
+		args = args[1:]
+	}
+	if len(args) < 1 {
 		usage()
 		os.Exit(2)
 	}
-	cmd := os.Args[1]
-	args := os.Args[2:]
+	cmd, rest := args[0], args[1:]
 	var err error
 	switch cmd {
 	case "serve":
-		err = runServe(args)
+		err = runServe(rest, handle)
 	case "task":
-		err = runTask(args)
+		err = runTask(rest, handle)
 	case "bench":
-		err = runBench(args)
+		err = runBench(rest, handle)
 	case "version", "--version", "-v":
 		fmt.Printf("juice-agent %s (%s)\n", version, commit)
 		return
@@ -56,18 +62,19 @@ func main() {
 
 func usage() {
 	fmt.Fprintln(os.Stderr, `usage:
-  juice-agent serve                 run the daemon (channels + worker pool)
-  juice-agent task "<prompt>"       run one task and print its outcome
-  juice-agent bench <suite.json>    run the experiment suite and write a report
+  juice-agent [@handle] serve                 run the daemon (channels + worker pool)
+  juice-agent [@handle] task "<prompt>"       run one task and print its outcome
+  juice-agent [@handle] bench <suite.json>    run the experiment suite and write a report
 
+A leading @handle launches that named agent from its home (<agents_dir>/<handle>/).
 config: AGENT_CONFIG (default ./agent.json); password: AGENT_PASSWORD or AGENT_PASSWORD_FILE`)
 }
 
 // setup does the shared startup: load config, authenticate, bootstrap the
 // intrinsic actions, and assemble the executor. It returns the executor, the
 // client, and the resolved loop config.
-func setup(ctx context.Context, log *logger) (*session.Executor, *juice.Client, agent.Config, Config, error) {
-	cfg, err := LoadConfig(configPath())
+func setup(ctx context.Context, log *logger, cliHandle string) (*session.Executor, *juice.Client, agent.Config, Config, error) {
+	cfg, err := ResolveConfig(cliHandle)
 	if err != nil {
 		return nil, nil, agent.Config{}, cfg, fmt.Errorf("config: %w", err)
 	}
@@ -117,6 +124,13 @@ func setup(ctx context.Context, log *logger) (*session.Executor, *juice.Client, 
 		LookupLimit:    cfg.LookupLimit,
 		Intrinsics:     intrinsics,
 	}
+	prompter := session.LoadPrompter(self.Handle, replyRef, cfg.personaPath(), cfg.knowledgePath())
+	var mem *session.Memory
+	if cfg.Memory.Enabled {
+		mem = session.NewMemory(cfg.memoryPath(), cfg.Memory.MemoryBytes, cl)
+	}
+	log.event("identity", map[string]any{"handle": self.Handle, "home": cfg.Home, "memory": cfg.Memory.Enabled})
+
 	exec := &session.Executor{
 		Kernel:       cl,
 		DataDir:      cfg.DataDir,
@@ -126,17 +140,19 @@ func setup(ctx context.Context, log *logger) (*session.Executor, *juice.Client, 
 		Loop:         loopCfg,
 		RateTasks:    cfg.RateTasks,
 		Maker:        maker,
+		Prompter:     prompter,
+		Memory:       mem,
 		Log:          log.event,
 	}
 	return exec, cl, loopCfg, cfg, nil
 }
 
-func runServe(_ []string) error {
+func runServe(_ []string, handle string) error {
 	log := newLogger()
 	runCtx, cancel := context.WithCancel(context.Background())
 	defer cancel()
 
-	exec, cl, _, cfg, err := setup(runCtx, log)
+	exec, cl, _, cfg, err := setup(runCtx, log, handle)
 	if err != nil {
 		return err
 	}
@@ -167,13 +183,13 @@ func runServe(_ []string) error {
 	return nil
 }
 
-func runTask(args []string) error {
+func runTask(args []string, handle string) error {
 	if len(args) < 1 || strings.TrimSpace(args[0]) == "" {
 		return fmt.Errorf("usage: juice-agent task \"<prompt>\"")
 	}
 	log := newLogger()
 	ctx := context.Background()
-	exec, _, _, cfg, err := setup(ctx, log)
+	exec, _, _, cfg, err := setup(ctx, log, handle)
 	if err != nil {
 		return err
 	}

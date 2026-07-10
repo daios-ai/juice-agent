@@ -91,16 +91,21 @@ k()  { HOME="$KHOME" JUICE_SERVER="$KURL" "$JUICE_BIN" --config "$KCFG" --db "$K
 kj() { HOME="$KHOME" JUICE_SERVER="$KURL" "$JUICE_BIN" --config "$KCFG" --db "$KDB" --json "$@" 2>/dev/null; }
 
 # create_agent — register @agent and fund it.
-create_agent() {
-    k user create @agent agent@example.com --password agent-pass >/dev/null 2>&1
-    k admin deposit @agent 100000 --reason flows >/dev/null 2>&1
+create_agent() { create_user @agent agent-pass; }
+
+# create_user handle password — register and fund a kernel user.
+create_user() {
+    k user create "$1" "${1#@}@example.com" --password "$2" >/dev/null 2>&1
+    k admin deposit "$1" 100000 --reason flows >/dev/null 2>&1
 }
 
 # ---------------------------------------------------------------------------
 # agentd
 # ---------------------------------------------------------------------------
-# start_agentd dir [cfg-fragment] — write agent.json, launch the daemon, set
-# ADATA and AHTTP (its http-channel address).
+# start_agentd dir [cfg-fragment] — write agent.json, launch the @agent daemon,
+# set ADATA and AHTTP. AGENT_HOME is the temp dir so persona/knowledge/memory
+# files stay out of the repo; memory is off by default (flows that test it enable
+# it in their fragment).
 start_agentd() {
     local dir="$1" extra="${2:-}"
     ADATA="$dir/agent-data"
@@ -109,10 +114,11 @@ start_agentd() {
 { "server_url": "$KURL", "handle": "@agent", "data_dir": "$ADATA",
   "default_budget": 100, "max_turns": 12, "concurrency": 2,
   "lookup_limit": 8, "candidate_limit": 12, "compact_bytes": 262144, "rate_tasks": true,
+  "memory": { "enabled": false },
   "channels": { "http": { "addr": "127.0.0.1:0" }, "step": { "poll_seconds": 1 } }
   ${extra:+, $extra} }
 EOF
-    AGENT_CONFIG="$acfg" AGENT_PASSWORD=agent-pass "$AGENTD" serve >"$dir/agentd.log" 2>&1 &
+    AGENT_HOME="$dir" AGENT_CONFIG="$acfg" AGENT_PASSWORD=agent-pass "$AGENTD" serve >"$dir/agentd.log" 2>&1 &
     AGENTD_PID=$!; track "$AGENTD_PID"
     local addr; addr=$(wait_line "$dir/agentd.log" '"event":"serving".*"http_addr":"\([^"]*\)"')
     [ -n "$addr" ] || { echo "agentd did not start" >&2; cat "$dir/agentd.log" >&2; return 1; }

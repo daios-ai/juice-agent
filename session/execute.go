@@ -2,6 +2,7 @@ package session
 
 import (
 	"context"
+	"time"
 
 	"github.com/daios-ai/juice-agent/agent"
 )
@@ -30,6 +31,8 @@ type Executor struct {
 	Loop         agent.Config
 	RateTasks    bool
 	Maker        *Maker
+	Prompter     *Prompter        // assembles the per-task system prompt (persona/knowledge/memory)
+	Memory       *Memory          // learned cross-task memory; nil disables it
 	Enqueue      func(agent.Task) // where maker-proposed synthesis tasks go
 	Log          func(event string, fields map[string]any)
 }
@@ -46,6 +49,13 @@ func (e *Executor) Execute(ctx context.Context, task agent.Task, steering func()
 	tr, err := OpenTranscript(e.DataDir, task.ID, e.CompactBytes, e.Kernel)
 	if err != nil {
 		return agent.Outcome{Status: agent.StatusFailed, Reason: "transcript: " + err.Error()}, err
+	}
+
+	// Prepend the assembled system prompt (persona + knowledge + current memory
+	// digest) so the model carries its identity and history into the task.
+	if e.Prompter != nil {
+		sys := e.Prompter.Build(e.Memory.Digest())
+		task.Messages = append([]agent.Message{sys}, task.Messages...)
 	}
 
 	deps := agent.Deps{
@@ -78,6 +88,10 @@ func (e *Executor) Execute(ctx context.Context, task agent.Task, steering func()
 		if synth := e.Maker.Observe(ctx, task, out); synth != nil && e.Enqueue != nil {
 			e.Enqueue(*synth)
 		}
+	}
+	// Fold what happened into durable memory for future tasks (best-effort).
+	if e.Memory != nil {
+		e.Memory.Update(ctx, time.Now().UTC().Format("2006-01-02 15:04"), task, out, msgs)
 	}
 	return out, nil
 }

@@ -143,15 +143,15 @@ func Run(ctx context.Context, task Task, cfg Config, deps Deps) (Outcome, error)
 }
 
 // prompt renders the task's seed conversation into a lookup query: the
-// concatenated user/system content, which is what lookup ranks against.
+// concatenated user content, which is what lookup ranks against. System messages
+// (the injected persona/knowledge/memory prompt) are deliberately excluded so
+// they don't drown out the actual request in the discovery query.
 func prompt(t Task) string {
 	var b strings.Builder
 	for _, m := range t.Messages {
-		if m.Role == RoleUser || m.Role == RoleSystem {
-			if m.Content != "" {
-				b.WriteString(m.Content)
-				b.WriteByte('\n')
-			}
+		if m.Role == RoleUser && m.Content != "" {
+			b.WriteString(m.Content)
+			b.WriteByte('\n')
 		}
 	}
 	return strings.TrimSpace(b.String())

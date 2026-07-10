@@ -56,3 +56,47 @@ func TestMakerConfigFillsZeroFields(t *testing.T) {
 		t.Fatalf("zero fields not filled from defaults: %+v", m)
 	}
 }
+
+func TestResolveLegacyLayout(t *testing.T) {
+	// No CLI handle, no env: legacy layout — home ".", data ./agent-data.
+	c := DefaultConfig()
+	c.resolve("", "", false)
+	if c.Home != "." {
+		t.Fatalf("legacy home = %q, want .", c.Home)
+	}
+	if c.DataDir != "./agent-data" {
+		t.Fatalf("legacy data_dir = %q, want ./agent-data", c.DataDir)
+	}
+	if c.memoryPath() != "memory.md" {
+		t.Fatalf("legacy memory path = %q", c.memoryPath())
+	}
+}
+
+func TestResolveNamedAgentHome(t *testing.T) {
+	c := DefaultConfig() // AgentsDir ./agents
+	c.resolve("@research", "", true)
+	if c.Handle != "@research" {
+		t.Fatalf("handle = %q", c.Handle)
+	}
+	if c.Home != "agents/research" {
+		t.Fatalf("home = %q, want agents/research", c.Home)
+	}
+	if c.DataDir != "agents/research/data" {
+		t.Fatalf("data_dir = %q, want agents/research/data", c.DataDir)
+	}
+	if c.personaPath() != "agents/research/persona.md" || c.memoryPath() != "agents/research/memory.md" {
+		t.Fatalf("paths = %q / %q", c.personaPath(), c.memoryPath())
+	}
+}
+
+func TestResolveHomeOverrideAndExplicitDataDir(t *testing.T) {
+	c := DefaultConfig()
+	c.DataDir = "/tmp/custom-data" // explicit -> respected
+	c.resolve("@bob", "/opt/bob", true)
+	if c.Home != "/opt/bob" {
+		t.Fatalf("home override = %q", c.Home)
+	}
+	if c.DataDir != "/tmp/custom-data" {
+		t.Fatalf("explicit data_dir clobbered: %q", c.DataDir)
+	}
+}
