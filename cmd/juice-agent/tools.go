@@ -55,3 +55,20 @@ func lookupCandidate() agent.Candidate {
 		},
 	}
 }
+
+// subtaskTool opens a bracket: a focused sub-loop that inherits context and an
+// instruction, works in isolation, and rolls up a single result (§4b).
+func subtaskTool() agent.Tool {
+	return agent.Tool{
+		Name:        "subtask",
+		Description: "delegate a focused sub-problem to an isolated sub-loop; only its result returns to this chat",
+		InputSchema: map[string]any{
+			"type": "object",
+			"properties": map[string]any{
+				"instruction": map[string]any{"type": "string", "description": "what the subtask must accomplish"},
+				"context":     map[string]any{"type": "string", "description": "optional facts the subtask needs from here"},
+			},
+			"required": []any{"instruction"},
+		},
+	}
+}

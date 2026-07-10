@@ -105,15 +105,16 @@ func setup(ctx context.Context, log *logger, cliHandle string) (*Executor, *juic
 	}
 	loopCfg := agent.Config{
 		ReplyTool:      "reply",
+		SubtaskTool:    "subtask",
 		LookupAction:   "@sys/lookup",
-		Tools:          []agent.Tool{replyTool(), publishTool()},
+		Tools:          []agent.Tool{replyTool(), subtaskTool(), publishTool()},
 		Always:         []agent.Candidate{lookupCandidate()},
 		MaxTurns:       cfg.MaxTurns,
 		CandidateLimit: cfg.CandidateLimit,
 		LookupLimit:    cfg.LookupLimit,
 		Intrinsics:     intrinsics,
 	}
-	log.event("bootstrap", map[string]any{"handle": self.Handle, "tools": []string{"reply", "publish"}})
+	log.event("bootstrap", map[string]any{"handle": self.Handle, "tools": []string{"reply", "subtask", "publish"}})
 	prompter := LoadPrompter(self.Handle, "reply", cfg.personaPath(), cfg.knowledgePath())
 	var mem *Memory
 	if cfg.Memory.Enabled {

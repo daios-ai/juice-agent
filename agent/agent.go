@@ -38,6 +38,10 @@ type Message struct {
 	TxID    string         `json:"tx_id,omitempty"`
 	IsError bool           `json:"is_error,omitempty"`
 	Kind    string         `json:"kind,omitempty"`
+	// Bracket tags a record with the subtask frame that produced it ("" = root).
+	// Bracket turns are teed to the durable transcript but kept out of the parent
+	// frame's model view (§4b).
+	Bracket string `json:"bracket,omitempty"`
 }
 
 // ActionStats is an action's kernel track record (GET /v1/stats/{id}). Known is
@@ -100,11 +104,16 @@ type Runner interface {
 }
 
 // Transcript is the durable, possibly-compacted working memory. Append persists
-// one record; Messages returns the current message list to send to the model
-// (which the implementation may have compacted). The core keeps no other state.
+// one record; Messages returns the current *frame's* model view (which the
+// implementation may have compacted). Child opens a nested bracket frame — a
+// fresh model view seeded with `seed`, whose records are teed to the same durable
+// store, tagged with a new bracket id. All returns every record across frames
+// (for rating and memory). The core keeps no other state.
 type Transcript interface {
 	Append(ctx context.Context, m Message) error
 	Messages() []Message
+	Child(ctx context.Context, seed []Message) (Transcript, error)
+	All() []Message
 }
 
 // Intrinsic is an agent-native capability the harness intercepts instead of
@@ -157,6 +166,7 @@ type Tool struct {
 // candidates, the caps, and the working-set bound.
 type Config struct {
 	ReplyTool      string      // the terminal tool's name (e.g. "reply")
+	SubtaskTool    string      // the bracket-opening tool's name (e.g. "subtask"); "" disables brackets
 	LookupAction   string      // the discovery action ref (e.g. "@sys/lookup")
 	Tools          []Tool      // harness tools rendered to the model each turn
 	Always         []Candidate // catalog candidates always offered (e.g. @sys/lookup)
@@ -182,35 +192,50 @@ type Deps struct {
 	Log        func(event string, fields map[string]any)
 }
 
-// Run executes one task to completion: the hand-owned pi-style loop with the
-// Juice catalog as its tool set. It seeds a working set of candidate actions
-// (via lookup), then repeatedly asks the Decider for the next tool, dispatches
-// it (or intercepts an intrinsic), and feeds the result back — until the model
-// selects the terminal reply action, the budget or turn cap is hit, or a
-// decide error ends the run.
-//
-// The stop rule keys off the *selection* (reply action chosen), never a
-// provider stop reason. The primary runaway rail is economic: every dispatched
-// call costs its advertised price, prepaid against the task budget. The turn cap
-// is the secondary rail for zero-price actions that escape the money rail.
+// counters are the per-task budgets shared by every frame (root and brackets) so
+// a subtask tree totals at most MaxTurns turns and task.Budget credits — the
+// bound is the shared counter, not a per-frame cap.
+type counters struct {
+	turns int
+	spent int
+}
+
+// Run executes one task to completion via the root loop frame (§4). Subtasks
+// (§4b) recurse into brackets that share the same counters and roll up to a
+// single result in the parent chat. The stop rule keys off the *selection* (the
+// reply tool), never a provider stop reason; the primary runaway rail is
+// economic (priced calls prepaid against task.Budget), the secondary the turn cap.
 func Run(ctx context.Context, task Task, cfg Config, deps Deps) (Outcome, error) {
 	logf := deps.Log
 	if logf == nil {
 		logf = func(string, map[string]any) {}
 	}
-	out := Outcome{Status: StatusFailed}
-
 	for _, m := range task.Messages {
 		if err := deps.Transcript.Append(ctx, m); err != nil {
-			return out, err
+			return Outcome{Status: StatusFailed}, err
 		}
 	}
+	cnt := &counters{}
+	res, status, reason, err := runFrame(ctx, cfg, deps, task.Budget, cnt, 0, logf)
+	out := Outcome{Status: status, Reason: reason, Spent: cnt.spent, Turns: cnt.turns}
+	if status == StatusAnswered {
+		out.Answer = res
+	}
+	logf("task_end", map[string]any{"status": out.Status, "reason": out.Reason, "turns": cnt.turns, "spent": cnt.spent})
+	return out, err
+}
 
+// runFrame runs one loop frame — the root task (depth 0) or a subtask bracket
+// (depth > 0). It returns the frame's result (the reply args on success, or a
+// rollup error map), a status, a reason, and a Go error (only for infrastructure
+// failures; model/budget/turn failures roll up as results). deps.Transcript is
+// this frame's model view; its records are teed to the shared durable store.
+func runFrame(ctx context.Context, cfg Config, deps Deps, budget int, cnt *counters, depth int, logf func(string, map[string]any)) (map[string]any, Status, string, error) {
 	ws := newWorkingSet(cfg.CandidateLimit)
 	for _, c := range cfg.Always {
 		ws.put(c)
 	}
-	if seed, err := deps.Catalog.Lookup(ctx, prompt(task), cfg.LookupLimit); err == nil {
+	if seed, err := deps.Catalog.Lookup(ctx, promptOf(deps.Transcript.Messages()), cfg.LookupLimit); err == nil {
 		mergeCandidates(ctx, deps, ws, seed)
 	}
 
@@ -220,42 +245,48 @@ func Run(ctx context.Context, task Task, cfg Config, deps Deps) (Outcome, error)
 	}
 	decideErrors := 0
 
-	spent := 0
-	for turn := 1; ; turn++ {
-		if cfg.MaxTurns > 0 && turn > cfg.MaxTurns {
-			out.Reason = "turn-cap"
-			out.Spent, out.Turns = spent, turn-1
-			logf("task_end", map[string]any{"status": out.Status, "reason": out.Reason, "spent": spent})
-			return out, nil
+	// feedback records a self-correction nudge and reports whether the cap is now
+	// exceeded (so the caller ends the frame).
+	feedback := func(content string) (exceeded bool, aerr error) {
+		decideErrors++
+		if decideErrors > maxDecideErrors {
+			return true, nil
 		}
+		return false, deps.Transcript.Append(ctx, Message{Role: RoleSystem, Kind: "decide-error", Content: content})
+	}
+	// exhausted rolls the frame up: the root fails the task; a bracket returns an
+	// error result its parent can act on.
+	exhausted := func(reason string) (map[string]any, Status, string, error) {
+		if depth == 0 {
+			return nil, StatusFailed, reason, nil
+		}
+		return map[string]any{"error": reason}, StatusFailed, reason, nil
+	}
 
-		if deps.Steering != nil {
+	for {
+		if cfg.MaxTurns > 0 && cnt.turns >= cfg.MaxTurns {
+			return exhausted("turn-cap")
+		}
+		cnt.turns++
+
+		if depth == 0 && deps.Steering != nil {
 			for _, m := range deps.Steering() {
 				if err := deps.Transcript.Append(ctx, m); err != nil {
-					return out, err
+					return nil, StatusFailed, "", err
 				}
 			}
 		}
 
-		catalog := ws.candidates(cfg)
-		sel, err := deps.Decider.Decide(ctx, deps.Transcript.Messages(), catalog, cfg.Tools)
+		sel, err := deps.Decider.Decide(ctx, deps.Transcript.Messages(), ws.candidates(cfg), cfg.Tools)
 		if err != nil {
-			// A real model occasionally emits an unusable selection (malformed
-			// args, no valid choice). Rather than kill the task, feed the error
-			// back and let the model self-correct on the next turn — bounded by a
-			// consecutive-error cap so a persistently broken model still ends.
-			decideErrors++
-			logf("decide_error", map[string]any{"turn": turn, "consecutive": decideErrors, "error": err.Error()})
-			if decideErrors > maxDecideErrors {
-				out.Reason = "decide-error: " + err.Error()
-				out.Spent, out.Turns = spent, turn
-				logf("task_end", map[string]any{"status": out.Status, "reason": out.Reason})
-				return out, err
+			logf("decide_error", map[string]any{"turn": cnt.turns, "depth": depth, "error": err.Error()})
+			over, aerr := feedback("Your previous tool selection was invalid: " + err.Error() +
+				". Choose one of the available tools or actions and provide well-formed arguments.")
+			if aerr != nil {
+				return nil, StatusFailed, "", aerr
 			}
-			if aerr := deps.Transcript.Append(ctx, Message{Role: RoleSystem, Kind: "decide-error",
-				Content: "Your previous tool selection was invalid: " + err.Error() +
-					". Choose one of the available actions and provide arguments that exactly match its input schema."}); aerr != nil {
-				return out, aerr
+			if over {
+				return exhausted("decide-error: " + err.Error())
 			}
 			continue
 		}
@@ -263,85 +294,117 @@ func Run(ctx context.Context, task Task, cfg Config, deps Deps) (Outcome, error)
 		if err := deps.Transcript.Append(ctx, Message{
 			Role: RoleAssistant, Action: sel.Action, Args: sel.Args, Content: sel.Message,
 		}); err != nil {
-			return out, err
+			return nil, StatusFailed, "", err
 		}
-		logf("turn", map[string]any{"turn": turn, "action": sel.Action})
+		logf("turn", map[string]any{"turn": cnt.turns, "depth": depth, "action": sel.Action})
 
-		// Harness tool: intercepted, not dispatched; may terminate the run. Its
-		// args are checked against the tool's required keys in-harness (catalog
-		// actions are validated kernel-side at dispatch instead).
-		if intr, ok := cfg.Intrinsics[sel.Action]; ok {
-			if miss := missingRequired(toolSchema(cfg.Tools, sel.Action), sel.Args); miss != "" {
-				decideErrors++
-				if decideErrors > maxDecideErrors {
-					out.Reason = "decide-error: missing required arg " + miss
-					out.Spent, out.Turns = spent, turn
-					return out, nil
+		// Harness-tool args are checked against required keys in-harness (catalog
+		// actions are validated kernel-side at dispatch).
+		if sch := toolSchema(cfg.Tools, sel.Action); sch != nil {
+			if miss := missingRequired(sch, sel.Args); miss != "" {
+				over, aerr := feedback(fmt.Sprintf("Your %q selection is missing the required argument %q. Re-select with it.", sel.Action, miss))
+				if aerr != nil {
+					return nil, StatusFailed, "", aerr
 				}
-				if aerr := deps.Transcript.Append(ctx, Message{Role: RoleSystem, Kind: "decide-error",
-					Content: fmt.Sprintf("Your %q selection is missing the required argument %q. Re-select with it.", sel.Action, miss)}); aerr != nil {
-					return out, aerr
+				if over {
+					return exhausted("decide-error: missing arg " + miss)
 				}
 				continue
 			}
-			res, terminal, ierr := intr.Handle(ctx, sel.Args)
+		}
+
+		switch {
+		// reply → this frame is done; its args are the frame result.
+		case sel.Action == cfg.ReplyTool:
+			if err := deps.Transcript.Append(ctx, Message{Role: RoleTool, Action: sel.Action, Result: sel.Args}); err != nil {
+				return nil, StatusFailed, "", err
+			}
+			return sel.Args, StatusAnswered, "", nil
+
+		// subtask → open a bracket sharing the counters; roll its result up.
+		case cfg.SubtaskTool != "" && sel.Action == cfg.SubtaskTool:
+			child, cerr := deps.Transcript.Child(ctx, bracketSeed(deps.Transcript.Messages(), sel.Args))
+			if cerr != nil {
+				return nil, StatusFailed, "", cerr
+			}
+			childDeps := deps
+			childDeps.Transcript = child
+			childDeps.Steering = nil
+			res, _, _, ferr := runFrame(ctx, cfg, childDeps, budget, cnt, depth+1, logf)
+			if ferr != nil {
+				return nil, StatusFailed, "", ferr
+			}
+			if err := deps.Transcript.Append(ctx, Message{Role: RoleTool, Action: sel.Action, Result: res}); err != nil {
+				return nil, StatusFailed, "", err
+			}
+
+		// other harness tool (publish) → intrinsic handler.
+		case cfg.Intrinsics[sel.Action].Handle != nil:
+			res, terminal, ierr := cfg.Intrinsics[sel.Action].Handle(ctx, sel.Args)
 			if err := deps.Transcript.Append(ctx, Message{
 				Role: RoleTool, Action: sel.Action, Result: res, IsError: ierr != nil, Content: errText(ierr),
 			}); err != nil {
-				return out, err
+				return nil, StatusFailed, "", err
 			}
 			if terminal {
-				out.Status, out.Answer = StatusAnswered, res
-				out.Spent, out.Turns = spent, turn
-				logf("task_end", map[string]any{"status": out.Status, "turns": turn, "spent": spent})
-				return out, nil
+				return res, StatusAnswered, "", nil
 			}
-			continue
-		}
 
-		// Budget rail: tell the model, do not kill it.
-		price := ws.priceOf(sel.Action)
-		if spent+price > task.Budget {
+		// catalog action → dispatch (budget-gated).
+		default:
+			price := ws.priceOf(sel.Action)
+			if cnt.spent+price > budget {
+				if err := deps.Transcript.Append(ctx, Message{Role: RoleUser, Kind: "budget",
+					Content: fmt.Sprintf("Budget exceeded: %q costs %d but only %d credits remain. "+
+						"Choose a cheaper action or finish with the %q tool.", sel.Action, price, budget-cnt.spent, cfg.ReplyTool)}); err != nil {
+					return nil, StatusFailed, "", err
+				}
+				logf("budget_refusal", map[string]any{"action": sel.Action, "price": price, "remaining": budget - cnt.spent})
+				continue
+			}
+			rr, rerr := deps.Runner.Run(ctx, sel.Action, sel.Args)
+			cnt.spent += price
+			result := rr.Result
+			if sel.Action == cfg.LookupAction && rerr == nil {
+				mergeCandidates(ctx, deps, ws, parseLookup(rr.Result))
+				result = trimLookup(rr.Result)
+			}
 			if err := deps.Transcript.Append(ctx, Message{
-				Role: RoleUser, Kind: "budget",
-				Content: fmt.Sprintf("Budget exceeded: %q costs %d but only %d credits remain. "+
-					"Choose a cheaper action or finish with the %q tool.", sel.Action, price, task.Budget-spent, cfg.ReplyTool),
+				Role: RoleTool, Action: sel.Action, Result: result, TxID: rr.TxID,
+				IsError: rerr != nil, Content: errText(rerr),
 			}); err != nil {
-				return out, err
+				return nil, StatusFailed, "", err
 			}
-			logf("budget_refusal", map[string]any{"action": sel.Action, "price": price, "remaining": task.Budget - spent})
-			continue
+			logf("dispatch", map[string]any{"action": sel.Action, "price": price, "tx_id": rr.TxID, "error": rerr != nil})
 		}
-
-		rr, rerr := deps.Runner.Run(ctx, sel.Action, sel.Args)
-		spent += price
-		// Discovery is in-band: a lookup result expands the working set. The full
-		// result (with schemas) feeds the working set, but only a trimmed form
-		// (ref + description + score) is persisted to the transcript — the schemas
-		// live in the working set and are rendered per turn, so keeping them in the
-		// chat too is pure noise.
-		result := rr.Result
-		if sel.Action == cfg.LookupAction && rerr == nil {
-			mergeCandidates(ctx, deps, ws, parseLookup(rr.Result))
-			result = trimLookup(rr.Result)
-		}
-		if err := deps.Transcript.Append(ctx, Message{
-			Role: RoleTool, Action: sel.Action, Result: result, TxID: rr.TxID,
-			IsError: rerr != nil, Content: errText(rerr),
-		}); err != nil {
-			return out, err
-		}
-		logf("dispatch", map[string]any{"action": sel.Action, "price": price, "tx_id": rr.TxID, "error": rerr != nil})
 	}
 }
 
-// prompt renders the task's seed conversation into a lookup query: the
-// concatenated user content, which is what lookup ranks against. System messages
-// (the injected persona/knowledge/memory prompt) are deliberately excluded so
-// they don't drown out the actual request in the discovery query.
-func prompt(t Task) string {
+// bracketSeed builds a subtask frame's opening conversation: the parent's system
+// prompt(s) (persona/knowledge/memory carry down), the optional context, and the
+// instruction. The parent's turn-by-turn history is deliberately NOT inherited —
+// a bracket starts clean with only what the parent hands it.
+func bracketSeed(parent []Message, args map[string]any) []Message {
+	var seed []Message
+	for _, m := range parent {
+		if m.Kind == "system" {
+			seed = append(seed, m)
+		}
+	}
+	if c, _ := args["context"].(string); strings.TrimSpace(c) != "" {
+		seed = append(seed, Message{Role: RoleUser, Content: "Context from the parent task:\n" + c})
+	}
+	instr, _ := args["instruction"].(string)
+	seed = append(seed, Message{Role: RoleUser, Content: "Subtask: " + instr})
+	return seed
+}
+
+// promptOf renders a frame's user content into a lookup query — what lookup
+// ranks against. System messages (persona/knowledge/memory) are excluded so they
+// don't drown out the actual request.
+func promptOf(msgs []Message) string {
 	var b strings.Builder
-	for _, m := range t.Messages {
+	for _, m := range msgs {
 		if m.Role == RoleUser && m.Content != "" {
 			b.WriteString(m.Content)
 			b.WriteByte('\n')

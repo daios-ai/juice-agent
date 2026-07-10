@@ -5,7 +5,9 @@ import (
 	"errors"
 	"os"
 	"path/filepath"
+	"strconv"
 	"strings"
+	"sync"
 	"testing"
 	"time"
 
@@ -190,6 +192,81 @@ func TestBackoffDoubles(t *testing.T) {
 	for attempt, want := range []time.Duration{2 * time.Second, 4 * time.Second, 8 * time.Second} {
 		if got := p.backoff(attempt); got != want {
 			t.Fatalf("backoff(%d) = %v, want %v", attempt, got, want)
+		}
+	}
+}
+
+// bracketKernel opens a subtask on the root's first turn, replies inside the
+// bracket, then replies at root — exercising the full frame recursion.
+type bracketKernel struct{ i int }
+
+func (k *bracketKernel) Decide(_ context.Context, _ []agent.Message, _ []agent.Candidate, _ []agent.Tool) (*agent.Selection, error) {
+	k.i++
+	switch k.i {
+	case 1:
+		return &agent.Selection{Action: "subtask", Args: map[string]any{"instruction": "sub"}}, nil
+	case 2:
+		return &agent.Selection{Action: "reply", Args: map[string]any{"answer": "sub-done"}}, nil
+	default:
+		return &agent.Selection{Action: "reply", Args: map[string]any{"answer": "root-done"}}, nil
+	}
+}
+func (k *bracketKernel) Lookup(context.Context, string, int) ([]agent.Candidate, error) {
+	return nil, nil
+}
+func (k *bracketKernel) Meta(context.Context, string) (int, agent.ActionStats, error) {
+	return 0, agent.ActionStats{}, nil
+}
+func (k *bracketKernel) Run(context.Context, string, map[string]any) (agent.RunResult, error) {
+	return agent.RunResult{}, nil
+}
+func (k *bracketKernel) Chat(context.Context, []agent.Message) (string, error) { return "", nil }
+func (k *bracketKernel) ChatJSON(context.Context, []agent.Message, map[string]any) (any, error) {
+	return nil, nil
+}
+func (k *bracketKernel) Embed(context.Context, string) ([]float64, error) { return nil, nil }
+func (k *bracketKernel) Rate(context.Context, string, int, string) error  { return nil }
+
+func bracketExecutor(dir string) *Executor {
+	return &Executor{
+		Kernel:  &bracketKernel{},
+		DataDir: dir,
+		RetryOK: func(error) bool { return false },
+		Loop: agent.Config{
+			ReplyTool: "reply", SubtaskTool: "subtask", LookupAction: "@sys/lookup", MaxTurns: 10,
+			Tools: []agent.Tool{
+				{Name: "reply", InputSchema: map[string]any{"type": "object", "required": []any{"answer"}}},
+				{Name: "subtask", InputSchema: map[string]any{"type": "object", "required": []any{"instruction"}}},
+			},
+		},
+	}
+}
+
+func TestConcurrentBracketTasksDoNotCrossTalk(t *testing.T) {
+	dir := t.TempDir()
+	var wg sync.WaitGroup
+	results := make([]agent.Outcome, 8)
+	for i := 0; i < 8; i++ {
+		wg.Add(1)
+		go func(i int) {
+			defer wg.Done()
+			e := bracketExecutor(dir) // independent kernel/counters per task
+			task := agent.Task{ID: "task-" + strconv.Itoa(i), Channel: "test", Budget: 100,
+				Messages: []agent.Message{{Role: agent.RoleUser, Content: "go"}}}
+			out, _ := e.Execute(context.Background(), task, nil)
+			results[i] = out
+		}(i)
+	}
+	wg.Wait()
+	// Every task answered independently with its own root reply; each transcript
+	// belongs to exactly one task.
+	for i, out := range results {
+		if out.Status != agent.StatusAnswered || out.Answer["answer"] != "root-done" {
+			t.Fatalf("task %d outcome = %+v", i, out)
+		}
+		data, _ := os.ReadFile(filepath.Join(dir, "task-"+strconv.Itoa(i)+".jsonl"))
+		if strings.Count(string(data), `"role":"user","content":"go"`) != 1 {
+			t.Fatalf("task %d transcript has cross-task content:\n%s", i, data)
 		}
 	}
 }

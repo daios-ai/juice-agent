@@ -13,48 +13,82 @@ import (
 	"github.com/daios-ai/juice-agent/agent"
 )
 
-// Transcript is a durable, append-only JSONL record of one task and the working
-// memory sent to the model. It persists every record as produced (crash
-// survivable) and compacts older turns into an LLM summary when the in-memory
-// view grows past a byte budget — the kernel reports no token count, so bytes
-// are the legible proxy. It implements agent.Transcript.
+// record is the shared durable store for one task: the JSONL file, the full
+// in-memory record across all frames, and a bracket-id counter. A task's root
+// Transcript and every bracket frame share one record.
+type record struct {
+	mu  sync.Mutex
+	f   *os.File
+	w   *bufio.Writer
+	all []agent.Message
+	seq int
+}
+
+func (r *record) write(m agent.Message) error {
+	r.mu.Lock()
+	defer r.mu.Unlock()
+	b, err := json.Marshal(m)
+	if err != nil {
+		return err
+	}
+	if _, err := r.w.Write(append(b, '\n')); err != nil {
+		return err
+	}
+	r.all = append(r.all, m)
+	return r.w.Flush()
+}
+
+func (r *record) snapshot() []agent.Message {
+	r.mu.Lock()
+	defer r.mu.Unlock()
+	out := make([]agent.Message, len(r.all))
+	copy(out, r.all)
+	return out
+}
+
+func (r *record) nextBracket() string {
+	r.mu.Lock()
+	defer r.mu.Unlock()
+	r.seq++
+	return fmt.Sprintf("b%d", r.seq)
+}
+
+// Transcript is one frame's view over a shared record (§4b). Append persists a
+// record (tagged with this frame's bracket) and adds it to the frame's view,
+// compacting the view when it grows past a byte budget. Child opens a nested
+// bracket frame; All returns the whole durable record. It implements
+// agent.Transcript.
 type Transcript struct {
-	path         string
+	rec          *record
+	bracket      string
 	chatter      Chatter
 	compactBytes int
-
-	mu     sync.Mutex
-	f      *os.File
-	w      *bufio.Writer
-	msgs   []agent.Message // current (possibly compacted) view
-	nbytes int             // approximate size of msgs
+	msgs         []agent.Message // this frame's (possibly compacted) view
+	nbytes       int
 }
 
 // TerminalKinds are the record kinds that mark a transcript as finished; their
 // presence as the last record means the task was not interrupted.
 var TerminalKinds = map[string]bool{"outcome": true, "interrupted": true}
 
-// OpenTranscript creates (or truncates) the JSONL file for taskID under dir.
-// compactBytes ≤ 0 disables compaction. chatter may be nil when compaction is
-// off.
+// OpenTranscript creates (or truncates) the JSONL file for taskID under dir and
+// returns its root frame. compactBytes ≤ 0 disables compaction.
 func OpenTranscript(dir, taskID string, compactBytes int, chatter Chatter) (*Transcript, error) {
 	if err := os.MkdirAll(dir, 0o755); err != nil {
 		return nil, err
 	}
-	path := filepath.Join(dir, taskID+".jsonl")
-	f, err := os.Create(path)
+	f, err := os.Create(filepath.Join(dir, taskID+".jsonl"))
 	if err != nil {
 		return nil, err
 	}
-	return &Transcript{path: path, chatter: chatter, compactBytes: compactBytes, f: f, w: bufio.NewWriter(f)}, nil
+	return &Transcript{rec: &record{f: f, w: bufio.NewWriter(f)}, chatter: chatter, compactBytes: compactBytes}, nil
 }
 
-// Append persists m and adds it to the working view, compacting if the view has
-// grown past the byte budget.
+// Append persists m (tagged with this frame's bracket) and adds it to the view,
+// compacting if the view has grown past the byte budget.
 func (t *Transcript) Append(ctx context.Context, m agent.Message) error {
-	t.mu.Lock()
-	defer t.mu.Unlock()
-	if err := t.write(m); err != nil {
+	m.Bracket = t.bracket
+	if err := t.rec.write(m); err != nil {
 		return err
 	}
 	t.msgs = append(t.msgs, m)
@@ -65,42 +99,45 @@ func (t *Transcript) Append(ctx context.Context, m agent.Message) error {
 	return nil
 }
 
-func (t *Transcript) write(m agent.Message) error {
-	b, err := json.Marshal(m)
-	if err != nil {
-		return err
-	}
-	if _, err := t.w.Write(append(b, '\n')); err != nil {
-		return err
-	}
-	return t.w.Flush()
-}
-
-// Messages returns a copy of the current working view.
+// Messages returns a copy of this frame's working view.
 func (t *Transcript) Messages() []agent.Message {
-	t.mu.Lock()
-	defer t.mu.Unlock()
 	out := make([]agent.Message, len(t.msgs))
 	copy(out, t.msgs)
 	return out
 }
 
+// All returns the whole durable record across every frame (for rating and
+// memory, which must see bracketed calls too).
+func (t *Transcript) All() []agent.Message { return t.rec.snapshot() }
+
+// Child opens a nested bracket frame sharing this task's durable record: a fresh
+// view seeded with `seed`, tagged with a new bracket id.
+func (t *Transcript) Child(ctx context.Context, seed []agent.Message) (agent.Transcript, error) {
+	child := &Transcript{rec: t.rec, bracket: t.rec.nextBracket(), chatter: t.chatter, compactBytes: t.compactBytes}
+	for _, m := range seed {
+		if err := child.Append(ctx, m); err != nil {
+			return nil, err
+		}
+	}
+	return child, nil
+}
+
 // Close flushes and closes the underlying file.
 func (t *Transcript) Close() error {
-	t.mu.Lock()
-	defer t.mu.Unlock()
-	if t.w != nil {
-		t.w.Flush()
+	t.rec.mu.Lock()
+	defer t.rec.mu.Unlock()
+	if t.rec.w != nil {
+		t.rec.w.Flush()
 	}
-	if t.f != nil {
-		return t.f.Close()
+	if t.rec.f != nil {
+		return t.rec.f.Close()
 	}
 	return nil
 }
 
 // compact replaces the older half of the view with a single summary message,
 // keeping a recent tail verbatim and cutting only at a turn boundary. The full
-// history stays on disk; only the in-memory view shrinks. Must hold t.mu.
+// history stays on disk; only the in-memory view shrinks.
 func (t *Transcript) compact(ctx context.Context) {
 	keep := t.compactBytes / 2
 	// find the cut: walk from the end accumulating bytes until we've kept ~keep.
@@ -122,7 +159,7 @@ func (t *Transcript) compact(ctx context.Context) {
 		return // compaction is best-effort; keep the full view on failure
 	}
 	sm := agent.Message{Role: agent.RoleSystem, Kind: "summary", Content: summary}
-	_ = t.write(sm) // record the compaction in the durable log
+	_ = t.rec.write(sm) // record the compaction in the durable log
 	t.msgs = append([]agent.Message{sm}, tail...)
 	t.nbytes = size(sm)
 	for _, m := range tail {

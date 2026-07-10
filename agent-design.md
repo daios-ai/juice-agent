@@ -151,15 +151,43 @@ catalog offers at that moment, local, imported, or federated.
 call, exactly as pi does. Follow-ups (input after completion) are channel semantics: a follow-up
 is a new task that reopens the prior transcript.
 
-**No in-loop subagents.** As in pi: delegation is not a tool. If the agent needs another agent, it
-calls that agent's published actions or parks a step for it — the kernel is the orchestrator, with
-payment and attribution built in.
+**Delegation to other agents** stays out of the loop (as in pi): to use another agent, call its
+published actions or park a step — the kernel is the orchestrator. *In-loop* decomposition is the
+`subtask` tool (§4b), which isolates context without an unbounded tree.
 
 ### The `reply` tool
 
 `reply` is a harness tool (schema `{answer: string, required}`), not an action. The harness treats
 its selection as terminal (at the root) or as the roll-up of a bracket (§4b), and never dispatches
 it. Nothing is registered on the platform for it — no WASM artifact, no bootstrap round-trip.
+
+## 4b. Brackets (subtasks)
+
+A long task pollutes the chat with lookups and dead ends. The `subtask` tool lets the model open a
+**bracket** — a stack frame: given inherited context + a specific instruction, it runs in its own
+scope and **rolls up** to a single result in the parent chat.
+
+- **Down.** Selecting `subtask {instruction, context?}` opens a child frame seeded with the parent's
+  system prompt(s) (persona/knowledge/memory carry down) + the context + the instruction. The
+  parent's turn-by-turn history is *not* inherited — the frame starts clean.
+- **Inside.** The child runs the ordinary loop with its own working set. All its turns — lookups,
+  results, dead ends — live in this frame only.
+- **Up.** Selecting `reply` inside the bracket *pops* it: the parent chat gets exactly one
+  tool-result (`{action: subtask, result: <reply args>}`); the child's internal turns never enter
+  the parent's model view.
+
+**The bound is a shared counter.** Turns and credits are one `counters{turns, spent}` per task,
+threaded by pointer through the recursion — a subtask tree totals ≤ `max_turns` and ≤ `budget`, not
+per-frame. There is no depth cap and no recursion base-case problem: you cannot spend turns you do
+not have. Exhaustion inside a bracket rolls up an error result the parent can act on; at the root it
+fails the task with `turn-cap`. This is the property none of pi/opencode/OpenClaw has — their
+subagents each get a *fresh* budget; ours share one.
+
+**Durable but clean.** Every record is teed to the one task transcript, tagged with its bracket id,
+so rating and memory (`Transcript.All()`) see bracketed calls too; only the parent's *model view*
+(`Messages()`) excludes them. The chat the model reads at any node is the root→node path, never a
+sibling's noise — the transcript reads like the reduced form (`subtask: find X → X = …`), with the
+messy interior derivations already collapsed.
 
 ### Safety rails
 

@@ -78,7 +78,8 @@ func (e *Executor) Execute(ctx context.Context, task agent.Task, steering func()
 		Content: string(out.Status), Result: map[string]any{
 			"status": string(out.Status), "reason": out.Reason, "spent": out.Spent, "turns": out.Turns,
 		}})
-	msgs := tr.Messages()
+	// All() (not Messages()) so bracketed tool calls are rated and remembered too.
+	msgs := tr.All()
 	_ = tr.Close()
 
 	if e.RateTasks {

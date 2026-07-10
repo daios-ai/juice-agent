@@ -98,3 +98,41 @@ func TestRecoverMarksInterruptedIdempotently(t *testing.T) {
 		t.Fatalf("second Recover marked %v, want none (idempotent)", marked2)
 	}
 }
+
+func TestTranscriptChildIsolatesViewButSharesRecord(t *testing.T) {
+	dir := t.TempDir()
+	tr, err := OpenTranscript(dir, "tb", 0, nil)
+	if err != nil {
+		t.Fatal(err)
+	}
+	ctx := context.Background()
+	tr.Append(ctx, agent.Message{Role: agent.RoleUser, Content: "root"})
+	child, err := tr.Child(ctx, []agent.Message{{Role: agent.RoleUser, Content: "seed"}})
+	if err != nil {
+		t.Fatal(err)
+	}
+	child.Append(ctx, agent.Message{Role: agent.RoleAssistant, Action: "@sys/time"})
+	tr.Append(ctx, agent.Message{Role: agent.RoleTool, Action: "subtask", Result: map[string]any{"answer": "x"}})
+
+	// Parent view excludes the bracket's turns.
+	for _, m := range tr.Messages() {
+		if m.Bracket != "" {
+			t.Fatalf("bracket turn leaked into parent view: %+v", m)
+		}
+	}
+	// The durable record has everything, and the bracket turns are tagged.
+	all := tr.All()
+	if len(all) != 4 { // root, seed(b1), @sys/time(b1), subtask-rollup
+		t.Fatalf("All() = %d records, want 4", len(all))
+	}
+	tagged := 0
+	for _, m := range all {
+		if m.Bracket == "b1" {
+			tagged++
+		}
+	}
+	if tagged != 2 {
+		t.Fatalf("bracket-tagged records = %d, want 2", tagged)
+	}
+	tr.Close()
+}

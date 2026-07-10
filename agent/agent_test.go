@@ -3,6 +3,8 @@ package agent
 import (
 	"context"
 	"errors"
+	"fmt"
+	"strings"
 	"testing"
 )
 
@@ -74,14 +76,41 @@ func (r *recordingRunner) Run(_ context.Context, action string, _ map[string]any
 	return RunResult{Result: map[string]any{"ok": true}}, nil
 }
 
-// memTranscript is an in-memory Transcript.
-type memTranscript struct{ msgs []Message }
+// memTranscript is an in-memory Transcript with bracket support: msgs is this
+// frame's view; all (shared across frames) is the durable record.
+type memTranscript struct {
+	bracket string
+	msgs    []Message
+	all     *[]Message
+	seq     *int
+}
 
+func (t *memTranscript) init() {
+	if t.all == nil {
+		t.all = &[]Message{}
+		t.seq = new(int)
+	}
+}
 func (t *memTranscript) Append(_ context.Context, m Message) error {
+	t.init()
+	m.Bracket = t.bracket
 	t.msgs = append(t.msgs, m)
+	*t.all = append(*t.all, m)
 	return nil
 }
 func (t *memTranscript) Messages() []Message { return t.msgs }
+func (t *memTranscript) All() []Message      { t.init(); return *t.all }
+func (t *memTranscript) Child(ctx context.Context, seed []Message) (Transcript, error) {
+	t.init()
+	*t.seq++
+	child := &memTranscript{bracket: fmt.Sprintf("b%d", *t.seq), all: t.all, seq: t.seq}
+	for _, m := range seed {
+		if err := child.Append(ctx, m); err != nil {
+			return nil, err
+		}
+	}
+	return child, nil
+}
 
 // replyIntrinsic is the terminal echo intrinsic used across tests, keyed by the
 // plain tool name.
@@ -244,11 +273,11 @@ func TestPersistentDecideErrorEndsRunAfterCap(t *testing.T) {
 	cfg := baseConfig()
 	cfg.MaxDecideErrors = 2
 	out, err := Run(context.Background(), Task{Budget: 100}, cfg, newDeps(dec, &fakeCatalog{}, &recordingRunner{}, &memTranscript{}))
-	if err == nil {
-		t.Fatal("expected error after the decide-error cap")
+	if err != nil {
+		t.Fatalf("model failure should be a failed outcome, not a Go error: %v", err)
 	}
-	if out.Status != StatusFailed || out.Reason == "" {
-		t.Fatalf("status=%q reason=%q, want failed with reason", out.Status, out.Reason)
+	if out.Status != StatusFailed || !strings.HasPrefix(out.Reason, "decide-error") {
+		t.Fatalf("status=%q reason=%q, want failed with a decide-error reason", out.Status, out.Reason)
 	}
 	// One past the cap: attempts 1,2 fed back, 3rd exceeds cap and ends.
 	if dec.calls != 3 {
@@ -520,4 +549,86 @@ func TestLookupResultTrimmedInTranscript(t *testing.T) {
 	if _, hasSchema := first["input_schema"]; hasSchema {
 		t.Fatalf("schema should be trimmed from the transcript: %v", first)
 	}
+}
+
+func subtaskConfig() Config {
+	cfg := baseConfig()
+	cfg.SubtaskTool = "subtask"
+	cfg.Tools = append(cfg.Tools, Tool{Name: "subtask", Description: "open a subtask",
+		InputSchema: map[string]any{"type": "object", "required": []any{"instruction"}}})
+	return cfg
+}
+
+func TestSubtaskOpensAndRollsUp(t *testing.T) {
+	// root opens a subtask; the bracket answers; the parent sees ONE rolled-up
+	// result, not the bracket's internal turns.
+	dec := &scriptedDecider{script: []Selection{
+		{Action: "subtask", Args: map[string]any{"instruction": "find X"}},
+		{Action: "reply", Args: map[string]any{"answer": "X=42"}},        // inside bracket
+		{Action: "reply", Args: map[string]any{"answer": "final: X=42"}}, // root
+	}}
+	tr := &memTranscript{}
+	out, err := Run(context.Background(), Task{Budget: 100}, subtaskConfig(), newDeps(dec, &fakeCatalog{}, &recordingRunner{}, tr))
+	if err != nil {
+		t.Fatal(err)
+	}
+	if out.Status != StatusAnswered || out.Answer["answer"] != "final: X=42" {
+		t.Fatalf("outcome = %+v", out)
+	}
+	// The parent view carries the subtask rollup as one tool-result...
+	var rollup map[string]any
+	for _, m := range tr.msgs {
+		if m.Role == RoleTool && m.Action == "subtask" {
+			rollup = m.Result
+		}
+		if m.Bracket != "" {
+			t.Fatalf("bracket turn leaked into the parent view: %+v", m)
+		}
+	}
+	if rollup == nil || rollup["answer"] != "X=42" {
+		t.Fatalf("subtask rollup missing/wrong: %v", rollup)
+	}
+	// ...while the durable record keeps the bracket's internal turns (tagged).
+	bracketSeen := false
+	for _, m := range tr.All() {
+		if m.Bracket != "" {
+			bracketSeen = true
+		}
+	}
+	if !bracketSeen {
+		t.Fatal("bracket turns absent from All() durable record")
+	}
+}
+
+func TestSubtaskSharesTurnCap(t *testing.T) {
+	// A bracket's turns count against the ONE shared cap: cap 4 = 1 root (subtask)
+	// + 3 bracket dispatches, then exhausted — not 4-per-frame.
+	dec := &loopingSubtaskDecider{}
+	cfg := subtaskConfig()
+	cfg.MaxTurns = 4
+	run := &recordingRunner{}
+	out, _ := Run(context.Background(), Task{Budget: 1000}, cfg, newDeps(dec, &fakeCatalog{}, run, &memTranscript{}))
+	if out.Status != StatusFailed || out.Reason != "turn-cap" {
+		t.Fatalf("outcome = %+v, want failed/turn-cap", out)
+	}
+	if out.Turns != 4 {
+		t.Fatalf("total turns = %d, want 4 (shared cap, not per-frame)", out.Turns)
+	}
+	// root turn opened the bracket (not dispatched); the 3 remaining turns were
+	// dispatches inside the bracket.
+	if len(run.calls) != 3 {
+		t.Fatalf("dispatched %d, want 3", len(run.calls))
+	}
+}
+
+// loopingSubtaskDecider opens a subtask on its first call, then loops a free
+// action forever (inside the bracket).
+type loopingSubtaskDecider struct{ n int }
+
+func (d *loopingSubtaskDecider) Decide(_ context.Context, _ []Message, _ []Candidate, _ []Tool) (*Selection, error) {
+	d.n++
+	if d.n == 1 {
+		return &Selection{Action: "subtask", Args: map[string]any{"instruction": "loop"}}, nil
+	}
+	return &Selection{Action: "@sys/time"}, nil
 }
