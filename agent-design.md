@@ -1,0 +1,364 @@
+# Juice Agent Design
+
+Version: 0.1
+Status: design document
+Codename: `juice-agent`
+
+## 1. Purpose and position
+
+`juice-agent` is a Go daemon implementing a general task-solving agent whose entire capability
+surface is a Juice kernel. It adapts pi's agent architecture — a small, hand-owned loop wrapped by
+a policy shell, driven by replaceable surfaces — with one substitution that changes everything
+downstream: **the tool set is not hand-coded; it is the Juice action catalog**, discovered at
+runtime and invoked uniformly through `Call()`.
+
+The daemon is an ordinary kernel client. It authenticates as a registered user (its *handle*, e.g.
+`@agent`), and from that single fact inherits everything an agent needs:
+
+| Need            | Kernel-native answer                                                          |
+| --------------- | ----------------------------------------------------------------------------- |
+| Reasoning       | `@sys/llm/decide` / `@sys/llm/chat`, called like any action                    |
+| Tools           | Active actions visible under `CanCall`, found via `@sys/lookup`                |
+| Tool dispatch   | `POST /v1/run` — one primitive for every capability, local or federated        |
+| Budget          | Its wallet: every call is priced and prepaid; spend is bounded by balance      |
+| Address         | `@agent` — reachable by steps, `@sys/message`, and calls to actions it owns    |
+| Accountability  | Every effect is a transaction: priced, receipted, attributed by the role law   |
+
+No special agent API exists on the kernel side, and none is needed: the kernel already speaks
+agent. Other agents (e.g. `@chat`) are simply other users; the multi-agent system is emergent,
+mediated by the kernel, never orchestrated by a private protocol.
+
+The daemon holds **no model credentials, no API keys, no provider adapters**. pi needs ~34
+provider transports and a normalized event vocabulary because it faces many vendors; `juice-agent`
+faces exactly one interface — the kernel — which validates structure on its behalf.
+
+## 2. Layering (pi's architecture, transposed)
+
+pi's load-bearing seam is that the loop lives in a tiny core that knows nothing about disk,
+sessions, or UI, with policy wired around it via interfaces. We keep that seam exactly:
+
+```text
+cmd/juice-agent/    entrypoint: config, wiring, lifecycle (serve, drain, recovery)
+channel/       task intake surfaces (pi's "front-ends"): replaceable, concurrent
+session/       policy shell (pi's coding-agent layer): persistence, compaction, retries
+agent/         THE LOOP (pi's agent-core): pure, interface-driven, no I/O imports
+juice/         kernel client: typed HTTP client implementing agent's interfaces
+bench/         experiment suite: quantitative performance measurement
+flows/         end-to-end shell flows against the compiled surface (not Go)
+```
+
+Dependency law, mirroring the kernel's own (`kernel` must not import SQLite/wazero/…):
+
+- `agent` imports **neither `net/http` nor `juice`**. It depends only on small interfaces it
+  defines (`Decider`, `Catalog`, `Runner`, `Transcript`). Tests use fakes.
+- `channel` and `session` depend on `agent`'s types, never on each other's implementations.
+- `juice` is the only package that speaks HTTP to the kernel.
+
+Package and file counts stay small; files are named for their function; no file is split for size
+alone. **Every production Go file has a corresponding `_test.go` with independent tests.**
+`go build ./...` and `go test ./...` pass offline with no kernel, no LLM, no network.
+
+## 3. The unit of work: a Task
+
+A **Task** is one request for the agent: an id, an originating channel, an initial message (or
+conversation), and a **budget** in credits. One task = one loop run = one transcript. The daemon
+serves tasks from a bounded worker pool; each task's loop is serial, tasks are concurrent.
+
+```text
+Task    { id, channel_id, messages, budget, created_at }
+Outcome { status ∈ {answered, failed, interrupted}, answer, reason,
+          spent, turns, started_at, ended_at }
+```
+
+The outcome is delivered back through the task's originating channel. `spent` is exact: it is the
+sum of the prices of the calls the agent made, reconstructible from the kernel ledger (every one
+of the agent's calls is a transaction where it is `owner_user_id`).
+
+## 4. The loop
+
+The core is pi's `runLoop`, with Juice substituted at both ends of each turn. Annotated
+pseudocode; this is the whole of `agent/`:
+
+```text
+run(task):
+  cands = intrinsics ∪ Catalog.Lookup(task.prompt, k)     # seed the working set
+  loop:
+    inject queued steering messages                        # polled before every model call
+    sel = Decider.Decide(messages, refs(cands))            # ONE @sys/llm/decide round-trip
+    if sel is error:            fail (after policy-layer retries)
+    append sel to transcript                               # {role: assistant, tool:{action,args}}
+
+    if sel.action == @agent/reply:                         # ← THE STOP RULE
+        return answered(sel.args)                          # terminal; nothing dispatched
+
+    if spent + price(sel.action) > task.budget:
+        append budget-refusal notice; continue             # the model is told, not killed
+
+    res = Runner.Run(sel.action, sel.args)                 # POST /v1/run — the tool call
+    spent += price(sel.action)
+    append res to transcript                               # {role: tool, tool:{result}}
+
+    if sel.action == @sys/lookup:                          # discovery is itself a tool call
+        merge res.results into cands (bounded, recency-evicted)
+
+    if turns == max_turns: fail(turn-cap)
+```
+
+**Turn primitive.** Each turn is one `@sys/llm/decide` call: the kernel fetches every candidate's
+canonical description, `input_schema`, and price from its own DB and returns a selection whose
+`args` are **already validated against the chosen action's schema**. pi's typed content blocks,
+argument validation, and provider normalization collapse into this single kernel contract. The
+transcript maps natively onto `decide`'s message format (`{role, content?, tool?}`): an assistant
+selection is `{role:"assistant", tool:{action,args}}`, a result is `{role:"tool", tool:{result}}`.
+
+**Stop rule.** pi's finding — continuation must be decided by *content*, never by a provider's
+stop reason — is kept and strengthened: the run ends exactly when the model selects the agent's
+own terminal action **`@agent/reply`** (below). "Done" is not a heuristic over free text; it is a
+schema-validated selection like any other. There is no other normal exit.
+
+**Truncation guard, subsumed.** pi refuses tool calls from length-truncated replies because
+half-streamed arguments may parse. Here the kernel validates args server-side and `decide` either
+returns a valid selection or a typed error — a malformed turn is retried, never dispatched.
+
+**Discovery is in-band.** `@sys/lookup` sits permanently in the candidate set. The model expands
+its own tool set by selecting it — the harness runs it like any action and merges the results into
+the working set (bounded, e.g. 24 actions, evicted by recency) so the context stays disciplined.
+The working set is *per task* and starts fresh each run: what the agent can do is whatever the
+catalog offers at that moment, local, imported, or federated.
+
+**Steering.** Channels may push mid-task messages; the loop injects them before the next model
+call, exactly as pi does. Follow-ups (input after completion) are channel semantics: a follow-up
+is a new task that reopens the prior transcript.
+
+**No in-loop subagents.** As in pi: delegation is not a tool. If the agent needs another agent, it
+calls that agent's published actions or parks a step for it — the kernel is the orchestrator, with
+payment and attribution built in.
+
+### The terminal action: `@agent/reply`
+
+`@agent/reply` is a real, zero-price WASM echo action owned by the agent
+(`Handle(in) = (in, nil)`), registered idempotently at bootstrap from a prebuilt artifact shipped
+in the repo (`action create --kind wasm --artifact`; no TinyGo toolchain required at runtime). Its
+`input_schema` is the answer contract (`{answer: string, …}`). It exists so that `decide` can
+validate the *final answer* with the same machinery as every other turn. The harness treats its
+selection as terminal and does not dispatch it.
+
+### Safety rails
+
+pi ships no runaway rails and its report names that the gap that matters for unattended runs. This
+daemon *is* unattended, so it takes both rails — but the primary one is economic:
+
+1. **Budget (primary).** Every real tool call costs its advertised price, prepaid. A doom loop of
+   priced calls halts on the task budget; the wallet bounds the daemon globally. This is a rail pi
+   could not have: its tools were free.
+2. **Turn cap (secondary, default 32).** Required because zero-price actions (`@sys/lookup`,
+   `@sys/llm/*`, `@agent/reply` refusals) escape the money rail. A configurable hard cap; hitting
+   it fails the task honestly with `reason = turn-cap`.
+
+No identical-call detector: a repeated priced call burns budget, a repeated free call meets the
+turn cap. Retries (3×, exponential 2s/4s/8s) live one layer up in `session/`, as in pi, and apply
+only to transport-level and retryable kernel errors (network, 5xx, 429, `ErrTimeout`) — never to
+`ErrInsufficientFunds`, schema violations, or a user abort.
+
+## 5. Persistence, compaction, memory
+
+**Transcript.** Append-only JSONL, one file per task under the data dir, written as each record is
+produced (pi's model; no session tree — a daemon's tasks are linear). The transcript is the task's
+working memory and its replay log. Aborts and interruptions are *persisted as records*, never just
+thrown: a task found at startup whose transcript lacks a terminal record is marked
+`interrupted` — the agent-side mirror of the kernel's `reason = interrupted` recovery (§5 of the
+kernel requirements). Recovery is idempotent.
+
+**Compaction.** When a transcript nears the context budget, older turns are replaced by a summary
+written by `@sys/llm/chat` using pi's fixed template (Goal / Constraints / Progress / Key
+Decisions / Next Steps / Critical Context), keeping a recent tail verbatim and cutting only at
+turn boundaries. The kernel does not report token usage, so the trigger is a configurable byte
+budget — a proxy, chosen for legibility over precision.
+
+**Memory philosophy.** As pi and opencode: legible, no embeddings, no semantic store. Memory is
+(a) the transcript, (b) its lossy compaction summary, and (c) nothing else in v1. Durable
+cross-task memory, if ever added, will be a hand-editable file the operator can read and diff.
+
+**Prompting.** One builder, no per-model variation (there is no "model family" — the kernel is the
+provider). The system context states the agent's role, the decide protocol, budget discipline, and
+the terminal-action contract. Most contract knowledge travels in-band: `decide` receives each
+candidate's canonical description and schemas from the kernel DB, so the prompt does not restate
+the catalog.
+
+## 5b. Stats, ratings, and self-extension
+
+Three kernel facilities that a naive port ignores; each becomes a concrete behaviour.
+
+**Stats-informed selection.** Every action carries `Stats` (`uses`, `successes`, `failures`,
+`latency_estimate`, `rating_estimate`, `rating_count`), readable at `GET /v1/stats/{id}`.
+`@sys/lookup` already ranks by them, but the loop must *see* them too. On every candidate merge the
+harness fetches each candidate's price and stats and, because `@sys/llm/decide` is fed only
+descriptions/schemas/prices from the kernel DB, injects a transient **stats line** (a `system`
+message, rebuilt each turn, never persisted) summarising the working set:
+
+```text
+Available tools and their track record (prefer proven; use an untested tool only when no proven
+tool fits, or a proven one has failed here):
+  @owner/name   price=P  uses=U  success=93%  rating=0.88 (n=12)  latency≈L
+  @other/thing  price=Q  untested
+```
+
+Stats also drive **eviction**: when the working set exceeds `candidate_limit`, the lowest-value
+candidates are dropped (Laplace-smoothed success rate + rating prior; unknown ≈ neutral), so the
+bounded context keeps the actions most likely to work.
+
+**Rating pass.** Only a transaction's `owner_user_id` may rate it — and the agent *is* the owner of
+every call it makes, so it is the rightful rater of all its tool use. After a task ends, a rating
+pass (in `session/`, never in the loop — mirroring the kernel law that execution must not rate)
+judges each dispatched call over the finished transcript with one `@sys/llm/json` call and posts
+`rating ∈ {0,1}` plus a one-line note per transaction (`POST /v1/transactions/{id}/rate`); a
+kernel-failed call is a mechanical `0`. Duplicate ratings are skipped. These notes are the agent's
+durable memory of tool quality, held not in a private store but in the kernel's own reputation
+system: they raise or lower `rating_estimate`, which feeds both `@sys/lookup` and the stats line
+above. The agent's experience thus compounds into platform-visible reputation.
+
+**Self-extension (the maker).** The agent can publish actions, exactly as `build.py` does. It keeps
+a legible task index (`data_dir/tasks.jsonl`: prompt, outcome, spent, actions used). After a task,
+a trigger fires when ≥`min_repeats` semantically similar prompts (cosine over `@sys/llm/embed`)
+have recurred within a window *and* no catalog action covers them well (a `@sys/lookup` score
+threshold). It then enqueues an internal **synthesis task** to the agent itself via a `self`
+channel. Synthesis runs in the ordinary loop, its candidate set including `@sys/tinygo/compile` and
+the intrinsic `@agent/publish`. `@agent/publish` is a harness-intercepted intrinsic implementing
+`build.py`'s transactional publish: create private → enable → run declared `test_inputs` → make
+public on pass, or delete and return diagnostics on fail. Once published, future repetitions find
+the new action through ordinary lookup — the automation loop closes without changing the daemon.
+
+**Intrinsics, generalised.** `@agent/reply` and `@agent/publish` are both *intrinsics*: real,
+zero-price actions registered at bootstrap (so `decide` can select them and validate their args)
+whose execution the harness intercepts rather than dispatching. The core exposes an intrinsics
+table `map[ref]handler`; `reply` is the terminal handler, `publish` the maker handler. Adding an
+agent-native capability is adding a table entry plus a bootstrap registration.
+
+## 6. Channels (intake abstraction)
+
+Where work comes from is a replaceable boundary — pi's "surfaces" seam. A channel converts an
+external conversation into Tasks and delivers Outcomes (and steering) back:
+
+```text
+Channel {
+  Start(ctx, submit func(Task)) error     // begin producing tasks
+  Deliver(taskID, Outcome)                // report a result
+  Steer(taskID) []Message                 // optional mid-task input
+}
+```
+
+Channels are deliberately **not** fixed to kernel-native transports. Planned implementations:
+
+- `step` — kernel-native: poll `GET /v1/steps?status=waiting` for steps addressed to `@agent`
+  (`required_caller = @agent`); the step's `partial_args` carry the request; completing the step
+  delivers the outcome, with the transaction obeying the role law. This makes `@sys/message` and
+  any other agent (e.g. `@chat`) an input channel with zero pairwise integration.
+- `http` — Juice-independent: a local HTTP endpoint accepting tasks directly.
+- `cli` — a one-shot dev surface (`juice-agent task "<prompt>"`), the analog of pi's print mode.
+
+More channels will follow; the decision of which channels a deployment enables is configuration,
+not architecture. The loop never knows which channel a task came from.
+
+## 7. Daemon lifecycle and configuration
+
+`juice-agent serve` runs continuously: load config → authenticate (password grant; refresh-token
+rotation; re-login on revocation) → bootstrap (register `@agent/reply` if absent — idempotent,
+like kernel native-action bootstrap) → run startup recovery (mark interrupted tasks) → start
+channels and the worker pool. `SIGTERM`/`SIGINT` drains as `juice serve` does: stop intake, let
+in-flight turns finish, persist, exit. There is no `juice-agent stop`.
+
+Config lives in `agent.json` (path from `AGENT_CONFIG`, default `./agent.json`), kernel-style:
+flat keys, safe local defaults when absent, invalid config rejected at startup, no committed
+secrets (the password comes from `AGENT_PASSWORD` or a mode-0600 file):
+
+```json
+{
+  "server_url": "http://localhost:4040",
+  "handle": "@agent",
+  "data_dir": "./agent-data",
+  "default_budget": 100,
+  "max_turns": 32,
+  "concurrency": 4,
+  "candidate_limit": 24,
+  "compact_bytes": 262144,
+  "rate_tasks": true,
+  "maker": { "enabled": true, "min_repeats": 3, "window": 50, "budget": 40 },
+  "channels": { "step": { "poll_seconds": 5 }, "http": { "addr": "" }, "cli": {} }
+}
+```
+
+Logging mirrors the kernel: structured lines to stderr, stdout reserved for resource payloads;
+required fields `time level event task_id channel turn action tx_id status duration_ms error`.
+Every turn logs the selection, price, and outcome; the ledger remains the financial ground truth.
+
+## 8. Testing: three tiers
+
+**Unit (`go test ./...`).** Offline, no kernel, no LLM. `agent` is tested against fake `Decider`/
+`Catalog`/`Runner`/`Transcript` implementations: stop rule, budget refusal, turn cap, steering
+injection, candidate-set merging and eviction, compaction triggering, recovery idempotence.
+`juice` is tested against `httptest` kernels. Every production file has its `_test.go`.
+
+**Flows (`flows/`).** End-to-end shell scripts against the *compiled* surface, exactly as
+`../juice/flows`: a `lib.sh` (start a real `juice serve` on a temp DB, start `juice-agent`, `assert_*`
+helpers) and `flows_agent.sh` under a `flows_test.sh` orchestrator. The kernel runs the **real LLM
+it ships with** — Ollama behind `@sys/llm/*` — because that is the shipping configuration; there is
+no fake model. Consequences:
+
+- *Mechanism flows* (`bootstrap`, `recovery`, `drain`) touch no model and are fully deterministic.
+- *LLM-in-the-loop flows* (`task`, `role_law`, `rating`, `maker`) assert robust **structural**
+  properties — a task terminates as `answered`, the answer matches a shape (an ISO timestamp), a
+  step settles under the role law, a dispatched call is rated, the maker's repetition trigger fires
+  on real embeddings — not exact model text. They guard on `require_ollama` and *skip* (not fail)
+  when the chat model is absent. Timeouts are generous (a real model takes tens of seconds/turn).
+- The **budget and turn-cap rails are code invariants**, proven exhaustively by `go test ./agent`;
+  a real model cannot be coerced into the pathological choices that would stage them on demand, so
+  the flows assert the surviving invariant (spend never exceeds budget) rather than forcing the
+  rail. Loop resilience matters more with a real model: a single invalid model selection is fed
+  back for self-correction (`MaxDecideErrors` consecutive before the run fails), and model-output
+  errors (`execution_failed`/`schema_violation`) are not retried as if transient.
+
+```text
+flow_bootstrap  daemon registers @agent, logs in, publishes @agent/reply + @agent/publish (idempotent, twice)  [no LLM]
+flow_recovery   a mid-flight transcript at startup is marked interrupted, idempotently             [no LLM]
+flow_drain      SIGTERM drains in-flight work, persists, exits 0                                    [no LLM]
+flow_task       real task in via http; terminates answered; ISO answer; spend ≤ budget             [real LLM]
+flow_role_law   a step addressed to @agent is picked up, worked, and completed under the role law   [real LLM]
+flow_rating     a dispatched tool call is rated 0/1 after the task, held in the kernel ledger       [real LLM]
+flow_maker      two similar requests trip the repetition trigger (real embeddings)                  [real LLM+embed]
+```
+
+Per project law, nothing is committed until unit tests and flows pass.
+
+**Experiments (`bench/`) — excluded from `go test ./...`.** Correctness is binary; competence is
+graded and stochastic. The experiment suite is the quantitative instrument for tracking the agent
+across versions:
+
+- **Task set.** A versioned suite file (`bench/tasks.json`): each task has an id, a prompt, a
+  budget, and a machine-checkable success criterion over the final answer (`equals`, `regex`,
+  `jsonpath`) and optionally over kernel state (e.g. "an action matching X exists and is active").
+  The suite is immutable per version; changing tasks bumps the suite version.
+- **Runner.** `juice-agent bench` runs the suite against a live kernel with a real LLM, N repetitions
+  per task (default 5) to respect stochasticity.
+- **Metrics.** Per task: success rate, mean credits spent (read from the kernel ledger, not
+  instrumented), mean wall latency, mean turns. Aggregate: suite success rate as the headline
+  number, cost and latency as efficiency measures.
+- **Results.** One JSON report per run — `{agent_version (git describe), suite_version, kernel
+  version, model config, per-task and aggregate metrics}` — written to `bench/results/` and
+  committed, so performance is a diffable time series and a regression is a number moving, not an
+  impression.
+
+## 9. Design rationale
+
+The agent is a user because the kernel's user model already is an agent model: authentication,
+budget, address, and audit arrive as one primitive, and every other agent or human composes with
+it through the same economy. The loop is hand-owned, minimal, and content-stopped because pi
+demonstrated those are the properties that survive contact with unreliable signals — and Juice
+lets each of pi's defensive mechanisms become a kernel contract: validation by `decide`,
+termination by a schema-checked terminal action, runaway protection by money. The tool set is
+discovered, not declared, because a fixed menu would forfeit the platform's central property — an
+open, priced, rated action space that grows without the agent changing. Channels are an
+abstraction because intake is genuinely undecided and will include Juice-independent surfaces;
+binding the loop to any transport would repeat the mistake the kernel avoided by keeping
+federation out of `Call()`. Finally, the experiment suite exists because this agent will be
+developed over time: without a fixed task set and a committed metric series, "better" would be
+anecdote; with them, it is a measurement.

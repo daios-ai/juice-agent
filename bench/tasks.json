@@ -1,0 +1,29 @@
+{
+  "suite_version": "v1",
+  "tasks": [
+    {
+      "id": "time-now",
+      "prompt": "What is the current time? Answer with an ISO-8601 timestamp.",
+      "budget": 20,
+      "check": { "type": "regex", "field": "answer", "value": "\\d{4}-\\d{2}-\\d{2}T\\d{2}:\\d{2}" }
+    },
+    {
+      "id": "arithmetic",
+      "prompt": "Compute 17 multiplied by 23 and give only the number as the answer.",
+      "budget": 30,
+      "check": { "type": "contains", "field": "answer", "value": "391" }
+    },
+    {
+      "id": "translate-spanish",
+      "prompt": "Translate the English sentence 'good morning' into Spanish.",
+      "budget": 40,
+      "check": { "type": "contains", "field": "answer", "value": "buenos" }
+    },
+    {
+      "id": "lookup-and-use",
+      "prompt": "Find a Juice action that can fetch a web page, then tell me its @owner/name.",
+      "budget": 40,
+      "check": { "type": "contains", "field": "answer", "value": "@sys/web" }
+    }
+  ]
+}

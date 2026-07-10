@@ -1,0 +1,114 @@
+package main
+
+import (
+	"context"
+	"sync"
+	"testing"
+	"time"
+
+	"github.com/daios-ai/juice-agent/agent"
+	"github.com/daios-ai/juice-agent/channel"
+	"github.com/daios-ai/juice-agent/session"
+)
+
+// captureChannel records deliveries and can inject one task at Start.
+type captureChannel struct {
+	name      string
+	seed      *agent.Task
+	mu        sync.Mutex
+	delivered map[string]agent.Outcome
+}
+
+func (c *captureChannel) Name() string { return c.name }
+func (c *captureChannel) Start(_ context.Context, submit func(agent.Task)) error {
+	if c.seed != nil {
+		submit(*c.seed)
+	}
+	return nil
+}
+func (c *captureChannel) Deliver(id string, out agent.Outcome) {
+	c.mu.Lock()
+	defer c.mu.Unlock()
+	if c.delivered == nil {
+		c.delivered = map[string]agent.Outcome{}
+	}
+	c.delivered[id] = out
+}
+func (c *captureChannel) Steering(string) []agent.Message { return nil }
+func (c *captureChannel) Stop()                           {}
+
+// stubKernel is the minimal session.Kernel that always replies immediately.
+type stubKernel struct{}
+
+func (stubKernel) Decide(context.Context, []agent.Message, []string) (*agent.Selection, error) {
+	return &agent.Selection{Action: "@agent/reply", Args: map[string]any{"answer": "done"}}, nil
+}
+func (stubKernel) Lookup(context.Context, string, int) ([]agent.Candidate, error) { return nil, nil }
+func (stubKernel) Meta(context.Context, string) (int, agent.ActionStats, error) {
+	return 0, agent.ActionStats{}, nil
+}
+func (stubKernel) Run(context.Context, string, map[string]any) (agent.RunResult, error) {
+	return agent.RunResult{}, nil
+}
+func (stubKernel) Chat(context.Context, []agent.Message) (string, error) { return "", nil }
+func (stubKernel) ChatJSON(context.Context, []agent.Message, map[string]any) (any, error) {
+	return nil, nil
+}
+func (stubKernel) Embed(context.Context, string) ([]float64, error) { return nil, nil }
+func (stubKernel) Rate(context.Context, string, int, string) error  { return nil }
+
+func newExecutor(dir string) *session.Executor {
+	return &session.Executor{
+		Kernel:  stubKernel{},
+		DataDir: dir,
+		RetryOK: func(error) bool { return false },
+		Loop: agent.Config{
+			ReplyAction: "@agent/reply", LookupAction: "@sys/lookup", MaxTurns: 5,
+			Intrinsics: map[string]agent.Intrinsic{"@agent/reply": {
+				Handle: func(_ context.Context, a map[string]any) (map[string]any, bool, error) { return a, true, nil },
+			}},
+		},
+	}
+}
+
+func TestRuntimeRoutesOutcomeBackToChannel(t *testing.T) {
+	ch := &captureChannel{name: "test", seed: &agent.Task{ID: "j1", Channel: "test", Budget: 10,
+		Messages: []agent.Message{{Role: agent.RoleUser, Content: "hi"}}}}
+	rt := NewRuntime(newExecutor(t.TempDir()), []channel.Channel{ch}, 2, func(string, map[string]any) {})
+
+	ctx := context.Background()
+	if err := rt.Start(ctx, 2); err != nil {
+		t.Fatal(err)
+	}
+	// wait for delivery
+	deadline := time.After(2 * time.Second)
+	for {
+		ch.mu.Lock()
+		_, ok := ch.delivered["j1"]
+		ch.mu.Unlock()
+		if ok {
+			break
+		}
+		select {
+		case <-deadline:
+			t.Fatal("outcome not delivered within timeout")
+		case <-time.After(5 * time.Millisecond):
+		}
+	}
+	rt.Shutdown()
+
+	ch.mu.Lock()
+	defer ch.mu.Unlock()
+	if ch.delivered["j1"].Status != agent.StatusAnswered {
+		t.Fatalf("delivered outcome = %+v", ch.delivered["j1"])
+	}
+}
+
+func TestRuntimeSubmitDropsWhenClosing(t *testing.T) {
+	rt := NewRuntime(newExecutor(t.TempDir()), nil, 1, func(string, map[string]any) {})
+	rt.Start(context.Background(), 1)
+	rt.Shutdown()
+	// Submitting after shutdown must not panic (send on closed channel) and must
+	// simply drop.
+	rt.submit(agent.Task{ID: "late"})
+}

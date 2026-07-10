@@ -1,1 +1,177 @@
 # juice-agent
+
+A Go daemon implementing a general task-solving agent whose entire tool set is a
+[Juice](../juice) kernel's action catalog. It registers as a kernel *user*, discovers actions with
+`@sys/lookup`, reasons with `@sys/llm/decide`, and dispatches every tool through `POST /v1/run` — so
+it pays for what it runs, rates the tools it uses, and (optionally) publishes new actions to
+automate recurring work. The loop is pi-style: a small hand-owned cycle that stops when the model
+selects the terminal `@agent/reply` action.
+
+See `agent-design.md` for the full design and rationale.
+
+## Prerequisites
+
+1. **A running Juice kernel with a real LLM.** The kernel's `native.llm` must point at an Ollama
+   instance with a chat model and an embed model. The agent is validated with the kernel default
+   `gemma4:26b` (chat) + `nomic-embed-text` (embed); smaller models often can't tool-call reliably
+   enough to drive the loop.
+2. **An agent account on that kernel, funded with credits** (below).
+3. Go 1.22+ to build. (TinyGo is only needed to *regenerate* the embedded reply artifact via
+   `make artifact`; the prebuilt one is committed.)
+
+## Build
+
+```sh
+make build        # -> ./juice-agent
+```
+
+## One-time setup on the kernel
+
+The daemon logs in as an ordinary user, so create and fund that user once (as the kernel operator):
+
+```sh
+# create the agent's account
+juice user create @agent agent@example.com --password 's3cret-pass'
+
+# fund it — every tool call the agent makes is prepaid from this balance
+juice admin deposit @agent 100000
+```
+
+The daemon self-registers its two intrinsic actions (`@agent/reply`, `@agent/publish`) on first
+start; nothing else is needed kernel-side.
+
+## Configuration
+
+Config is `agent.json` (path from `AGENT_CONFIG`, default `./agent.json`). Secrets never live in it:
+the password comes from `AGENT_PASSWORD` or the file named by `AGENT_PASSWORD_FILE`.
+
+```json
+{
+  "server_url": "http://localhost:4040",
+  "handle": "@agent",
+  "data_dir": "./agent-data",
+  "default_budget": 100,
+  "max_turns": 32,
+  "concurrency": 4,
+  "lookup_limit": 8,
+  "candidate_limit": 24,
+  "compact_bytes": 262144,
+  "rate_tasks": true,
+  "maker": { "enabled": false, "min_repeats": 3, "window": 50, "budget": 40, "threshold": 0.85 },
+  "channels": {
+    "http": { "addr": "127.0.0.1:871" },
+    "step": { "poll_seconds": 5 }
+  }
+}
+```
+
+- `default_budget` — credits a task may spend when its channel doesn't set one. The primary runaway
+  rail: a task can never spend more than its budget.
+- `max_turns` — secondary rail, bounding zero-price loops.
+- `rate_tasks` — after each task, the agent grades every tool call it made (0/1 + a note) via
+  `POST /v1/transactions/{id}/rate`; those ratings feed `@sys/lookup` and future tool selection.
+- `maker.enabled` — when on, a recurring request that no catalog action serves triggers the agent to
+  synthesize and publish a WASM action automating it.
+- `channels` — only the channels you list are enabled. Omit the block for `juice-agent task` (below),
+  which needs no channel.
+
+## Running
+
+### As a daemon
+
+```sh
+AGENT_PASSWORD='s3cret-pass' AGENT_CONFIG=./agent.json juice-agent serve
+```
+
+It authenticates, registers its intrinsics, runs startup recovery, starts the configured channels
+and a worker pool, and serves until `SIGTERM`/`SIGINT` — on which it drains in-flight tasks,
+persists, and exits 0. Structured logs go to stderr.
+
+### One-shot (no channel, no daemon)
+
+```sh
+AGENT_PASSWORD='s3cret-pass' juice-agent task "What is the current time? Reply with an ISO-8601 timestamp."
+```
+
+Runs one task and prints its outcome as JSON to stdout:
+
+```json
+{ "status": "answered", "answer": { "answer": "2026-07-10T00:50:45Z" }, "spent": 0, "turns": 2 }
+```
+
+## Giving the daemon work (channels)
+
+Where tasks come from is a replaceable boundary. Two channels ship:
+
+### HTTP channel (Juice-independent)
+
+Enable `channels.http.addr`, then submit tasks over plain HTTP:
+
+```sh
+# submit — returns {"task_id":"http-1"}
+curl -s -X POST http://127.0.0.1:871/task \
+  -H 'Content-Type: application/json' \
+  -d '{"prompt":"Translate \"good morning\" into Spanish.","budget":40}'
+
+# poll — 202 {"status":"running"} until ready, then 200 with the outcome
+curl -s http://127.0.0.1:871/task/http-1
+```
+
+`budget` is optional (falls back to `default_budget`).
+
+### Step channel (kernel-native)
+
+Enable `channels.step`, and any user or action can hand the agent work by parking a *step* addressed
+to `@agent` — no integration between them beyond the kernel. The simplest way is `@sys/message`:
+
+```sh
+# as any funded kernel user
+juice run @sys/message '{"to":"@agent","message":"Summarise the latest release notes."}'
+```
+
+The daemon polls for waiting steps addressed to it, works each as a task, and completes the step
+with its answer — the settlement transaction obeys the kernel's role law (caller `@agent`). This is
+also how *other agents* (e.g. `@chat`) delegate to it.
+
+## Outcomes
+
+Every task yields:
+
+| field    | meaning                                                        |
+| -------- | ------------------------------------------------------------- |
+| `status` | `answered`, `failed`, or `interrupted`                         |
+| `answer` | the reply object the model produced (for `answered`)          |
+| `reason` | why it failed (`turn-cap`, `decide-error: …`) when not answered|
+| `spent`  | credits spent — reconstructible from the kernel ledger        |
+| `turns`  | model round-trips taken                                        |
+
+## Observability
+
+- **Logs** — structured JSON to stderr (`event`, `task_id`, `turn`, `action`, `tx_id`, …).
+- **Transcripts** — one append-only JSONL per task under `data_dir/`; the durable record and replay
+  log. A task interrupted at shutdown is marked on the next start's recovery scan.
+- **Ledger** — the kernel is the financial ground truth: `juice tx list` shows the agent's calls,
+  their costs, and the ratings it left.
+
+## Measuring performance across versions
+
+The agent will change over time, so competence is tracked quantitatively, not by impression:
+
+```sh
+juice-agent bench bench/tasks.json 5     # 5 repetitions per task, against a live kernel + LLM
+```
+
+`bench/tasks.json` is a versioned suite of tasks with machine-checkable success criteria. Each run
+writes a report (success rate, mean credits from the ledger, latency, turns) keyed by `git describe`
++ suite version under `bench/results/`, so performance is a diffable time series. The bench needs a
+live kernel and real LLM, so it is excluded from `go test`.
+
+## Tests
+
+```sh
+make test     # go test ./... — offline, deterministic, no kernel or LLM
+make flows    # end-to-end against a real kernel + real Ollama (JUICE_BIN=../juice/juice)
+```
+
+Mechanism flows (bootstrap, recovery, drain) are deterministic; LLM flows (task, role law, rating,
+maker) drive a real model and skip cleanly if Ollama or the chat model is unavailable.

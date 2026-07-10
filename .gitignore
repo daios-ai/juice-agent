@@ -1,0 +1,21 @@
+# build output (single binary at repo root, juice-style)
+/juice-agent
+
+# runtime data (transcripts, task index)
+/agent-data/
+*.jsonl
+
+# local kernel state
+*.db
+*.db-shm
+*.db-wal
+
+# local config with secrets
+/agent.json
+/juice.json
+
+# agentd build scratch (mirrors build.py's dir)
+/.agent_build/
+
+# bench outputs are committed; local scratch is not
+/bench/results/*.local.json
