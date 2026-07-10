@@ -6,18 +6,16 @@ import (
 	"os"
 	"testing"
 
-	"github.com/daios-ai/juice-agent/channel"
 	"github.com/daios-ai/juice-agent/juice"
-	"github.com/daios-ai/juice-agent/session"
 )
 
 // Compile-time guarantees that the juice client and adapters satisfy the
 // interfaces the higher layers depend on. If a method drifts, this fails to
 // build rather than at runtime.
 var (
-	_ session.Kernel     = (*juice.Client)(nil)
-	_ session.Publisher  = (*juice.Client)(nil)
-	_ channel.StepSource = stepAdapter{}
+	_ Kernel     = (*juice.Client)(nil)
+	_ Publisher  = (*juice.Client)(nil)
+	_ StepSource = stepAdapter{}
 )
 
 func TestLoggerEmitsStructuredJSON(t *testing.T) {

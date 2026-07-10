@@ -1,4 +1,4 @@
-package bench
+package main
 
 import (
 	"context"
@@ -32,7 +32,7 @@ func TestCheckTypes(t *testing.T) {
 }
 
 func TestRunAggregatesMetrics(t *testing.T) {
-	suite := Suite{Version: "vT", Tasks: []Task{
+	suite := Suite{Version: "vT", Tasks: []BenchTask{
 		{ID: "a", Prompt: "p", Budget: 10, Check: Check{Type: "equals", Value: "ok"}},
 	}}
 	// Deterministic clock: each now() call advances 100ms.
@@ -50,7 +50,7 @@ func TestRunAggregatesMetrics(t *testing.T) {
 		return agent.Outcome{Status: agent.StatusAnswered, Answer: map[string]any{"answer": ans},
 			Spent: 3, Turns: 2}, nil
 	}
-	rep := Run(context.Background(), suite, 4, "test-1", run, now)
+	rep := RunSuite(context.Background(), suite, 4, "test-1", run, now)
 	if len(rep.Tasks) != 1 {
 		t.Fatalf("tasks = %d", len(rep.Tasks))
 	}
@@ -70,7 +70,7 @@ func TestRunAggregatesMetrics(t *testing.T) {
 
 func TestLoadSuiteAndWriteReport(t *testing.T) {
 	// The committed starter suite must parse.
-	s, err := LoadSuite("tasks.json")
+	s, err := LoadSuite("../../bench/tasks.json")
 	if err != nil {
 		t.Fatalf("load starter suite: %v", err)
 	}

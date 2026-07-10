@@ -1,4 +1,4 @@
-package session
+package main
 
 import (
 	"bufio"
@@ -31,11 +31,11 @@ type Publisher interface {
 
 // MakerConfig governs self-extension.
 type MakerConfig struct {
-	Enabled    bool
-	MinRepeats int     // similar prompts within the window that trigger synthesis
-	Window     int     // how many recent tasks to consider
-	Budget     int     // credit budget for a synthesis task
-	Threshold  float64 // cosine similarity counting as "the same kind of request"
+	Enabled    bool    `json:"enabled"`
+	MinRepeats int     `json:"min_repeats"` // similar prompts within the window that trigger synthesis
+	Window     int     `json:"window"`      // how many recent tasks to consider
+	Budget     int     `json:"budget"`      // credit budget for a synthesis task
+	Threshold  float64 `json:"threshold"`   // cosine similarity counting as "the same kind of request"
 }
 
 // DefaultMakerConfig is a conservative starting policy.

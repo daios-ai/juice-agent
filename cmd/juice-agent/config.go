@@ -5,8 +5,6 @@ import (
 	"os"
 	"path/filepath"
 	"strings"
-
-	"github.com/daios-ai/juice-agent/session"
 )
 
 // Config is the daemon's configuration (agent.json), kernel-style: flat keys,
@@ -38,15 +36,6 @@ type Config struct {
 type MemoryConfig struct {
 	Enabled     bool `json:"enabled"`
 	MemoryBytes int  `json:"memory_bytes"`
-}
-
-// MakerConfig mirrors session.MakerConfig for JSON.
-type MakerConfig struct {
-	Enabled    bool    `json:"enabled"`
-	MinRepeats int     `json:"min_repeats"`
-	Window     int     `json:"window"`
-	Budget     int     `json:"budget"`
-	Threshold  float64 `json:"threshold"`
 }
 
 // ChannelConfig enables and configures intake surfaces.
@@ -180,11 +169,11 @@ func LoadConfig(path string) (Config, error) {
 	return cfg, nil
 }
 
-// makerConfig converts the JSON maker config into the session type, filling
-// zero fields from the session default so a partial config stays sane.
-func (c Config) makerConfig() session.MakerConfig {
-	d := session.DefaultMakerConfig()
-	m := session.MakerConfig{
+// makerConfig returns the maker config with zero fields filled from defaults,
+// so a partial config stays sane.
+func (c Config) makerConfig() MakerConfig {
+	d := DefaultMakerConfig()
+	m := MakerConfig{
 		Enabled:    c.Maker.Enabled,
 		MinRepeats: c.Maker.MinRepeats,
 		Window:     c.Maker.Window,

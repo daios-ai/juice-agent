@@ -7,8 +7,6 @@ import (
 	"time"
 
 	"github.com/daios-ai/juice-agent/agent"
-	"github.com/daios-ai/juice-agent/channel"
-	"github.com/daios-ai/juice-agent/session"
 )
 
 // captureChannel records deliveries and can inject one task at Start.
@@ -37,7 +35,7 @@ func (c *captureChannel) Deliver(id string, out agent.Outcome) {
 func (c *captureChannel) Steering(string) []agent.Message { return nil }
 func (c *captureChannel) Stop()                           {}
 
-// stubKernel is the minimal session.Kernel that always replies immediately.
+// stubKernel is the minimal Kernel that always replies immediately.
 type stubKernel struct{}
 
 func (stubKernel) Decide(context.Context, []agent.Message, []string) (*agent.Selection, error) {
@@ -57,8 +55,8 @@ func (stubKernel) ChatJSON(context.Context, []agent.Message, map[string]any) (an
 func (stubKernel) Embed(context.Context, string) ([]float64, error) { return nil, nil }
 func (stubKernel) Rate(context.Context, string, int, string) error  { return nil }
 
-func newExecutor(dir string) *session.Executor {
-	return &session.Executor{
+func newExecutor(dir string) *Executor {
+	return &Executor{
 		Kernel:  stubKernel{},
 		DataDir: dir,
 		RetryOK: func(error) bool { return false },
@@ -74,7 +72,7 @@ func newExecutor(dir string) *session.Executor {
 func TestRuntimeRoutesOutcomeBackToChannel(t *testing.T) {
 	ch := &captureChannel{name: "test", seed: &agent.Task{ID: "j1", Channel: "test", Budget: 10,
 		Messages: []agent.Message{{Role: agent.RoleUser, Content: "hi"}}}}
-	rt := NewRuntime(newExecutor(t.TempDir()), []channel.Channel{ch}, 2, func(string, map[string]any) {})
+	rt := NewRuntime(newExecutor(t.TempDir()), []Channel{ch}, 2, func(string, map[string]any) {})
 
 	ctx := context.Background()
 	if err := rt.Start(ctx, 2); err != nil {

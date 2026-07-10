@@ -43,31 +43,33 @@ faces exactly one interface — the kernel — which validates structure on its 
 ## 2. Layering (pi's architecture, transposed)
 
 pi's load-bearing seam is that the loop lives in a tiny core that knows nothing about disk,
-sessions, or UI, with policy wired around it via interfaces. We keep that seam exactly:
+sessions, or UI. Only **two** seams are actually load-bearing, so there are exactly **three
+packages** — one per seam plus the product that uses both. (pi has more packages because its core
+and provider layers are separately *published libraries*; ours are not, so extra packages would be
+ceremony.)
 
 ```text
-cmd/juice-agent/    entrypoint: config, wiring, lifecycle (serve, drain, recovery), handle→home resolution
-channel/       task intake surfaces (pi's "front-ends"): replaceable, concurrent
-session/       policy shell (pi's coding-agent layer): persistence, compaction, retries,
-               system-prompt assembly (persona + knowledge + memory), post-task memory update
-agent/         THE LOOP (pi's agent-core): pure, interface-driven, no I/O imports
-juice/         kernel client: typed HTTP client implementing agent's interfaces
-bench/         experiment suite: quantitative performance measurement
-flows/         end-to-end shell flows against the compiled surface (not Go)
+agent/           THE LOOP (pi's agent-core): pure, interface-driven, no I/O imports
+juice/           kernel client: the only package that speaks HTTP to the kernel
+cmd/juice-agent/ the product (package main): everything else — lifecycle, config, home resolution,
+                 channels (intake), the policy shell (transcripts, compaction, retries, system-prompt
+                 assembly, memory, rating), the maker, and the bench runner. Files are named for
+                 their function (execute.go, transcript.go, prompt.go, channels.go, maker.go, …).
+bench/           experiment-suite data (tasks.json, results/) — no Go
+flows/           end-to-end shell flows against the compiled surface (not Go)
 ```
 
-The 0.1.1 additions (§5c) live in `session/` and `cmd/`; the pure loop is unchanged.
+Dependency law, mirroring the kernel's own (`kernel` must not import SQLite/wazero/…) — the two seams
+that matter:
 
-Dependency law, mirroring the kernel's own (`kernel` must not import SQLite/wazero/…):
-
-- `agent` imports **neither `net/http` nor `juice`**. It depends only on small interfaces it
-  defines (`Decider`, `Catalog`, `Runner`, `Transcript`). Tests use fakes.
-- `channel` and `session` depend on `agent`'s types, never on each other's implementations.
+- `agent` imports **neither `net/http` nor `juice`**. It depends only on small interfaces it defines
+  (`Decider`, `Catalog`, `Runner`, `Transcript`). Tests use fakes. This is what keeps the loop pure.
 - `juice` is the only package that speaks HTTP to the kernel.
+- `cmd/juice-agent` depends on both and is the sole `package main`.
 
-Package and file counts stay small; files are named for their function; no file is split for size
-alone. **Every production Go file has a corresponding `_test.go` with independent tests.**
-`go build ./...` and `go test ./...` pass offline with no kernel, no LLM, no network.
+File counts stay small; files are named for their function; no file is split for size alone. **Every
+production Go file has a corresponding `_test.go` with independent tests.** `go build ./...` and
+`go test ./...` pass offline with no kernel, no LLM, no network.
 
 ## 3. The unit of work: a Task
 
@@ -167,7 +169,7 @@ daemon *is* unattended, so it takes both rails — but the primary one is econom
    it fails the task honestly with `reason = turn-cap`.
 
 No identical-call detector: a repeated priced call burns budget, a repeated free call meets the
-turn cap. Retries (3×, exponential 2s/4s/8s) live one layer up in `session/`, as in pi, and apply
+turn cap. Retries (3×, exponential 2s/4s/8s) live in the policy layer (outside the pure loop), as in pi, and apply
 only to transport-level and retryable kernel errors (network, 5xx, 429, `ErrTimeout`) — never to
 `ErrInsufficientFunds`, schema violations, or a user abort.
 
@@ -216,7 +218,7 @@ bounded context keeps the actions most likely to work.
 
 **Rating pass.** Only a transaction's `owner_user_id` may rate it — and the agent *is* the owner of
 every call it makes, so it is the rightful rater of all its tool use. After a task ends, a rating
-pass (in `session/`, never in the loop — mirroring the kernel law that execution must not rate)
+pass (in the policy layer, never in the loop — mirroring the kernel law that execution must not rate)
 judges each dispatched call over the finished transcript with one `@sys/llm/json` call and posts
 `rating ∈ {0,1}` plus a one-line note per transaction (`POST /v1/transactions/{id}/rate`); a
 kernel-failed call is a mechanical `0`. Duplicate ratings are skipped. These notes are the agent's
@@ -255,7 +257,7 @@ holds `agent.json` and `data/` (transcripts, maker index). `juice-agent @researc
 this home, so a differently-behaved agent is a directory, not new code. This splits pi's `AGENTS.md`
 along the authorship seam.
 
-**System prompt.** Before each task the policy layer (`session/`, not the pure loop) assembles one
+**System prompt.** Before each task the policy layer (not the pure loop) assembles one
 `system` message — role line + `persona.md` + `knowledge.md` + `memory.md` digest + the operating
 contract (decide protocol, budget, terminal action) — and prepends it. This is the builder 0.1's §5
 claimed but never wired. One builder, no per-model variation (the kernel is the one provider); the
@@ -265,7 +267,7 @@ loop is unchanged — it receives messages and never knows a prompt exists.
 **Learned memory.** After a task settles (alongside the rating pass, §5b), one `@sys/llm/chat` call
 summarises what it did and learned into a dated `memory.md` entry; the next task loads `memory.md`
 into the system prompt, so the agent carries history forward. Update is best-effort (never fails the
-task) and lives in `session/`. `memory.md` is byte-bounded (`memory_bytes`): over budget, §5's
+task) and lives in the policy layer. `memory.md` is byte-bounded (`memory_bytes`): over budget, §5's
 compaction folds the oldest entries into a digest. Representation is a summarised file, not an
 embedding store — the middle path between pi (no automatic memory) and OpenClaw (vectors + wiki);
 escalate to a `@sys/llm/embed` index only if a readable file stops scaling. `memory.enabled=false`
@@ -346,7 +348,7 @@ Every turn logs the selection, price, and outcome; the ledger remains the financ
 **Unit (`go test ./...`).** Offline, no kernel, no LLM. `agent` is tested against fake `Decider`/
 `Catalog`/`Runner`/`Transcript` implementations: stop rule, budget refusal, turn cap, steering
 injection, candidate-set merging and eviction, compaction triggering, recovery idempotence.
-`session` additionally covers the new 0.1.1 policy: system-prompt assembly (role + persona + knowledge
+The product-package tests additionally cover the new 0.1.1 policy: system-prompt assembly (role + persona + knowledge
 + memory digest, with absent files skipped), the post-task memory update and its byte-bounded
 self-compaction, and agent-home / handle resolution. `juice` is tested against `httptest` kernels.
 Every production file has its `_test.go`.

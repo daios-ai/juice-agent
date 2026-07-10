@@ -5,17 +5,15 @@ import (
 	"sync"
 
 	"github.com/daios-ai/juice-agent/agent"
-	"github.com/daios-ai/juice-agent/channel"
 	"github.com/daios-ai/juice-agent/juice"
-	"github.com/daios-ai/juice-agent/session"
 )
 
 // Runtime is the daemon's core: a bounded worker pool consuming tasks from a
 // queue that channels and the maker feed. It routes each finished task's outcome
 // back through its originating channel and drains cleanly on shutdown.
 type Runtime struct {
-	exec     *session.Executor
-	channels map[string]channel.Channel
+	exec     *Executor
+	channels map[string]Channel
 	queue    chan agent.Task
 	log      func(string, map[string]any)
 
@@ -25,11 +23,11 @@ type Runtime struct {
 }
 
 // NewRuntime wires an executor to a set of channels with the given worker count.
-func NewRuntime(exec *session.Executor, channels []channel.Channel, concurrency int, log func(string, map[string]any)) *Runtime {
+func NewRuntime(exec *Executor, channels []Channel, concurrency int, log func(string, map[string]any)) *Runtime {
 	if concurrency <= 0 {
 		concurrency = 4
 	}
-	chm := map[string]channel.Channel{}
+	chm := map[string]Channel{}
 	for _, ch := range channels {
 		chm[ch.Name()] = ch
 	}
@@ -113,14 +111,14 @@ func (r *Runtime) Shutdown() {
 // keeping channel independent of the kernel client.
 type stepAdapter struct{ cl *juice.Client }
 
-func (a stepAdapter) WaitingSteps(ctx context.Context) ([]channel.StepInfo, error) {
+func (a stepAdapter) WaitingSteps(ctx context.Context) ([]StepInfo, error) {
 	steps, err := a.cl.WaitingSteps(ctx)
 	if err != nil {
 		return nil, err
 	}
-	out := make([]channel.StepInfo, 0, len(steps))
+	out := make([]StepInfo, 0, len(steps))
 	for _, s := range steps {
-		out = append(out, channel.StepInfo{ID: s.ID, PartialArgs: s.PartialArgs, CreatedBy: s.CreatedBy})
+		out = append(out, StepInfo{ID: s.ID, PartialArgs: s.PartialArgs, CreatedBy: s.CreatedBy})
 	}
 	return out, nil
 }
@@ -128,4 +126,16 @@ func (a stepAdapter) WaitingSteps(ctx context.Context) ([]channel.StepInfo, erro
 func (a stepAdapter) CompleteStep(ctx context.Context, id string, args map[string]any) error {
 	_, err := a.cl.CompleteStep(ctx, id, args)
 	return err
+}
+
+// Channel is one task-intake surface. Start begins producing tasks (submitting
+// each via the callback) and returns once producers are running; Deliver reports
+// a finished task's outcome; Steering supplies optional mid-task input; Stop
+// halts production.
+type Channel interface {
+	Name() string
+	Start(ctx context.Context, submit func(agent.Task)) error
+	Deliver(taskID string, out agent.Outcome)
+	Steering(taskID string) []agent.Message
+	Stop()
 }

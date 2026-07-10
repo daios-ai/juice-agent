@@ -11,13 +11,12 @@ import (
 	"os"
 	"os/signal"
 	"strings"
+	"sync"
 	"syscall"
 	"time"
 
 	"github.com/daios-ai/juice-agent/agent"
-	"github.com/daios-ai/juice-agent/channel"
 	"github.com/daios-ai/juice-agent/juice"
-	"github.com/daios-ai/juice-agent/session"
 )
 
 // version and commit are injected at build time via -ldflags (see Makefile).
@@ -73,7 +72,7 @@ config: AGENT_CONFIG (default ./agent.json); password: AGENT_PASSWORD or AGENT_P
 // setup does the shared startup: load config, authenticate, bootstrap the
 // intrinsic actions, and assemble the executor. It returns the executor, the
 // client, and the resolved loop config.
-func setup(ctx context.Context, log *logger, cliHandle string) (*session.Executor, *juice.Client, agent.Config, Config, error) {
+func setup(ctx context.Context, log *logger, cliHandle string) (*Executor, *juice.Client, agent.Config, Config, error) {
 	cfg, err := ResolveConfig(cliHandle)
 	if err != nil {
 		return nil, nil, agent.Config{}, cfg, fmt.Errorf("config: %w", err)
@@ -104,7 +103,7 @@ func setup(ctx context.Context, log *logger, cliHandle string) (*session.Executo
 	}
 	log.event("bootstrap", map[string]any{"reply": replyRef, "publish": publishRef})
 
-	maker, err := session.NewMaker(cfg.DataDir, cfg.makerConfig(), cl, cl, log.event)
+	maker, err := NewMaker(cfg.DataDir, cfg.makerConfig(), cl, cl, log.event)
 	if err != nil {
 		return nil, nil, agent.Config{}, cfg, fmt.Errorf("maker: %w", err)
 	}
@@ -124,18 +123,18 @@ func setup(ctx context.Context, log *logger, cliHandle string) (*session.Executo
 		LookupLimit:    cfg.LookupLimit,
 		Intrinsics:     intrinsics,
 	}
-	prompter := session.LoadPrompter(self.Handle, replyRef, cfg.personaPath(), cfg.knowledgePath())
-	var mem *session.Memory
+	prompter := LoadPrompter(self.Handle, replyRef, cfg.personaPath(), cfg.knowledgePath())
+	var mem *Memory
 	if cfg.Memory.Enabled {
-		mem = session.NewMemory(cfg.memoryPath(), cfg.Memory.MemoryBytes, cl)
+		mem = NewMemory(cfg.memoryPath(), cfg.Memory.MemoryBytes, cl)
 	}
 	log.event("identity", map[string]any{"handle": self.Handle, "home": cfg.Home, "memory": cfg.Memory.Enabled})
 
-	exec := &session.Executor{
+	exec := &Executor{
 		Kernel:       cl,
 		DataDir:      cfg.DataDir,
 		CompactBytes: cfg.CompactBytes,
-		Retry:        session.DefaultRetryPolicy(),
+		Retry:        DefaultRetryPolicy(),
 		RetryOK:      juice.IsRetryable,
 		Loop:         loopCfg,
 		RateTasks:    cfg.RateTasks,
@@ -157,7 +156,7 @@ func runServe(_ []string, handle string) error {
 		return err
 	}
 
-	if marked, err := session.Recover(cfg.DataDir); err == nil && len(marked) > 0 {
+	if marked, err := Recover(cfg.DataDir); err == nil && len(marked) > 0 {
 		log.event("recovery", map[string]any{"interrupted": marked})
 	}
 
@@ -168,7 +167,7 @@ func runServe(_ []string, handle string) error {
 	}
 	fields := map[string]any{"channels": channelNames(channels), "concurrency": cfg.Concurrency}
 	for _, ch := range channels {
-		if hc, ok := ch.(*channel.HTTP); ok {
+		if hc, ok := ch.(*HTTP); ok {
 			fields["http_addr"] = hc.Addr
 		}
 	}
@@ -209,19 +208,19 @@ func runTask(args []string, handle string) error {
 }
 
 // buildChannels constructs the enabled intake surfaces from config.
-func buildChannels(cfg Config, cl *juice.Client) []channel.Channel {
-	var out []channel.Channel
+func buildChannels(cfg Config, cl *juice.Client) []Channel {
+	var out []Channel
 	if hc := cfg.Channels.HTTP; hc != nil && hc.Addr != "" {
-		out = append(out, channel.NewHTTP(hc.Addr, cfg.DefaultBudget))
+		out = append(out, NewHTTP(hc.Addr, cfg.DefaultBudget))
 	}
 	if sc := cfg.Channels.Step; sc != nil {
 		interval := time.Duration(sc.PollSeconds) * time.Second
-		out = append(out, channel.NewStep(stepAdapter{cl: cl}, interval, cfg.DefaultBudget))
+		out = append(out, NewStep(stepAdapter{cl: cl}, interval, cfg.DefaultBudget))
 	}
 	return out
 }
 
-func channelNames(cs []channel.Channel) []string {
+func channelNames(cs []Channel) []string {
 	out := make([]string, 0, len(cs))
 	for _, c := range cs {
 		out = append(out, c.Name())
@@ -250,4 +249,27 @@ func resolvePassword() (string, error) {
 		return strings.TrimSpace(string(b)), nil
 	}
 	return "", fmt.Errorf("no password: set AGENT_PASSWORD or AGENT_PASSWORD_FILE")
+}
+
+// logger writes structured JSON log lines to stderr (stdout stays reserved for
+// resource payloads, per the kernel's logging discipline). Every line carries a
+// timestamp, an event name, and the event's fields.
+type logger struct {
+	mu  sync.Mutex
+	enc *json.Encoder
+}
+
+func newLogger() *logger {
+	return &logger{enc: json.NewEncoder(os.Stderr)}
+}
+
+// event emits one structured log line. A nil fields map is fine.
+func (l *logger) event(event string, fields map[string]any) {
+	l.mu.Lock()
+	defer l.mu.Unlock()
+	rec := map[string]any{"time": time.Now().UTC().Format(time.RFC3339), "event": event}
+	for k, v := range fields {
+		rec[k] = v
+	}
+	l.enc.Encode(rec)
 }
