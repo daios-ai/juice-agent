@@ -2,7 +2,13 @@ package main
 
 import (
 	"context"
+	"encoding/json"
 	"errors"
+	"os"
+	"path/filepath"
+	"strconv"
+	"strings"
+	"sync"
 	"testing"
 
 	"github.com/daios-ai/juice-agent/agent"
@@ -142,5 +148,33 @@ func TestPublishIntrinsicDeletesOnTestFailure(t *testing.T) {
 	}
 	if pub.madePublic {
 		t.Fatal("a failing action must not be made public")
+	}
+}
+
+func TestMakerConcurrentObserveNoCorruption(t *testing.T) {
+	dir := t.TempDir()
+	m, _ := NewMaker(dir, MakerConfig{Enabled: false, Window: 1000}, fixedEmbedder{}, nil, nil)
+	const n = 40
+	var wg sync.WaitGroup
+	for i := 0; i < n; i++ {
+		wg.Add(1)
+		go func(i int) {
+			defer wg.Done()
+			m.Observe(context.Background(), makeTask("t"+strconv.Itoa(i), "prompt"), agent.Outcome{Status: agent.StatusAnswered})
+		}(i)
+	}
+	wg.Wait()
+	// Every append must be one intact JSON line — no interleaving.
+	data, _ := os.ReadFile(filepath.Join(dir, "tasks.jsonl"))
+	lines := 0
+	for _, ln := range strings.Split(strings.TrimSpace(string(data)), "\n") {
+		var r taskRecord
+		if err := json.Unmarshal([]byte(ln), &r); err != nil {
+			t.Fatalf("corrupted line: %q (%v)", ln, err)
+		}
+		lines++
+	}
+	if lines != n {
+		t.Fatalf("wrote %d intact lines, want %d", lines, n)
 	}
 }

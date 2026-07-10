@@ -153,5 +153,6 @@ afield()   { python3 -c "import sys,json; print(json.loads(sys.stdin.read()).get
 assert_eq()      { [ "$2" = "$3" ] && ok "$1" || fail "$1" "want [$2] got [$3]"; }
 assert_le()      { [ "$2" -le "$3" ] && ok "$1" || fail "$1" "want $2 <= $3"; }
 assert_contains(){ case "$3" in *"$2"*) ok "$1";; *) fail "$1" "want substring [$2] in [$3]";; esac; }
+assert_not_contains(){ case "$3" in *"$2"*) fail "$1" "should NOT contain [$2]";; *) ok "$1";; esac; }
 assert_nonempty(){ [ -n "$2" ] && ok "$1" || fail "$1" "expected non-empty"; }
 assert_match()   { echo "$3" | grep -qE "$2" && ok "$1" || fail "$1" "want /$2/ in [$3]"; }

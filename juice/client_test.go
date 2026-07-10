@@ -174,27 +174,53 @@ func TestRunFailureIsKernelError(t *testing.T) {
 	}
 }
 
-func TestDecideParsesSelection(t *testing.T) {
+func TestDecideRendersToolsAndExtractsSelection(t *testing.T) {
 	f := newFakeKernel()
-	f.runResults["@sys/llm/decide"] = map[string]any{
-		"action":  "@sys/lookup",
-		"args":    map[string]any{"query": "translate"},
-		"message": map[string]any{"role": "assistant", "content": "let me search"},
+	// Decide runs @sys/llm/chat; the model replies with prose wrapping a JSON
+	// selection, which the client must extract.
+	f.runResults["@sys/llm/chat"] = map[string]any{
+		"message": map[string]any{"role": "assistant",
+			"content": `Sure, I'll search. {"action": "@sys/web", "args": {"url": "x"}}`},
 	}
 	c := startFake(t, f)
-	sel, err := c.Decide(context.Background(), []agent.Message{{Role: agent.RoleUser, Content: "hi"}}, []string{"@sys/lookup"})
+	catalog := []agent.Candidate{{Ref: "@sys/web", Description: "fetch a page", Price: 3,
+		Stats:       agent.ActionStats{Known: true, Uses: 4, Successes: 3},
+		InputSchema: map[string]any{"type": "object", "properties": map[string]any{"url": map[string]any{"type": "string"}}, "required": []any{"url"}}}}
+	tools := []agent.Tool{{Name: "reply", Description: "finish", InputSchema: map[string]any{"type": "object",
+		"properties": map[string]any{"answer": map[string]any{"type": "string"}}, "required": []any{"answer"}}}}
+
+	sel, err := c.Decide(context.Background(), []agent.Message{{Role: agent.RoleUser, Content: "hi"}}, catalog, tools)
 	if err != nil {
 		t.Fatalf("decide: %v", err)
 	}
-	if sel.Action != "@sys/lookup" || sel.Args["query"] != "translate" || sel.Message != "let me search" {
+	if sel.Action != "@sys/web" || sel.Args["url"] != "x" {
 		t.Fatalf("selection = %+v", sel)
 	}
-	// the decide request must carry messages and actions
-	if _, ok := f.lastRunArgs["messages"]; !ok {
-		t.Fatal("decide did not send messages")
+	// The rendered prompt (last chat message) must list both the tool and the
+	// catalog action with its stats.
+	msgs, _ := f.lastRunArgs["messages"].([]any)
+	last, _ := msgs[len(msgs)-1].(map[string]any)
+	prompt, _ := last["content"].(string)
+	for _, want := range []string{"reply", "answer (required)", "@sys/web", "uses=4", "success=75%", "url (required)"} {
+		if !strings.Contains(prompt, want) {
+			t.Fatalf("rendered prompt missing %q:\n%s", want, prompt)
+		}
 	}
-	if _, ok := f.lastRunArgs["actions"]; !ok {
-		t.Fatal("decide did not send actions")
+}
+
+func TestExtractJSON(t *testing.T) {
+	cases := map[string]string{
+		`{"a":1}`:                 `{"a":1}`,
+		"prose {\"a\":1} more":    `{"a":1}`,
+		"```json\n{\"a\":1}\n```": `{"a":1}`,
+		`{"s":"has } brace"}`:     `{"s":"has } brace"}`,
+		`{"nest":{"b":2},"c":3}`:  `{"nest":{"b":2},"c":3}`,
+		"no json here":            "",
+	}
+	for in, want := range cases {
+		if got := extractJSON(in); got != want {
+			t.Errorf("extractJSON(%q) = %q, want %q", in, got, want)
+		}
 	}
 }
 

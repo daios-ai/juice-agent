@@ -20,9 +20,9 @@ type fakeKernel struct {
 	rated  map[string]int
 }
 
-func (k *fakeKernel) Decide(_ context.Context, _ []agent.Message, _ []string) (*agent.Selection, error) {
+func (k *fakeKernel) Decide(_ context.Context, _ []agent.Message, _ []agent.Candidate, _ []agent.Tool) (*agent.Selection, error) {
 	if k.i >= len(k.script) {
-		return &agent.Selection{Action: "@agent/reply", Args: map[string]any{"answer": "fallback"}}, nil
+		return &agent.Selection{Action: "reply", Args: map[string]any{"answer": "fallback"}}, nil
 	}
 	s := k.script[k.i]
 	k.i++
@@ -52,7 +52,7 @@ func (k *fakeKernel) Rate(_ context.Context, txID string, rating int, _ string) 
 
 func replyIntrinsics() map[string]agent.Intrinsic {
 	return map[string]agent.Intrinsic{
-		"@agent/reply": {Handle: func(_ context.Context, args map[string]any) (map[string]any, bool, error) {
+		"reply": {Handle: func(_ context.Context, args map[string]any) (map[string]any, bool, error) {
 			return args, true, nil
 		}},
 	}
@@ -62,7 +62,7 @@ func TestExecutorRunsRatesAndRecordsOutcome(t *testing.T) {
 	dir := t.TempDir()
 	k := &fakeKernel{script: []agent.Selection{
 		{Action: "@sys/time"},
-		{Action: "@agent/reply", Args: map[string]any{"answer": "noon"}},
+		{Action: "reply", Args: map[string]any{"answer": "noon"}},
 	}}
 	e := &Executor{
 		Kernel:  k,
@@ -70,8 +70,8 @@ func TestExecutorRunsRatesAndRecordsOutcome(t *testing.T) {
 		Retry:   RetryPolicy{MaxRetries: 0},
 		RetryOK: func(error) bool { return false },
 		Loop: agent.Config{
-			ReplyAction: "@agent/reply", LookupAction: "@sys/lookup",
-			AlwaysRefs: []string{"@sys/lookup"}, MaxTurns: 10, Intrinsics: replyIntrinsics(),
+			ReplyTool: "reply", LookupAction: "@sys/lookup",
+			Always: []agent.Candidate{{Ref: "@sys/lookup"}}, MaxTurns: 10, Intrinsics: replyIntrinsics(),
 		},
 		RateTasks: true,
 	}
@@ -104,7 +104,7 @@ func TestExecutorEnqueuesMakerSynthesis(t *testing.T) {
 	var enqueued []agent.Task
 	e := &Executor{
 		Kernel: k, DataDir: dir, RetryOK: func(error) bool { return false },
-		Loop: agent.Config{ReplyAction: "@agent/reply", LookupAction: "@sys/lookup",
+		Loop: agent.Config{ReplyTool: "reply", LookupAction: "@sys/lookup",
 			MaxTurns: 5, Intrinsics: replyIntrinsics()},
 		Maker:   maker,
 		Enqueue: func(tk agent.Task) { enqueued = append(enqueued, tk) },
@@ -125,12 +125,12 @@ type flakyDecider struct {
 	calls int
 }
 
-func (d *flakyDecider) Decide(_ context.Context, _ []agent.Message, _ []string) (*agent.Selection, error) {
+func (d *flakyDecider) Decide(_ context.Context, _ []agent.Message, _ []agent.Candidate, _ []agent.Tool) (*agent.Selection, error) {
 	d.calls++
 	if d.calls <= d.failN {
 		return nil, errors.New("transient")
 	}
-	return &agent.Selection{Action: "@agent/reply"}, nil
+	return &agent.Selection{Action: "reply"}, nil
 }
 
 func alwaysRetry(error) bool { return true }
@@ -140,7 +140,7 @@ func TestRetryDeciderSucceedsAfterTransientFailures(t *testing.T) {
 	d := &flakyDecider{failN: 2}
 	wrapped := retryDecider{inner: d, policy: RetryPolicy{MaxRetries: 3, BaseDelay: time.Millisecond},
 		retryOK: alwaysRetry, sleep: func(time.Duration) {}}
-	if _, err := wrapped.Decide(context.Background(), nil, nil); err != nil {
+	if _, err := wrapped.Decide(context.Background(), nil, nil, nil); err != nil {
 		t.Fatalf("expected success after retries, got %v", err)
 	}
 	if d.calls != 3 {
@@ -152,7 +152,7 @@ func TestRetryDeciderStopsOnNonRetryable(t *testing.T) {
 	d := &flakyDecider{failN: 5}
 	wrapped := retryDecider{inner: d, policy: RetryPolicy{MaxRetries: 3, BaseDelay: time.Millisecond},
 		retryOK: neverRetry, sleep: func(time.Duration) {}}
-	if _, err := wrapped.Decide(context.Background(), nil, nil); err == nil {
+	if _, err := wrapped.Decide(context.Background(), nil, nil, nil); err == nil {
 		t.Fatal("expected error")
 	}
 	if d.calls != 1 {

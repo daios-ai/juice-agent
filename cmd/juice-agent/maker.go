@@ -20,7 +20,7 @@ type Embedder interface {
 }
 
 // Publisher registers, tests, and publishes WASM actions. Implemented by the
-// juice client. It is the effect surface of the @agent/publish intrinsic.
+// juice client. It is the effect surface of the publish tool.
 type Publisher interface {
 	CreateWasmAction(ctx context.Context, name, description string, price int, in, out map[string]any, artifactB64 string) (id, ref string, err error)
 	EnableAction(ctx context.Context, id string) error
@@ -54,7 +54,7 @@ type taskRecord struct {
 
 // Maker observes completed tasks, records them in a legible index, and — when a
 // request recurs without catalog coverage — proposes a synthesis task to build
-// a WASM action that automates it. It also implements the @agent/publish
+// a WASM action that automates it. It also implements the publish
 // intrinsic used during synthesis.
 type Maker struct {
 	cfg      MakerConfig
@@ -98,8 +98,9 @@ func (m *Maker) Observe(ctx context.Context, task agent.Task, out agent.Outcome)
 		m.recent = m.recent[len(m.recent)-m.cfg.Window:]
 	}
 	sim := m.countSimilarLocked(rec)
-	m.mu.Unlock()
+	// Append under the lock so concurrent tasks can't interleave lines in the index.
 	_ = appendJSONL(m.path, rec)
+	m.mu.Unlock()
 
 	if !m.cfg.Enabled || task.Channel == "self" || rec.Embed == nil {
 		return nil
@@ -134,9 +135,9 @@ func (m *Maker) countSimilarLocked(rec taskRecord) int {
 func (m *Maker) synthesisTask(origin, prompt string) *agent.Task {
 	instr := "A request of this kind keeps recurring and no existing action serves it well:\n\n" +
 		prompt + "\n\nBuild a reusable Juice WASM action that handles this class of request. " +
-		"Write a TinyGo Handle, compile it with @sys/tinygo/compile, then call @agent/publish with " +
+		"Write a TinyGo Handle, compile it with @sys/tinygo/compile, then select the publish tool with " +
 		"the compiled artifact, a kebab-case name, a description, typed input/output schemas, and a " +
-		"few distinct test_inputs. Publish only once it passes its tests, then finish with @agent/reply."
+		"few distinct test_inputs. Publish only once it passes its tests, then finish with the reply tool."
 	return &agent.Task{
 		ID:       "synth-" + origin,
 		Channel:  "self",
@@ -145,7 +146,7 @@ func (m *Maker) synthesisTask(origin, prompt string) *agent.Task {
 	}
 }
 
-// PublishIntrinsic returns the @agent/publish handler: build.py's transactional
+// PublishIntrinsic returns the publish tool handler: build.py's transactional
 // publish as a harness intrinsic — create private, enable, run declared
 // test_inputs, then make public on pass or delete and report on failure.
 func (m *Maker) PublishIntrinsic() agent.Intrinsic {

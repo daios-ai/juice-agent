@@ -14,6 +14,7 @@ import (
 	"io"
 	"net/http"
 	"net/url"
+	"sort"
 	"strings"
 	"sync"
 	"time"
@@ -169,58 +170,150 @@ func (c *Client) Run(ctx context.Context, action string, args map[string]any) (a
 
 // --- Decider ---------------------------------------------------------------
 
-// Decide performs one @sys/llm/decide round-trip over the conversation and the
-// offered action refs, returning the kernel's schema-validated selection.
-func (c *Client) Decide(ctx context.Context, messages []agent.Message, actions []string) (*agent.Selection, error) {
-	res, err := c.Run(ctx, "@sys/llm/decide", map[string]any{
-		"messages": toDecideMessages(messages),
-		"actions":  actions,
-	})
+// Decide performs one selection round-trip. It renders the harness tools and
+// catalog candidates into a chat prompt, runs @sys/llm/chat, and extracts a JSON
+// selection from the reply. We use plain chat, not @sys/llm/decide: decide only
+// accepts @owner/name refs (so plain harness-tool names can't be offered) and,
+// on Ollama, its grammar-constrained JSON corrupts copied strings (measured:
+// timestamps garbled). Unconstrained chat + balanced-brace extraction is both
+// more capable (offers tools) and higher-fidelity.
+func (c *Client) Decide(ctx context.Context, messages []agent.Message, catalog []agent.Candidate, tools []agent.Tool) (*agent.Selection, error) {
+	aug := append(append([]agent.Message{}, messages...),
+		agent.Message{Role: agent.RoleUser, Content: selectionPrompt(catalog, tools)})
+	content, err := c.Chat(ctx, aug)
 	if err != nil {
 		return nil, err
 	}
-	action, _ := res.Result["action"].(string)
-	args, _ := res.Result["args"].(map[string]any)
-	msg := ""
-	if mo, ok := res.Result["message"].(map[string]any); ok {
-		msg, _ = mo["content"].(string)
-	} else if ms, ok := res.Result["message"].(string); ok {
-		msg = ms
+	js := extractJSON(content)
+	if js == "" {
+		return nil, &KernelError{Status: 200, Code: "execution_failed",
+			Message: "no JSON selection in model reply: " + trunc(content, 120)}
 	}
-	return &agent.Selection{Action: action, Args: args, Message: msg}, nil
+	var sel struct {
+		Action  string         `json:"action"`
+		Args    map[string]any `json:"args"`
+		Message string         `json:"message"`
+	}
+	if err := json.Unmarshal([]byte(js), &sel); err != nil || sel.Action == "" {
+		return nil, &KernelError{Status: 200, Code: "execution_failed",
+			Message: "unparseable selection: " + trunc(js, 120)}
+	}
+	if sel.Args == nil {
+		sel.Args = map[string]any{}
+	}
+	return &agent.Selection{Action: sel.Action, Args: sel.Args, Message: sel.Message}, nil
 }
 
-// toDecideMessages converts agent transcript messages into @sys/llm/decide's
-// wire format ({role, content?, tool?{action,args,result}}).
-func toDecideMessages(msgs []agent.Message) []map[string]any {
-	out := make([]map[string]any, 0, len(msgs))
-	for _, m := range msgs {
-		dm := map[string]any{"role": string(m.Role)}
-		switch {
-		case m.Role == agent.RoleAssistant && m.Action != "":
-			tool := map[string]any{"action": m.Action}
-			if m.Args != nil {
-				tool["args"] = m.Args
-			}
-			dm["tool"] = tool
-			if m.Content != "" {
-				dm["content"] = m.Content
-			}
-		case m.Role == agent.RoleTool && m.Action != "":
-			tool := map[string]any{"action": m.Action}
-			if m.Result != nil {
-				tool["result"] = m.Result
-			}
-			if m.Content != "" && m.Result == nil {
-				tool["result"] = map[string]any{"error": m.Content}
-			}
-			dm["tool"] = tool
-		default:
-			dm["content"] = m.Content
+// selectionPrompt renders the one-shot instruction + tool list the model chooses
+// from: harness tools (plain names) first, then catalog actions (@owner/name)
+// with price, stats, and a compact schema.
+func selectionPrompt(catalog []agent.Candidate, tools []agent.Tool) string {
+	var b strings.Builder
+	b.WriteString("Select exactly ONE tool or action to take next.\n\n")
+	if len(tools) > 0 {
+		b.WriteString("Tools (plain names):\n")
+		for _, t := range tools {
+			fmt.Fprintf(&b, "- %s — %s; args: %s\n", t.Name, t.Description, argSummary(t.InputSchema))
 		}
-		out = append(out, dm)
+		b.WriteByte('\n')
+	}
+	if len(catalog) > 0 {
+		b.WriteString("Actions (@owner/name), preferring proven ones:\n")
+		for _, c := range catalog {
+			fmt.Fprintf(&b, "- %s — %s; price=%d%s; args: %s\n",
+				c.Ref, c.Description, c.Price, statsSummary(c.Stats), argSummary(c.InputSchema))
+		}
+		b.WriteByte('\n')
+	}
+	b.WriteString(`Respond with ONLY a JSON object: {"action": "<name or @owner/name>", "args": {...}}. No prose, no code fences.`)
+	return b.String()
+}
+
+// argSummary renders a schema's properties as "name (required), other" — a
+// compact hint, not the full schema.
+func argSummary(schema map[string]any) string {
+	props, _ := schema["properties"].(map[string]any)
+	if len(props) == 0 {
+		return "{}"
+	}
+	req := map[string]bool{}
+	if rs, ok := schema["required"].([]any); ok {
+		for _, r := range rs {
+			if s, ok := r.(string); ok {
+				req[s] = true
+			}
+		}
+	}
+	names := make([]string, 0, len(props))
+	for k := range props {
+		names = append(names, k)
+	}
+	sort.Strings(names)
+	parts := make([]string, 0, len(names))
+	for _, k := range names {
+		if req[k] {
+			parts = append(parts, k+" (required)")
+		} else {
+			parts = append(parts, k)
+		}
+	}
+	return "{" + strings.Join(parts, ", ") + "}"
+}
+
+// statsSummary renders an action's track record inline, or "" when untested.
+func statsSummary(s agent.ActionStats) string {
+	if !s.Known || s.Uses == 0 {
+		return " (untested)"
+	}
+	out := fmt.Sprintf(" uses=%d success=%d%%", s.Uses, pct(s.Successes, s.Uses))
+	if s.RatingCount > 0 {
+		out += fmt.Sprintf(" rating=%.2f", s.RatingEstimate)
 	}
 	return out
+}
+
+func pct(n, d int) int {
+	if d == 0 {
+		return 0
+	}
+	return n * 100 / d
+}
+
+// extractJSON returns the first balanced {...} object in s (skipping prose and
+// code fences), ported from build.py's extract_json.
+func extractJSON(s string) string {
+	start := strings.IndexByte(s, '{')
+	if start < 0 {
+		return ""
+	}
+	depth, inStr, esc := 0, false, false
+	for i := start; i < len(s); i++ {
+		ch := s[i]
+		switch {
+		case esc:
+			esc = false
+		case ch == '\\' && inStr:
+			esc = true
+		case ch == '"':
+			inStr = !inStr
+		case inStr:
+		case ch == '{':
+			depth++
+		case ch == '}':
+			depth--
+			if depth == 0 {
+				return s[start : i+1]
+			}
+		}
+	}
+	return ""
+}
+
+func trunc(s string, n int) string {
+	if len(s) <= n {
+		return s
+	}
+	return s[:n] + "…"
 }
 
 // --- LLM helpers (compaction, rating, embedding) ---------------------------

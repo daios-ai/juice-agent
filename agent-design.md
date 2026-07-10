@@ -1,8 +1,12 @@
 # Juice Agent Design
 
-Version: 0.1.1
+Version: 0.1.2
 Status: design document
 Codename: `juice-agent`
+
+Revision 0.1.2 rewrites the turn primitive: the harness builds the tool list and drives selection
+via `@sys/llm/chat` (JSON extracted), so plain-named tools (`reply`/`publish`/`subtask`) coexist with
+catalog actions and NO fake echo actions pollute the catalog (the `reply.wasm.b64` blob is gone).
 
 Revision 0.1.1 adds named-agent **identity** (`juice-agent @handle`, §7), authored **persona +
 knowledge** injected as a real system prompt (§5c), and durable **cross-task memory** (§5c).
@@ -97,11 +101,11 @@ run(task):
   cands = intrinsics ∪ Catalog.Lookup(task.prompt, k)     # seed the working set
   loop:
     inject queued steering messages                        # polled before every model call
-    sel = Decider.Decide(messages, refs(cands))            # ONE @sys/llm/decide round-trip
+    sel = Decider.Decide(messages, candidates, tools)     # ONE @sys/llm/chat round-trip, JSON extracted
     if sel is error:            fail (after policy-layer retries)
     append sel to transcript                               # {role: assistant, tool:{action,args}}
 
-    if sel.action == @agent/reply:                         # ← THE STOP RULE
+    if sel.action == "reply":                              # ← THE STOP RULE (a harness tool)
         return answered(sel.args)                          # terminal; nothing dispatched
 
     if spent + price(sel.action) > task.budget:
@@ -117,21 +121,25 @@ run(task):
     if turns == max_turns: fail(turn-cap)
 ```
 
-**Turn primitive.** Each turn is one `@sys/llm/decide` call: the kernel fetches every candidate's
-canonical description, `input_schema`, and price from its own DB and returns a selection whose
-`args` are **already validated against the chosen action's schema**. pi's typed content blocks,
-argument validation, and provider normalization collapse into this single kernel contract. The
-transcript maps natively onto `decide`'s message format (`{role, content?, tool?}`): an assistant
-selection is `{role:"assistant", tool:{action,args}}`, a result is `{role:"tool", tool:{result}}`.
+**Turn primitive.** Each turn is one `@sys/llm/chat` call over the transcript plus a rendered tool
+list the harness builds itself: the catalog candidates (each with description, price, stats, and a
+compact schema) followed by the plain-named **harness tools** (`reply`, `publish`, `subtask`). The
+model replies with a single JSON object `{action, args}`, which the client extracts with a
+balanced-brace parser. We do *not* use `@sys/llm/decide`: it only offers `@owner/name` refs (so
+plain tool names can't be candidates) and, on Ollama, its grammar-constrained JSON corrupts copied
+strings (measured — timestamps garbled). Unconstrained chat + extraction is both more capable and
+higher-fidelity. Validation splits cleanly: harness-tool args get a required-keys check in-harness;
+catalog args are validated kernel-side at dispatch (`POST /v1/run` rejects a schema violation),
+fed back to the model on failure.
 
-**Stop rule.** pi's finding — continuation must be decided by *content*, never by a provider's
-stop reason — is kept and strengthened: the run ends exactly when the model selects the agent's
-own terminal action **`@agent/reply`** (below). "Done" is not a heuristic over free text; it is a
-schema-validated selection like any other. There is no other normal exit.
+**Stop rule.** pi's finding — continuation decided by *content*, never a provider stop reason — is
+kept: the run ends exactly when the model selects the **`reply` tool**. "Done" is a selection like
+any other, not a heuristic over free text. There is no other normal exit.
 
-**Truncation guard, subsumed.** pi refuses tool calls from length-truncated replies because
-half-streamed arguments may parse. Here the kernel validates args server-side and `decide` either
-returns a valid selection or a typed error — a malformed turn is retried, never dispatched.
+**Harness tools are not catalog rows.** `reply`/`publish`/`subtask` are plain-named affordances the
+daemon offers and intercepts — never registered on the platform, so the catalog stays a truthful
+registry of real capabilities. Names never contain `/`, so they're unambiguous against action refs.
+Each has a schema only to standardise the args the model must supply.
 
 **Discovery is in-band.** `@sys/lookup` sits permanently in the candidate set. The model expands
 its own tool set by selecting it — the harness runs it like any action and merges the results into
@@ -147,14 +155,11 @@ is a new task that reopens the prior transcript.
 calls that agent's published actions or parks a step for it — the kernel is the orchestrator, with
 payment and attribution built in.
 
-### The terminal action: `@agent/reply`
+### The `reply` tool
 
-`@agent/reply` is a real, zero-price WASM echo action owned by the agent
-(`Handle(in) = (in, nil)`), registered idempotently at bootstrap from a prebuilt artifact shipped
-in the repo (`action create --kind wasm --artifact`; no TinyGo toolchain required at runtime). Its
-`input_schema` is the answer contract (`{answer: string, …}`). It exists so that `decide` can
-validate the *final answer* with the same machinery as every other turn. The harness treats its
-selection as terminal and does not dispatch it.
+`reply` is a harness tool (schema `{answer: string, required}`), not an action. The harness treats
+its selection as terminal (at the root) or as the roll-up of a bracket (§4b), and never dispatches
+it. Nothing is registered on the platform for it — no WASM artifact, no bootstrap round-trip.
 
 ### Safety rails
 
@@ -165,7 +170,7 @@ daemon *is* unattended, so it takes both rails — but the primary one is econom
    priced calls halts on the task budget; the wallet bounds the daemon globally. This is a rail pi
    could not have: its tools were free.
 2. **Turn cap (secondary, default 32).** Required because zero-price actions (`@sys/lookup`,
-   `@sys/llm/*`, `@agent/reply` refusals) escape the money rail. A configurable hard cap; hitting
+   `@sys/llm/*`, refused selections) escape the money rail. A configurable hard cap; hitting
    it fails the task honestly with `reason = turn-cap`.
 
 No identical-call detector: a repeated priced call burns budget, a repeated free call meets the
@@ -200,17 +205,10 @@ Three kernel facilities that a naive port ignores; each becomes a concrete behav
 
 **Stats-informed selection.** Every action carries `Stats` (`uses`, `successes`, `failures`,
 `latency_estimate`, `rating_estimate`, `rating_count`), readable at `GET /v1/stats/{id}`.
-`@sys/lookup` already ranks by them, but the loop must *see* them too. On every candidate merge the
-harness fetches each candidate's price and stats and, because `@sys/llm/decide` is fed only
-descriptions/schemas/prices from the kernel DB, injects a transient **stats line** (a `system`
-message, rebuilt each turn, never persisted) summarising the working set:
-
-```text
-Available tools and their track record (prefer proven; use an untested tool only when no proven
-tool fits, or a proven one has failed here):
-  @owner/name   price=P  uses=U  success=93%  rating=0.88 (n=12)  latency≈L
-  @other/thing  price=Q  untested
-```
+`@sys/lookup` already ranks by them, but the model must *see* them too. On every candidate merge the
+harness fetches each candidate's price and stats, and the client renders them inline in the tool
+list it builds each turn (`@owner/name — desc; price=P uses=U success=93% rating=0.88; args: {…}`),
+so track record rides with the choice — no separate message.
 
 Stats also drive **eviction**: when the working set exceeds `candidate_limit`, the lowest-value
 candidates are dropped (Laplace-smoothed success rate + rating prior; unknown ≈ neutral), so the
@@ -232,16 +230,15 @@ a trigger fires when ≥`min_repeats` semantically similar prompts (cosine over 
 have recurred within a window *and* no catalog action covers them well (a `@sys/lookup` score
 threshold). It then enqueues an internal **synthesis task** to the agent itself via a `self`
 channel. Synthesis runs in the ordinary loop, its candidate set including `@sys/tinygo/compile` and
-the intrinsic `@agent/publish`. `@agent/publish` is a harness-intercepted intrinsic implementing
-`build.py`'s transactional publish: create private → enable → run declared `test_inputs` → make
-public on pass, or delete and return diagnostics on fail. Once published, future repetitions find
-the new action through ordinary lookup — the automation loop closes without changing the daemon.
+the harness tool `publish`. `publish` implements `build.py`'s transactional publish: create private
+→ enable → run declared `test_inputs` → make public on pass, or delete and return diagnostics on
+fail. Once published, future repetitions find the new action through ordinary lookup — the
+automation loop closes without changing the daemon.
 
-**Intrinsics, generalised.** `@agent/reply` and `@agent/publish` are both *intrinsics*: real,
-zero-price actions registered at bootstrap (so `decide` can select them and validate their args)
-whose execution the harness intercepts rather than dispatching. The core exposes an intrinsics
-table `map[ref]handler`; `reply` is the terminal handler, `publish` the maker handler. Adding an
-agent-native capability is adding a table entry plus a bootstrap registration.
+**Harness tools.** `reply`, `publish`, and `subtask` (§4b) are plain-named tools the loop offers
+and intercepts — not registered actions. The core keeps an intrinsics table keyed by tool name;
+`reply` is terminal, `publish` the maker handler, `subtask` opens a bracket. Adding an agent-native
+capability is a table entry plus a `Tool` definition — no platform registration, no artifact.
 
 ## 5c. Identity, persona, knowledge, and memory
 
@@ -373,7 +370,7 @@ no fake model. Consequences:
   errors (`execution_failed`/`schema_violation`) are not retried as if transient.
 
 ```text
-flow_bootstrap  daemon registers @agent, logs in, publishes @agent/reply + @agent/publish (idempotent, twice)  [no LLM]
+flow_bootstrap  daemon logs in and serves; no fake reply/publish rows in the catalog; restart      [no LLM]
 flow_recovery   a mid-flight transcript at startup is marked interrupted, idempotently             [no LLM]
 flow_drain      SIGTERM drains in-flight work, persists, exits 0                                    [no LLM]
 flow_task       real task in via http; terminates answered; ISO answer; spend ≤ budget             [real LLM]

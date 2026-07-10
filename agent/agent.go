@@ -78,11 +78,12 @@ type RunResult struct {
 	TxID   string
 }
 
-// Decider performs one model round-trip: given the conversation and the set of
-// selectable action refs, it returns the next tool selection. Implemented by the
-// juice client over @sys/llm/decide.
+// Decider performs one model round-trip: given the conversation, the catalog
+// candidates (with descriptions/schemas/stats to render), and the harness tools,
+// it returns the next selection. Implemented by the juice client over
+// @sys/llm/chat (it builds the tool list itself and extracts a JSON selection).
 type Decider interface {
-	Decide(ctx context.Context, messages []Message, actions []string) (*Selection, error)
+	Decide(ctx context.Context, messages []Message, catalog []Candidate, tools []Tool) (*Selection, error)
 }
 
 // Catalog discovers actions and reads their metadata. Lookup ranks active
@@ -141,19 +142,33 @@ type Outcome struct {
 	Turns  int            `json:"turns"`
 }
 
-// Config is the loop's static policy: the reply/lookup action refs, the caps,
-// the working-set bound, and the intrinsics table.
+// Tool is a plain-named harness capability offered to the model alongside the
+// catalog's @owner/name actions. Unlike an action it is not registered anywhere
+// on the platform — the harness intercepts its selection (see Intrinsic). Names
+// never contain "/", so they are unambiguous against action refs.
+type Tool struct {
+	Name        string
+	Description string
+	InputSchema map[string]any
+}
+
+// Config is the loop's static policy: the reply tool name, the lookup action,
+// the harness tools + their intrinsic handlers, the always-offered catalog
+// candidates, the caps, and the working-set bound.
 type Config struct {
-	ReplyAction    string
-	LookupAction   string
-	AlwaysRefs     []string // refs always offered to decide (e.g. @sys/lookup, @sys/llm/*)
+	ReplyTool      string      // the terminal tool's name (e.g. "reply")
+	LookupAction   string      // the discovery action ref (e.g. "@sys/lookup")
+	Tools          []Tool      // harness tools rendered to the model each turn
+	Always         []Candidate // catalog candidates always offered (e.g. @sys/lookup)
 	MaxTurns       int
 	CandidateLimit int
 	LookupLimit    int
 	// MaxDecideErrors bounds consecutive invalid model selections before the run
 	// fails; each is fed back for self-correction. Default 3 when zero.
 	MaxDecideErrors int
-	Intrinsics      map[string]Intrinsic
+	// Intrinsics maps a harness tool name to its handler. reply is terminal;
+	// publish/subtask are non-terminal.
+	Intrinsics map[string]Intrinsic
 }
 
 // Deps is the loop's wiring: the four interfaces plus optional steering and log
@@ -192,6 +207,9 @@ func Run(ctx context.Context, task Task, cfg Config, deps Deps) (Outcome, error)
 	}
 
 	ws := newWorkingSet(cfg.CandidateLimit)
+	for _, c := range cfg.Always {
+		ws.put(c)
+	}
 	if seed, err := deps.Catalog.Lookup(ctx, prompt(task), cfg.LookupLimit); err == nil {
 		mergeCandidates(ctx, deps, ws, seed)
 	}
@@ -219,13 +237,8 @@ func Run(ctx context.Context, task Task, cfg Config, deps Deps) (Outcome, error)
 			}
 		}
 
-		refs := ws.refs(cfg)
-		msgs := deps.Transcript.Messages()
-		if line, ok := ws.statsMessage(); ok {
-			msgs = append(append([]Message{}, msgs...), line)
-		}
-
-		sel, err := deps.Decider.Decide(ctx, msgs, refs)
+		catalog := ws.candidates(cfg)
+		sel, err := deps.Decider.Decide(ctx, deps.Transcript.Messages(), catalog, cfg.Tools)
 		if err != nil {
 			// A real model occasionally emits an unusable selection (malformed
 			// args, no valid choice). Rather than kill the task, feed the error
@@ -254,8 +267,23 @@ func Run(ctx context.Context, task Task, cfg Config, deps Deps) (Outcome, error)
 		}
 		logf("turn", map[string]any{"turn": turn, "action": sel.Action})
 
-		// Intrinsic: intercepted, not dispatched; may terminate the run.
+		// Harness tool: intercepted, not dispatched; may terminate the run. Its
+		// args are checked against the tool's required keys in-harness (catalog
+		// actions are validated kernel-side at dispatch instead).
 		if intr, ok := cfg.Intrinsics[sel.Action]; ok {
+			if miss := missingRequired(toolSchema(cfg.Tools, sel.Action), sel.Args); miss != "" {
+				decideErrors++
+				if decideErrors > maxDecideErrors {
+					out.Reason = "decide-error: missing required arg " + miss
+					out.Spent, out.Turns = spent, turn
+					return out, nil
+				}
+				if aerr := deps.Transcript.Append(ctx, Message{Role: RoleSystem, Kind: "decide-error",
+					Content: fmt.Sprintf("Your %q selection is missing the required argument %q. Re-select with it.", sel.Action, miss)}); aerr != nil {
+					return out, aerr
+				}
+				continue
+			}
 			res, terminal, ierr := intr.Handle(ctx, sel.Args)
 			if err := deps.Transcript.Append(ctx, Message{
 				Role: RoleTool, Action: sel.Action, Result: res, IsError: ierr != nil, Content: errText(ierr),
@@ -277,7 +305,7 @@ func Run(ctx context.Context, task Task, cfg Config, deps Deps) (Outcome, error)
 			if err := deps.Transcript.Append(ctx, Message{
 				Role: RoleUser, Kind: "budget",
 				Content: fmt.Sprintf("Budget exceeded: %q costs %d but only %d credits remain. "+
-					"Choose a cheaper action or finish with %s.", sel.Action, price, task.Budget-spent, cfg.ReplyAction),
+					"Choose a cheaper action or finish with the %q tool.", sel.Action, price, task.Budget-spent, cfg.ReplyTool),
 			}); err != nil {
 				return out, err
 			}
@@ -287,18 +315,23 @@ func Run(ctx context.Context, task Task, cfg Config, deps Deps) (Outcome, error)
 
 		rr, rerr := deps.Runner.Run(ctx, sel.Action, sel.Args)
 		spent += price
+		// Discovery is in-band: a lookup result expands the working set. The full
+		// result (with schemas) feeds the working set, but only a trimmed form
+		// (ref + description + score) is persisted to the transcript — the schemas
+		// live in the working set and are rendered per turn, so keeping them in the
+		// chat too is pure noise.
+		result := rr.Result
+		if sel.Action == cfg.LookupAction && rerr == nil {
+			mergeCandidates(ctx, deps, ws, parseLookup(rr.Result))
+			result = trimLookup(rr.Result)
+		}
 		if err := deps.Transcript.Append(ctx, Message{
-			Role: RoleTool, Action: sel.Action, Result: rr.Result, TxID: rr.TxID,
+			Role: RoleTool, Action: sel.Action, Result: result, TxID: rr.TxID,
 			IsError: rerr != nil, Content: errText(rerr),
 		}); err != nil {
 			return out, err
 		}
 		logf("dispatch", map[string]any{"action": sel.Action, "price": price, "tx_id": rr.TxID, "error": rerr != nil})
-
-		// Discovery is in-band: a lookup result expands the working set.
-		if sel.Action == cfg.LookupAction && rerr == nil {
-			mergeCandidates(ctx, deps, ws, parseLookup(rr.Result))
-		}
 	}
 }
 
@@ -398,62 +431,75 @@ func (w *workingSet) priceOf(ref string) int {
 	return 0 // always-refs / intrinsics are zero-price natives
 }
 
-// refs is the deduplicated, sorted list of action refs offered to decide: the
-// working set plus the always-available and intrinsic refs. Sorting makes the
-// offered set deterministic (independent of Go map iteration order).
-func (w *workingSet) refs(cfg Config) []string {
-	seen := map[string]bool{}
-	for ref := range w.by {
-		seen[ref] = true
+// candidates returns the working-set actions to offer this turn, value-sorted
+// (best first) so the client renders the most promising tools at the top, with
+// the always-offered candidates guaranteed present regardless of eviction.
+func (w *workingSet) candidates(cfg Config) []Candidate {
+	merged := map[string]Candidate{}
+	for ref, c := range w.by {
+		merged[ref] = c
 	}
-	for _, ref := range cfg.AlwaysRefs {
-		if ref != "" {
-			seen[ref] = true
+	for _, c := range cfg.Always {
+		if _, ok := merged[c.Ref]; !ok {
+			merged[c.Ref] = c
 		}
 	}
-	for ref := range cfg.Intrinsics {
-		seen[ref] = true
+	out := make([]Candidate, 0, len(merged))
+	for _, c := range merged {
+		out = append(out, c)
 	}
-	out := make([]string, 0, len(seen))
-	for ref := range seen {
-		out = append(out, ref)
-	}
-	sort.Strings(out)
+	sort.Slice(out, func(i, j int) bool {
+		if vi, vj := value(out[i]), value(out[j]); vi != vj {
+			return vi > vj
+		}
+		return out[i].Ref < out[j].Ref // deterministic tie-break
+	})
 	return out
 }
 
-// statsMessage builds the transient per-turn stats line describing the working
-// set's track record. Returns ok=false when the set is empty.
-func (w *workingSet) statsMessage() (Message, bool) {
-	if len(w.by) == 0 {
-		return Message{}, false
-	}
-	refs := make([]string, 0, len(w.by))
-	for ref := range w.by {
-		refs = append(refs, ref)
-	}
-	sort.Slice(refs, func(i, j int) bool { return value(w.by[refs[i]]) > value(w.by[refs[j]]) })
-
-	var b strings.Builder
-	b.WriteString("Available tools and their track record (prefer proven tools; use an untested " +
-		"tool only when no proven tool fits, or a proven one has failed here):\n")
-	for _, ref := range refs {
-		c := w.by[ref]
-		fmt.Fprintf(&b, "  %s  price=%d", c.Ref, c.Price)
-		if s := c.Stats; s.Known && s.Uses > 0 {
-			fmt.Fprintf(&b, "  uses=%d  success=%d%%", s.Uses, pct(s.Successes, s.Uses))
-			if s.RatingCount > 0 {
-				fmt.Fprintf(&b, "  rating=%.2f (n=%d)", s.RatingEstimate, s.RatingCount)
-			}
-			if s.LatencyEstimate > 0 {
-				fmt.Fprintf(&b, "  latency≈%.0f", s.LatencyEstimate)
-			}
-		} else {
-			b.WriteString("  untested")
+// trimLookup rewrites a @sys/lookup result to carry only ref + description +
+// score per candidate, dropping the schemas that bloat the transcript.
+func trimLookup(res map[string]any) map[string]any {
+	raw, _ := res["results"].([]any)
+	out := make([]any, 0, len(raw))
+	for _, r := range raw {
+		m, ok := r.(map[string]any)
+		if !ok {
+			continue
 		}
-		b.WriteByte('\n')
+		slim := map[string]any{"action": m["action"], "description": m["description"]}
+		if s, ok := m["score"]; ok {
+			slim["score"] = s
+		}
+		out = append(out, slim)
 	}
-	return Message{Role: RoleSystem, Content: strings.TrimRight(b.String(), "\n"), Kind: "stats"}, true
+	return map[string]any{"results": out}
+}
+
+// toolSchema returns the input schema of the named harness tool, or nil.
+func toolSchema(tools []Tool, name string) map[string]any {
+	for _, t := range tools {
+		if t.Name == name {
+			return t.InputSchema
+		}
+	}
+	return nil
+}
+
+// missingRequired returns the first required key of schema absent from args, or
+// "" if all are present (or the schema declares no required keys).
+func missingRequired(schema map[string]any, args map[string]any) string {
+	req, _ := schema["required"].([]any)
+	for _, r := range req {
+		k, _ := r.(string)
+		if k == "" {
+			continue
+		}
+		if _, ok := args[k]; !ok {
+			return k
+		}
+	}
+	return ""
 }
 
 // value scores a candidate for eviction and stats-line ranking: a
@@ -467,11 +513,4 @@ func value(c Candidate) float64 {
 		rating = s.RatingEstimate
 	}
 	return succ + rating
-}
-
-func pct(n, d int) int {
-	if d == 0 {
-		return 0
-	}
-	return n * 100 / d
 }

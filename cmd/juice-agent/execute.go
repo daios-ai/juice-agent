@@ -119,10 +119,10 @@ type retryDecider struct {
 	sleep   func(time.Duration)
 }
 
-func (d retryDecider) Decide(ctx context.Context, msgs []agent.Message, actions []string) (*agent.Selection, error) {
+func (d retryDecider) Decide(ctx context.Context, msgs []agent.Message, catalog []agent.Candidate, tools []agent.Tool) (*agent.Selection, error) {
 	var last error
 	for attempt := 0; attempt <= d.policy.MaxRetries; attempt++ {
-		sel, err := d.inner.Decide(ctx, msgs, actions)
+		sel, err := d.inner.Decide(ctx, msgs, catalog, tools)
 		if err == nil {
 			return sel, nil
 		}

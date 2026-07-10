@@ -3,25 +3,25 @@ package agent
 import (
 	"context"
 	"errors"
-	"strings"
 	"testing"
 )
 
 // --- fakes -----------------------------------------------------------------
 
 // scriptedDecider returns a fixed sequence of selections, one per turn, then
-// errors if asked beyond the script. It records the refs it was offered.
+// errors if asked beyond the script. It records what it was offered.
 type scriptedDecider struct {
-	script    []Selection
-	i         int
-	lastRefs  []string
-	lastMsgs  []Message
-	decideErr error
-	errAtTurn int
+	script      []Selection
+	i           int
+	lastCatalog []Candidate
+	lastTools   []Tool
+	lastMsgs    []Message
+	decideErr   error
+	errAtTurn   int
 }
 
-func (d *scriptedDecider) Decide(_ context.Context, msgs []Message, actions []string) (*Selection, error) {
-	d.lastRefs, d.lastMsgs = actions, msgs
+func (d *scriptedDecider) Decide(_ context.Context, msgs []Message, catalog []Candidate, tools []Tool) (*Selection, error) {
+	d.lastMsgs, d.lastCatalog, d.lastTools = msgs, catalog, tools
 	if d.decideErr != nil && d.i == d.errAtTurn {
 		return nil, d.decideErr
 	}
@@ -83,10 +83,11 @@ func (t *memTranscript) Append(_ context.Context, m Message) error {
 }
 func (t *memTranscript) Messages() []Message { return t.msgs }
 
-// replyIntrinsic is the terminal echo intrinsic used across tests.
+// replyIntrinsic is the terminal echo intrinsic used across tests, keyed by the
+// plain tool name.
 func replyIntrinsic() map[string]Intrinsic {
 	return map[string]Intrinsic{
-		"@agent/reply": {Handle: func(_ context.Context, args map[string]any) (map[string]any, bool, error) {
+		"reply": {Handle: func(_ context.Context, args map[string]any) (map[string]any, bool, error) {
 			return args, true, nil
 		}},
 	}
@@ -94,9 +95,10 @@ func replyIntrinsic() map[string]Intrinsic {
 
 func baseConfig() Config {
 	return Config{
-		ReplyAction:    "@agent/reply",
+		ReplyTool:      "reply",
 		LookupAction:   "@sys/lookup",
-		AlwaysRefs:     []string{"@sys/lookup"},
+		Tools:          []Tool{{Name: "reply", Description: "finish", InputSchema: map[string]any{"type": "object"}}},
+		Always:         []Candidate{{Ref: "@sys/lookup"}},
 		MaxTurns:       32,
 		CandidateLimit: 24,
 		LookupLimit:    8,
@@ -113,7 +115,7 @@ func newDeps(d Decider, c Catalog, r Runner, t Transcript) Deps {
 func TestStopsWhenReplySelected(t *testing.T) {
 	dec := &scriptedDecider{script: []Selection{
 		{Action: "@sys/time"},
-		{Action: "@agent/reply", Args: map[string]any{"answer": "it is noon"}},
+		{Action: "reply", Args: map[string]any{"answer": "it is noon"}},
 	}}
 	cat := &fakeCatalog{seed: []Candidate{{Ref: "@sys/time"}}}
 	run := &recordingRunner{}
@@ -142,7 +144,7 @@ func TestBudgetRefusesThenContinues(t *testing.T) {
 	// and let the model recover with reply.
 	dec := &scriptedDecider{script: []Selection{
 		{Action: "@expensive"},
-		{Action: "@agent/reply", Args: map[string]any{"answer": "gave up on expensive"}},
+		{Action: "reply", Args: map[string]any{"answer": "gave up on expensive"}},
 	}}
 	cat := &fakeCatalog{
 		seed: []Candidate{{Ref: "@expensive"}},
@@ -183,7 +185,7 @@ func TestBudgetSpendAccumulates(t *testing.T) {
 	dec := &scriptedDecider{script: []Selection{
 		{Action: "@a"},
 		{Action: "@b"},
-		{Action: "@agent/reply", Args: map[string]any{"answer": "done"}},
+		{Action: "reply", Args: map[string]any{"answer": "done"}},
 	}}
 	cat := &fakeCatalog{
 		seed: []Candidate{{Ref: "@a"}, {Ref: "@b"}},
@@ -225,14 +227,14 @@ func TestTurnCapHalts(t *testing.T) {
 // loopingDecider always selects the same action (a doom loop).
 type loopingDecider struct{ action string }
 
-func (d *loopingDecider) Decide(_ context.Context, _ []Message, _ []string) (*Selection, error) {
+func (d *loopingDecider) Decide(_ context.Context, _ []Message, _ []Candidate, _ []Tool) (*Selection, error) {
 	return &Selection{Action: d.action}, nil
 }
 
 // alwaysErrorDecider fails every Decide call.
 type alwaysErrorDecider struct{ calls int }
 
-func (d *alwaysErrorDecider) Decide(context.Context, []Message, []string) (*Selection, error) {
+func (d *alwaysErrorDecider) Decide(context.Context, []Message, []Candidate, []Tool) (*Selection, error) {
 	d.calls++
 	return nil, errors.New("model produced no valid selection")
 }
@@ -258,12 +260,12 @@ func TestPersistentDecideErrorEndsRunAfterCap(t *testing.T) {
 // fumble the loop recovers from by feeding the error back.
 type errorThenReplyDecider struct{ calls int }
 
-func (d *errorThenReplyDecider) Decide(_ context.Context, msgs []Message, _ []string) (*Selection, error) {
+func (d *errorThenReplyDecider) Decide(_ context.Context, msgs []Message, _ []Candidate, _ []Tool) (*Selection, error) {
 	d.calls++
 	if d.calls == 1 {
 		return nil, errors.New("malformed args")
 	}
-	return &Selection{Action: "@agent/reply", Args: map[string]any{"answer": "recovered"}}, nil
+	return &Selection{Action: "reply", Args: map[string]any{"answer": "recovered"}}, nil
 }
 
 func TestSingleDecideErrorRecovers(t *testing.T) {
@@ -291,7 +293,7 @@ func TestSingleDecideErrorRecovers(t *testing.T) {
 func TestSteeringInjectedBeforeDecide(t *testing.T) {
 	steer := []Message{{Role: RoleUser, Content: "actually, use @sys/time"}}
 	dec := &scriptedDecider{script: []Selection{
-		{Action: "@agent/reply", Args: map[string]any{"answer": "ok"}},
+		{Action: "reply", Args: map[string]any{"answer": "ok"}},
 	}}
 	cat := &fakeCatalog{}
 	run := &recordingRunner{}
@@ -340,29 +342,35 @@ func TestWorkingSetEvictsLowestValue(t *testing.T) {
 	}
 }
 
-func TestStatsMessageRanksProvenFirstAndMarksUntested(t *testing.T) {
+func TestCandidatesRankProvenFirstAndAlwaysPresent(t *testing.T) {
 	ws := newWorkingSet(10)
-	ws.put(Candidate{Ref: "@proven", Price: 5, Stats: ActionStats{Known: true, Uses: 8, Successes: 8, RatingCount: 3, RatingEstimate: 0.9, LatencyEstimate: 12}})
+	ws.put(Candidate{Ref: "@proven", Price: 5, Stats: ActionStats{Known: true, Uses: 8, Successes: 8, RatingCount: 3, RatingEstimate: 0.9}})
 	ws.put(Candidate{Ref: "@fresh", Price: 2})
 
-	msg, ok := ws.statsMessage()
-	if !ok {
-		t.Fatal("expected a stats message")
+	cfg := Config{Always: []Candidate{{Ref: "@sys/lookup"}}}
+	cands := ws.candidates(cfg)
+	// Value-sorted: proven before fresh.
+	var order []string
+	for _, c := range cands {
+		order = append(order, c.Ref)
 	}
-	if msg.Role != RoleSystem {
-		t.Fatalf("role = %q, want system", msg.Role)
-	}
-	pi := strings.Index(msg.Content, "@proven")
-	fi := strings.Index(msg.Content, "@fresh")
+	pi, fi := indexOf(order, "@proven"), indexOf(order, "@fresh")
 	if pi < 0 || fi < 0 || pi > fi {
-		t.Fatalf("proven should be listed before fresh:\n%s", msg.Content)
+		t.Fatalf("proven should rank before fresh: %v", order)
 	}
-	if !strings.Contains(msg.Content, "success=100%") {
-		t.Fatalf("missing success rate:\n%s", msg.Content)
+	// The always-offered candidate is present even though it was never put().
+	if indexOf(order, "@sys/lookup") < 0 {
+		t.Fatalf("always candidate missing: %v", order)
 	}
-	if !strings.Contains(msg.Content, "untested") {
-		t.Fatalf("fresh action should be marked untested:\n%s", msg.Content)
+}
+
+func indexOf(s []string, v string) int {
+	for i, x := range s {
+		if x == v {
+			return i
+		}
 	}
+	return -1
 }
 
 func TestParseLookup(t *testing.T) {
@@ -402,7 +410,7 @@ func TestLookupResultMergesIntoWorkingSet(t *testing.T) {
 	// A lookup dispatch must expand the offered refs on the next turn.
 	dec := &refCapturingDecider{script: []Selection{
 		{Action: "@sys/lookup", Args: map[string]any{"query": "x"}},
-		{Action: "@agent/reply", Args: map[string]any{"answer": "done"}},
+		{Action: "reply", Args: map[string]any{"answer": "done"}},
 	}}
 	cat := &fakeCatalog{seed: nil}
 	run := &recordingRunner{results: map[string]RunResult{
@@ -424,10 +432,14 @@ type refCapturingDecider struct {
 	allRefs [][]string
 }
 
-func (d *refCapturingDecider) Decide(_ context.Context, _ []Message, actions []string) (*Selection, error) {
-	d.allRefs = append(d.allRefs, actions)
+func (d *refCapturingDecider) Decide(_ context.Context, _ []Message, catalog []Candidate, _ []Tool) (*Selection, error) {
+	refs := make([]string, 0, len(catalog))
+	for _, c := range catalog {
+		refs = append(refs, c.Ref)
+	}
+	d.allRefs = append(d.allRefs, refs)
 	if d.i >= len(d.script) {
-		return &Selection{Action: "@agent/reply", Args: map[string]any{"answer": "fallback"}}, nil
+		return &Selection{Action: "reply", Args: map[string]any{"answer": "fallback"}}, nil
 	}
 	s := d.script[d.i]
 	d.i++
@@ -443,4 +455,69 @@ func (d *refCapturingDecider) everOffered(ref string) bool {
 		}
 	}
 	return false
+}
+
+func TestMissingRequiredArgFedBack(t *testing.T) {
+	// The model selects the reply tool WITHOUT the required "answer" arg the first
+	// time, then supplies it. The loop must feed the miss back, not terminate.
+	dec := &scriptedDecider{script: []Selection{
+		{Action: "reply", Args: map[string]any{}},                      // missing "answer"
+		{Action: "reply", Args: map[string]any{"answer": "recovered"}}, // fixed
+	}}
+	cfg := baseConfig()
+	cfg.Tools = []Tool{{Name: "reply", InputSchema: map[string]any{
+		"type": "object", "required": []any{"answer"}}}}
+	tr := &memTranscript{}
+	out, err := Run(context.Background(), Task{Budget: 100}, cfg, newDeps(dec, &fakeCatalog{}, &recordingRunner{}, tr))
+	if err != nil {
+		t.Fatal(err)
+	}
+	if out.Status != StatusAnswered || out.Answer["answer"] != "recovered" {
+		t.Fatalf("outcome = %+v", out)
+	}
+	found := false
+	for _, m := range tr.msgs {
+		if m.Kind == "decide-error" {
+			found = true
+		}
+	}
+	if !found {
+		t.Fatal("missing-arg was not fed back to the model")
+	}
+}
+
+func TestLookupResultTrimmedInTranscript(t *testing.T) {
+	// A lookup dispatch persists only ref+description+score (no schemas), while
+	// the working set retains the full candidate for the client to render.
+	dec := &scriptedDecider{script: []Selection{
+		{Action: "@sys/lookup", Args: map[string]any{"query": "x"}},
+		{Action: "reply", Args: map[string]any{"answer": "done"}},
+	}}
+	run := &recordingRunner{results: map[string]RunResult{
+		"@sys/lookup": {Result: map[string]any{"results": []any{
+			map[string]any{"action": "@sys/web", "description": "fetch",
+				"input_schema": map[string]any{"type": "object", "properties": map[string]any{"url": map[string]any{}}}},
+		}}},
+	}}
+	tr := &memTranscript{}
+	Run(context.Background(), Task{Budget: 100}, baseConfig(), newDeps(dec, &fakeCatalog{}, run, tr))
+
+	// find the persisted lookup tool-result
+	var lookupRes map[string]any
+	for _, m := range tr.msgs {
+		if m.Role == RoleTool && m.Action == "@sys/lookup" {
+			lookupRes = m.Result
+		}
+	}
+	if lookupRes == nil {
+		t.Fatal("no lookup result persisted")
+	}
+	results, _ := lookupRes["results"].([]any)
+	first, _ := results[0].(map[string]any)
+	if first["action"] != "@sys/web" || first["description"] != "fetch" {
+		t.Fatalf("trimmed result missing ref/desc: %v", first)
+	}
+	if _, hasSchema := first["input_schema"]; hasSchema {
+		t.Fatalf("schema should be trimmed from the transcript: %v", first)
+	}
 }

@@ -91,39 +91,30 @@ func setup(ctx context.Context, log *logger, cliHandle string) (*Executor, *juic
 	}
 	log.event("login", map[string]any{"handle": self.Handle, "available": self.Available})
 
-	replyIn, replyOut := replySchema()
-	replyRef, err := ensureAction(ctx, cl, "reply", replyIn, replyOut)
-	if err != nil {
-		return nil, nil, agent.Config{}, cfg, fmt.Errorf("bootstrap @agent/reply: %w", err)
-	}
-	pubIn, pubOut := publishSchema()
-	publishRef, err := ensureAction(ctx, cl, "publish", pubIn, pubOut)
-	if err != nil {
-		return nil, nil, agent.Config{}, cfg, fmt.Errorf("bootstrap @agent/publish: %w", err)
-	}
-	log.event("bootstrap", map[string]any{"reply": replyRef, "publish": publishRef})
-
 	maker, err := NewMaker(cfg.DataDir, cfg.makerConfig(), cl, cl, log.event)
 	if err != nil {
 		return nil, nil, agent.Config{}, cfg, fmt.Errorf("maker: %w", err)
 	}
 
+	// Harness tools: plain-named, intercepted, never registered on the platform.
 	intrinsics := map[string]agent.Intrinsic{
-		replyRef: {Handle: func(_ context.Context, args map[string]any) (map[string]any, bool, error) {
+		"reply": {Handle: func(_ context.Context, args map[string]any) (map[string]any, bool, error) {
 			return args, true, nil // terminal: the answer is the selection's args
 		}},
-		publishRef: maker.PublishIntrinsic(),
+		"publish": maker.PublishIntrinsic(),
 	}
 	loopCfg := agent.Config{
-		ReplyAction:    replyRef,
+		ReplyTool:      "reply",
 		LookupAction:   "@sys/lookup",
-		AlwaysRefs:     []string{"@sys/lookup"},
+		Tools:          []agent.Tool{replyTool(), publishTool()},
+		Always:         []agent.Candidate{lookupCandidate()},
 		MaxTurns:       cfg.MaxTurns,
 		CandidateLimit: cfg.CandidateLimit,
 		LookupLimit:    cfg.LookupLimit,
 		Intrinsics:     intrinsics,
 	}
-	prompter := LoadPrompter(self.Handle, replyRef, cfg.personaPath(), cfg.knowledgePath())
+	log.event("bootstrap", map[string]any{"handle": self.Handle, "tools": []string{"reply", "publish"}})
+	prompter := LoadPrompter(self.Handle, "reply", cfg.personaPath(), cfg.knowledgePath())
 	var mem *Memory
 	if cfg.Memory.Enabled {
 		mem = NewMemory(cfg.memoryPath(), cfg.Memory.MemoryBytes, cl)

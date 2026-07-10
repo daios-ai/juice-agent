@@ -70,10 +70,10 @@ func TestRateTaskJudgesSuccessfulCalls(t *testing.T) {
 
 func TestRateTaskSkipsIntrinsics(t *testing.T) {
 	msgs := []agent.Message{
-		{Role: agent.RoleTool, Action: "@agent/reply", TxID: "tx-reply"},
+		{Role: agent.RoleTool, Action: "reply", TxID: "tx-reply"},
 	}
 	r := newFakeRater(map[string]any{"ratings": []any{}})
-	RateTask(context.Background(), msgs, r, map[string]agent.Intrinsic{"@agent/reply": {}}, nil)
+	RateTask(context.Background(), msgs, r, map[string]agent.Intrinsic{"reply": {}}, nil)
 	if _, ok := r.rated["tx-reply"]; ok {
 		t.Fatal("intrinsic call should not be rated")
 	}

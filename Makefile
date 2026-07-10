@@ -6,7 +6,7 @@ VERSION  := $(shell git describe --tags --always --dirty 2>/dev/null || echo dev
 COMMIT   := $(shell git rev-parse --short HEAD 2>/dev/null || echo unknown)
 LDFLAGS  := -ldflags "-X main.version=$(VERSION) -X main.commit=$(COMMIT)"
 
-.PHONY: build test flows bench artifact clean install uninstall
+.PHONY: build test flows bench clean install uninstall
 
 build:
 	go build $(LDFLAGS) -o $(BINARY) $(PKG)
@@ -25,11 +25,6 @@ flows: build
 # Requires a reachable kernel and AGENT_PASSWORD.
 bench: build
 	./$(BINARY) bench bench/tasks.json
-
-# Regenerate the embedded reply.wasm.b64 echo artifact by compiling the one-line
-# echo Handle through a throwaway kernel's @sys/tinygo/compile.
-artifact:
-	JUICE_BIN=$(JUICE_BIN) ./flows/gen_artifact.sh
 
 clean:
 	rm -f $(BINARY)

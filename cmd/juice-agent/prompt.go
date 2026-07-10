@@ -15,20 +15,20 @@ import (
 // buildSystemPrompt, transposed: one builder, no per-model variation (the kernel
 // is the one provider). Absent sections are simply omitted.
 type Prompter struct {
-	Handle      string // the agent, e.g. "@research"
-	ReplyAction string // the terminal action, e.g. "@research/reply"
-	Persona     string // persona.md contents (may be empty)
-	Knowledge   string // knowledge.md contents (may be empty)
+	Handle    string // the agent, e.g. "@research"
+	ReplyTool string // the terminal tool's name, e.g. "reply"
+	Persona   string // persona.md contents (may be empty)
+	Knowledge string // knowledge.md contents (may be empty)
 }
 
 // LoadPrompter builds a Prompter, reading the persona and knowledge files (a
 // missing or unreadable file yields an empty section, never an error).
-func LoadPrompter(handle, replyAction, personaPath, knowledgePath string) *Prompter {
+func LoadPrompter(handle, replyTool, personaPath, knowledgePath string) *Prompter {
 	return &Prompter{
-		Handle:      handle,
-		ReplyAction: replyAction,
-		Persona:     readFileOrEmpty(personaPath),
-		Knowledge:   readFileOrEmpty(knowledgePath),
+		Handle:    handle,
+		ReplyTool: replyTool,
+		Persona:   readFileOrEmpty(personaPath),
+		Knowledge: readFileOrEmpty(knowledgePath),
 	}
 }
 
@@ -40,14 +40,14 @@ func (p *Prompter) Build(memoryDigest string) agent.Message {
 	if handle == "" {
 		handle = "@agent"
 	}
-	reply := p.ReplyAction
+	reply := p.ReplyTool
 	if reply == "" {
-		reply = handle + "/reply"
+		reply = "reply"
 	}
 
 	var b strings.Builder
-	fmt.Fprintf(&b, "You are %s, an agent on the Juice platform. You solve each task by selecting "+
-		"actions from the catalog, one per turn, and finish by selecting %s with your answer.\n",
+	fmt.Fprintf(&b, "You are %s, an agent on the Juice platform. You solve each task by selecting one "+
+		"action or tool per turn, and finish by selecting the %q tool with your answer.\n",
 		handle, reply)
 	if s := strings.TrimSpace(p.Persona); s != "" {
 		b.WriteString("\n# Persona\n" + s + "\n")
@@ -60,7 +60,7 @@ func (p *Prompter) Build(memoryDigest string) agent.Message {
 	}
 	b.WriteString("\n# Operating\nPrefer actions with a proven track record; try an untested one " +
 		"only when nothing proven fits. Stay within your credit budget. When you have the answer, " +
-		"select " + reply + ".")
+		"select the " + reply + " tool.")
 	return agent.Message{Role: agent.RoleSystem, Kind: "system", Content: strings.TrimSpace(b.String())}
 }
 

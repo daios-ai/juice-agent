@@ -38,8 +38,8 @@ func (c *captureChannel) Stop()                           {}
 // stubKernel is the minimal Kernel that always replies immediately.
 type stubKernel struct{}
 
-func (stubKernel) Decide(context.Context, []agent.Message, []string) (*agent.Selection, error) {
-	return &agent.Selection{Action: "@agent/reply", Args: map[string]any{"answer": "done"}}, nil
+func (stubKernel) Decide(context.Context, []agent.Message, []agent.Candidate, []agent.Tool) (*agent.Selection, error) {
+	return &agent.Selection{Action: "reply", Args: map[string]any{"answer": "done"}}, nil
 }
 func (stubKernel) Lookup(context.Context, string, int) ([]agent.Candidate, error) { return nil, nil }
 func (stubKernel) Meta(context.Context, string) (int, agent.ActionStats, error) {
@@ -61,8 +61,8 @@ func newExecutor(dir string) *Executor {
 		DataDir: dir,
 		RetryOK: func(error) bool { return false },
 		Loop: agent.Config{
-			ReplyAction: "@agent/reply", LookupAction: "@sys/lookup", MaxTurns: 5,
-			Intrinsics: map[string]agent.Intrinsic{"@agent/reply": {
+			ReplyTool: "reply", LookupAction: "@sys/lookup", MaxTurns: 5,
+			Intrinsics: map[string]agent.Intrinsic{"reply": {
 				Handle: func(_ context.Context, a map[string]any) (map[string]any, bool, error) { return a, true, nil },
 			}},
 		},

@@ -25,14 +25,16 @@ flow_bootstrap() {
     start_kernel "$dir" || { fail bootstrap.kernel "no kernel"; return; }
     create_agent
     start_agentd "$dir" || { fail bootstrap.agentd "no daemon"; return; }
+    ok bootstrap.logged_in_and_serving
 
+    # Harness tools are NOT registered on the platform — the catalog stays clean.
     local acts; acts=$(kj action list --all)
-    assert_contains bootstrap.reply_registered   "@agent/reply"   "$acts"
-    assert_contains bootstrap.publish_registered "@agent/publish" "$acts"
+    assert_not_contains bootstrap.no_fake_reply   "@agent/reply"   "$acts"
+    assert_not_contains bootstrap.no_fake_publish "@agent/publish" "$acts"
 
     kill -9 "$AGENTD_PID" 2>/dev/null; wait "$AGENTD_PID" 2>/dev/null
     start_agentd "$dir" || { fail bootstrap.restart "no daemon"; return; }
-    ok bootstrap.idempotent_restart
+    ok bootstrap.restart
 }
 
 flow_recovery() {
@@ -190,11 +192,12 @@ flow_named() {
     wait_line "$dir/alice.log" '"event":"serving"' >/dev/null
     wait_line "$dir/bob.log"   '"event":"serving"' >/dev/null
 
-    # Each named agent registered its own terminal action under its own handle.
+    # Each named agent logs in and serves under its own handle (distinct users on
+    # one kernel; no fake per-agent actions are registered).
+    assert_contains named.alice_identity '"handle":"@alice"' "$(cat "$dir/alice.log")"
+    assert_contains named.bob_identity   '"handle":"@bob"'   "$(cat "$dir/bob.log")"
     local acts; acts=$(kj action list --all)
-    assert_contains named.alice_reply "@alice/reply" "$acts"
-    assert_contains named.bob_reply   "@bob/reply"   "$acts"
-    assert_contains named.identity    '"handle":"@alice"' "$(cat "$dir/alice.log")"
+    assert_not_contains named.no_fake_actions "@alice/reply" "$acts"
 }
 
 flow_memory() {
