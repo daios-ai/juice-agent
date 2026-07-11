@@ -240,6 +240,7 @@ func TestTurnCapHalts(t *testing.T) {
 	tr := &memTranscript{}
 	cfg := baseConfig()
 	cfg.MaxTurns = 5
+	cfg.MaxRepeats = -1 // isolate the turn cap from the repeat guard
 
 	out, err := Run(context.Background(), Task{Budget: 100}, cfg, newDeps(dec, cat, run, tr))
 	if err != nil {
@@ -606,6 +607,7 @@ func TestSubtaskSharesTurnCap(t *testing.T) {
 	dec := &loopingSubtaskDecider{}
 	cfg := subtaskConfig()
 	cfg.MaxTurns = 4
+	cfg.MaxRepeats = -1 // isolate the shared turn cap from the repeat guard
 	run := &recordingRunner{}
 	out, _ := Run(context.Background(), Task{Budget: 1000}, cfg, newDeps(dec, &fakeCatalog{}, run, &memTranscript{}))
 	if out.Status != StatusFailed || out.Reason != "turn-cap" {
@@ -631,4 +633,251 @@ func (d *loopingSubtaskDecider) Decide(_ context.Context, _ []Message, _ []Candi
 		return &Selection{Action: "subtask", Args: map[string]any{"instruction": "loop"}}, nil
 	}
 	return &Selection{Action: "@sys/time"}, nil
+}
+
+// --- repeat guard (§4c) -----------------------------------------------------
+
+func countKind(msgs []Message, kind string) int {
+	n := 0
+	for _, m := range msgs {
+		if m.Kind == kind {
+			n++
+		}
+	}
+	return n
+}
+
+func TestRepeatChallengeThenBackDown(t *testing.T) {
+	// The model posts the same successful action twice; the second is a repeat, so
+	// the loop challenges it (does NOT dispatch), and the model backs down with
+	// reply. Exactly ONE dispatch, one challenge, a clean answered outcome.
+	dec := &scriptedDecider{script: []Selection{
+		{Action: "@chat/message", Args: map[string]any{"text": "read it"}},
+		{Action: "@chat/message", Args: map[string]any{"text": "read it"}}, // repeat → challenged
+		{Action: "reply", Args: map[string]any{"answer": "done"}},
+	}}
+	cat := &fakeCatalog{seed: []Candidate{{Ref: "@chat/message"}}}
+	run := &recordingRunner{}
+	tr := &memTranscript{}
+
+	out, err := Run(context.Background(), Task{Budget: 100}, baseConfig(), newDeps(dec, cat, run, tr))
+	if err != nil {
+		t.Fatal(err)
+	}
+	if out.Status != StatusAnswered {
+		t.Fatalf("status = %q, want answered", out.Status)
+	}
+	if len(run.calls) != 1 {
+		t.Fatalf("dispatched %v, want exactly one (the repeat was challenged, not run)", run.calls)
+	}
+	if n := countKind(tr.msgs, "repeat-challenge"); n != 1 {
+		t.Fatalf("repeat-challenge messages = %d, want 1", n)
+	}
+}
+
+// repeatingDecider always selects the same action+args (a doom loop), until it
+// has been challenged, at which point it keeps insisting.
+type repeatingDecider struct{ action string }
+
+func (d *repeatingDecider) Decide(_ context.Context, _ []Message, _ []Candidate, _ []Tool) (*Selection, error) {
+	return &Selection{Action: d.action, Args: map[string]any{"text": "same"}}, nil
+}
+
+func TestRepeatConfirmThenFloor(t *testing.T) {
+	// The model insists on the repeat past every challenge. With the default floor
+	// of 3 confirmed repeats, total dispatches are bounded to 4 (1 original + 3
+	// confirmed) and the frame hard-stops on repeat-loop, well under the turn cap.
+	dec := &repeatingDecider{action: "@chat/message"}
+	cat := &fakeCatalog{seed: []Candidate{{Ref: "@chat/message"}}}
+	run := &recordingRunner{}
+	tr := &memTranscript{}
+	cfg := baseConfig() // MaxRepeats 0 → default 3
+
+	out, err := Run(context.Background(), Task{Budget: 1000}, cfg, newDeps(dec, cat, run, tr))
+	if err != nil {
+		t.Fatal(err)
+	}
+	if out.Status != StatusFailed || out.Reason != "repeat-loop" {
+		t.Fatalf("outcome = %+v, want failed/repeat-loop", out)
+	}
+	if len(run.calls) != 4 {
+		t.Fatalf("dispatched %d, want 4 (1 original + 3 confirmed)", len(run.calls))
+	}
+	if out.Turns >= cfg.MaxTurns {
+		t.Fatalf("turns = %d, want well under the cap %d (terminated on repeat-loop)", out.Turns, cfg.MaxTurns)
+	}
+}
+
+func TestRepeatFloorConfigurable(t *testing.T) {
+	// A floor of 1 bounds dispatches to 2 (1 original + 1 confirmed).
+	dec := &repeatingDecider{action: "@chat/message"}
+	cat := &fakeCatalog{seed: []Candidate{{Ref: "@chat/message"}}}
+	run := &recordingRunner{}
+	cfg := baseConfig()
+	cfg.MaxRepeats = 1
+
+	out, _ := Run(context.Background(), Task{Budget: 1000}, cfg, newDeps(dec, cat, run, &memTranscript{}))
+	if out.Status != StatusFailed || out.Reason != "repeat-loop" {
+		t.Fatalf("outcome = %+v, want failed/repeat-loop", out)
+	}
+	if len(run.calls) != 2 {
+		t.Fatalf("dispatched %d, want 2 (1 original + 1 confirmed)", len(run.calls))
+	}
+}
+
+func TestRepeatChangeOfCourseResets(t *testing.T) {
+	// After the challenge the model picks a DIFFERENT action; that is progress, so
+	// no hard-stop and the confirmed-repeat count resets.
+	dec := &scriptedDecider{script: []Selection{
+		{Action: "@a", Args: map[string]any{"x": 1}},
+		{Action: "@a", Args: map[string]any{"x": 1}}, // repeat → challenged
+		{Action: "@b", Args: map[string]any{"y": 2}}, // change of course
+		{Action: "reply", Args: map[string]any{"answer": "done"}},
+	}}
+	cat := &fakeCatalog{seed: []Candidate{{Ref: "@a"}, {Ref: "@b"}}}
+	run := &recordingRunner{}
+	tr := &memTranscript{}
+
+	out, err := Run(context.Background(), Task{Budget: 100}, baseConfig(), newDeps(dec, cat, run, tr))
+	if err != nil {
+		t.Fatal(err)
+	}
+	if out.Status != StatusAnswered {
+		t.Fatalf("outcome = %+v, want answered (no repeat-loop)", out)
+	}
+	if len(run.calls) != 2 || run.calls[0] != "@a" || run.calls[1] != "@b" {
+		t.Fatalf("dispatched %v, want [@a @b] (one @a, challenge, then @b)", run.calls)
+	}
+	if n := countKind(tr.msgs, "repeat-challenge"); n != 1 {
+		t.Fatalf("repeat-challenge messages = %d, want 1", n)
+	}
+}
+
+func TestAlternationIsNotARepeat(t *testing.T) {
+	// A, B, A, B is not a repeat loop — the guard is consecutive-only, so no
+	// challenge is ever issued.
+	dec := &scriptedDecider{script: []Selection{
+		{Action: "@a", Args: map[string]any{"x": 1}},
+		{Action: "@b", Args: map[string]any{"x": 1}},
+		{Action: "@a", Args: map[string]any{"x": 1}},
+		{Action: "@b", Args: map[string]any{"x": 1}},
+		{Action: "reply", Args: map[string]any{"answer": "done"}},
+	}}
+	cat := &fakeCatalog{seed: []Candidate{{Ref: "@a"}, {Ref: "@b"}}}
+	run := &recordingRunner{}
+	tr := &memTranscript{}
+
+	out, _ := Run(context.Background(), Task{Budget: 100}, baseConfig(), newDeps(dec, cat, run, tr))
+	if out.Status != StatusAnswered {
+		t.Fatalf("outcome = %+v, want answered", out)
+	}
+	if len(run.calls) != 4 {
+		t.Fatalf("dispatched %d, want 4 (no challenge inserted)", len(run.calls))
+	}
+	if n := countKind(tr.msgs, "repeat-challenge"); n != 0 {
+		t.Fatalf("repeat-challenge messages = %d, want 0 (alternation is not a repeat)", n)
+	}
+}
+
+func TestSelectionSigArgOrderIndependent(t *testing.T) {
+	// The signature is invariant to how the args map was built (encoding/json sorts
+	// keys), so the same action with the same values always compares equal.
+	a := &Selection{Action: "@x", Args: map[string]any{"a": 1, "b": "two", "c": []any{3, 4}}}
+	b := &Selection{Action: "@x", Args: map[string]any{"c": []any{3, 4}, "b": "two", "a": 1}}
+	if selectionSig(a) != selectionSig(b) {
+		t.Fatalf("signatures differ for equal args:\n %q\n %q", selectionSig(a), selectionSig(b))
+	}
+	// Different values must NOT collide.
+	c := &Selection{Action: "@x", Args: map[string]any{"a": 1, "b": "two", "c": []any{3, 5}}}
+	if selectionSig(a) == selectionSig(c) {
+		t.Fatal("signatures collided for different args")
+	}
+}
+
+func TestReplyExemptFromRepeatGuard(t *testing.T) {
+	// reply is the escape hatch; it terminates on first selection and is never
+	// challenged as a repeat.
+	dec := &scriptedDecider{script: []Selection{
+		{Action: "reply", Args: map[string]any{"answer": "done"}},
+		{Action: "reply", Args: map[string]any{"answer": "done"}},
+	}}
+	tr := &memTranscript{}
+	out, _ := Run(context.Background(), Task{Budget: 100}, baseConfig(), newDeps(dec, &fakeCatalog{}, &recordingRunner{}, tr))
+	if out.Status != StatusAnswered || out.Turns != 1 {
+		t.Fatalf("outcome = %+v, want answered on turn 1", out)
+	}
+	if n := countKind(tr.msgs, "repeat-challenge"); n != 0 {
+		t.Fatalf("repeat-challenge messages = %d, want 0", n)
+	}
+}
+
+// bracketRepeatDecider opens a subtask once, loops a free action inside the
+// bracket, and replies at the root as soon as it sees the subtask rollup.
+type bracketRepeatDecider struct{ opened bool }
+
+func (d *bracketRepeatDecider) Decide(_ context.Context, msgs []Message, _ []Candidate, _ []Tool) (*Selection, error) {
+	for _, m := range msgs {
+		if m.Role == RoleTool && m.Action == "subtask" {
+			return &Selection{Action: "reply", Args: map[string]any{"answer": "handled"}}, nil
+		}
+	}
+	if !d.opened {
+		d.opened = true
+		return &Selection{Action: "subtask", Args: map[string]any{"instruction": "loop"}}, nil
+	}
+	return &Selection{Action: "@sys/time", Args: map[string]any{"text": "same"}}, nil
+}
+
+func TestBracketRepeatIsolation(t *testing.T) {
+	// A repeat inside a bracket hard-stops the CHILD frame (rollup error), without
+	// tripping the parent's own guard. The parent recovers and answers.
+	dec := &bracketRepeatDecider{}
+	cfg := subtaskConfig()
+	cfg.MaxRepeats = 1 // child bounded to 2 dispatches (1 original + 1 confirmed)
+	run := &recordingRunner{}
+	tr := &memTranscript{}
+
+	out, err := Run(context.Background(), Task{Budget: 1000}, cfg, newDeps(dec, &fakeCatalog{}, run, tr))
+	if err != nil {
+		t.Fatal(err)
+	}
+	if out.Status != StatusAnswered || out.Answer["answer"] != "handled" {
+		t.Fatalf("outcome = %+v, want answered/handled (parent recovered)", out)
+	}
+	if len(run.calls) != 2 {
+		t.Fatalf("child dispatched %d, want 2 (bounded by the child's own guard)", len(run.calls))
+	}
+	// The parent's rolled-up subtask result carries the child's repeat-loop error.
+	var rollup map[string]any
+	for _, m := range tr.msgs {
+		if m.Role == RoleTool && m.Action == "subtask" {
+			rollup = m.Result
+		}
+	}
+	if rollup == nil || rollup["error"] != "repeat-loop" {
+		t.Fatalf("subtask rollup = %v, want {error: repeat-loop}", rollup)
+	}
+}
+
+func TestRepeatGuardDisabled(t *testing.T) {
+	// MaxRepeats < 0 disables the guard: a looping action runs every turn until the
+	// turn cap, exactly as before, with no challenge inserted.
+	dec := &repeatingDecider{action: "@sys/time"}
+	cat := &fakeCatalog{seed: []Candidate{{Ref: "@sys/time"}}}
+	run := &recordingRunner{}
+	tr := &memTranscript{}
+	cfg := baseConfig()
+	cfg.MaxTurns = 5
+	cfg.MaxRepeats = -1
+
+	out, _ := Run(context.Background(), Task{Budget: 1000}, cfg, newDeps(dec, cat, run, tr))
+	if out.Status != StatusFailed || out.Reason != "turn-cap" {
+		t.Fatalf("outcome = %+v, want failed/turn-cap", out)
+	}
+	if len(run.calls) != 5 {
+		t.Fatalf("dispatched %d, want 5 (every turn, guard disabled)", len(run.calls))
+	}
+	if n := countKind(tr.msgs, "repeat-challenge"); n != 0 {
+		t.Fatalf("repeat-challenge messages = %d, want 0 (guard disabled)", n)
+	}
 }

@@ -200,11 +200,38 @@ daemon *is* unattended, so it takes both rails — but the primary one is econom
 2. **Turn cap (secondary, default 32).** Required because zero-price actions (`@sys/lookup`,
    `@sys/llm/*`, refused selections) escape the money rail. A configurable hard cap; hitting
    it fails the task honestly with `reason = turn-cap`.
+3. **Repeat guard (§4c).** Catches the case the other two miss: a *free, succeeding* action selected
+   over and over (a real observed failure — an agent posted the same chat message 31× and never
+   stopped).
 
-No identical-call detector: a repeated priced call burns budget, a repeated free call meets the
-turn cap. Retries (3×, exponential 2s/4s/8s) live in the policy layer (outside the pure loop), as in pi, and apply
+Retries (3×, exponential 2s/4s/8s) live in the policy layer (outside the pure loop), as in pi, and apply
 only to transport-level and retryable kernel errors (network, 5xx, 429, `ErrTimeout`) — never to
 `ErrInsufficientFunds`, schema violations, or a user abort.
+
+## 4c. Repeat guard
+
+Budget and the turn cap both fail against a cheap action that *succeeds* on every call: the model
+re-selects an identical `(action, args)` forever, the task reads `failed / turn-cap` even though it
+functionally succeeded, and any side-effect is spammed. The guard treats a repeat as a **question,
+not a verdict** — the model's own answer decides.
+
+- **Detect.** Before dispatch, the loop signs each selection (`action` + JSON-canonical `args`,
+  keys sorted so ordering never matters) and compares it to the last selection it actually *acted*
+  on. `reply` is exempt — it is the exit we *want* the model to take.
+- **Challenge, don't dispatch.** On the first repeat the loop does **not** run it; it injects one
+  message — *"you already ran this and it succeeded; are you sure, or is the task complete? if
+  complete, select reply"* — and loops. The identical side-effect is thereby bounded to **one**: a
+  second only fires if the model insists past the question.
+- **The model's answer is the signal.** Back down (`reply`, or a different action) → resolved
+  gracefully, the common case. Insist (same call again) → treated as confirmation and allowed once.
+- **Hard floor.** After `max_repeats` confirmed repeats (default 3) the frame hard-stops with
+  `reason = repeat-loop` (a bracket rolls up `{error: repeat-loop}` its parent can act on). State is
+  per-frame, so a bracket's repeats are its own and never trip the parent.
+
+This is opencode's confirm-before-repeat (it asks the *human* at 3 identical calls) turned into a
+*model*-in-the-loop self-check, with the deterministic floor kept underneath as the guarantee — a
+shape none of pi (no rail), opencode (human prompt), or OpenClaw (count breaker at 30) has.
+`max_repeats < 0` disables it.
 
 ## 5. Persistence, compaction, memory
 

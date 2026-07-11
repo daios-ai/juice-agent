@@ -20,6 +20,7 @@ type Config struct {
 	Memory         MemoryConfig  `json:"memory"`
 	DefaultBudget  int           `json:"default_budget"`
 	MaxTurns       int           `json:"max_turns"`
+	MaxRepeats     int           `json:"max_repeats"`
 	Concurrency    int           `json:"concurrency"`
 	CandidateLimit int           `json:"candidate_limit"`
 	LookupLimit    int           `json:"lookup_limit"`
@@ -66,6 +67,7 @@ func DefaultConfig() Config {
 		Memory:         MemoryConfig{Enabled: true, MemoryBytes: 65536},
 		DefaultBudget:  100,
 		MaxTurns:       32,
+		MaxRepeats:     3,
 		Concurrency:    4,
 		CandidateLimit: 24,
 		LookupLimit:    8,

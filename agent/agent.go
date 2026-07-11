@@ -9,6 +9,7 @@ package agent
 
 import (
 	"context"
+	"encoding/json"
 	"fmt"
 	"sort"
 	"strings"
@@ -176,6 +177,10 @@ type Config struct {
 	// MaxDecideErrors bounds consecutive invalid model selections before the run
 	// fails; each is fed back for self-correction. Default 3 when zero.
 	MaxDecideErrors int
+	// MaxRepeats bounds how many times the model may confirm-and-repeat an
+	// identical (action, args) selection after being challenged, before the frame
+	// hard-stops (§4c). Default 3 when zero; negative disables the repeat guard.
+	MaxRepeats int
 	// Intrinsics maps a harness tool name to its handler. reply is terminal;
 	// publish/subtask are non-terminal.
 	Intrinsics map[string]Intrinsic
@@ -245,6 +250,18 @@ func runFrame(ctx context.Context, cfg Config, deps Deps, budget int, cnt *count
 	}
 	decideErrors := 0
 
+	// Repeat guard (§4c): on a repeated (action, args), challenge the model once
+	// before dispatching; only a confirmed insistence acts, and only up to
+	// maxRepeats times before the frame hard-stops. lastActedSig is the signature
+	// of the last selection actually acted on; "" (frame start) never matches.
+	maxRepeats := cfg.MaxRepeats
+	if maxRepeats == 0 {
+		maxRepeats = 3
+	}
+	var lastActedSig string
+	awaitingConfirm := false
+	confirmedRepeats := 0
+
 	// feedback records a self-correction nudge and reports whether the cap is now
 	// exceeded (so the caller ends the frame).
 	feedback := func(content string) (exceeded bool, aerr error) {
@@ -313,6 +330,35 @@ func runFrame(ctx context.Context, cfg Config, deps Deps, budget int, cnt *count
 			}
 		}
 
+		// Repeat guard (§4c): reply is exempt (it is the escape we want). A first
+		// repeat is challenged, not dispatched; a repeat that persists past the
+		// challenge is a confirmation, allowed up to maxRepeats before hard-stop.
+		sig := selectionSig(sel)
+		isRepeat := maxRepeats >= 0 && sel.Action != cfg.ReplyTool && sig == lastActedSig
+		if isRepeat && !awaitingConfirm {
+			awaitingConfirm = true
+			logf("repeat_challenge", map[string]any{"turn": cnt.turns, "depth": depth, "action": sel.Action})
+			if err := deps.Transcript.Append(ctx, Message{Role: RoleSystem, Kind: "repeat-challenge",
+				Content: fmt.Sprintf("You just selected %q with the same arguments as your previous call, "+
+					"which already completed. Are you sure you want to run it again? If the task is now "+
+					"complete, select the %q tool with your answer. If a different step is needed, select that "+
+					"action instead. Only repeat this exact call if it is truly necessary.", sel.Action, cfg.ReplyTool)}); err != nil {
+				return nil, StatusFailed, "", err
+			}
+			continue
+		}
+		if awaitingConfirm {
+			awaitingConfirm = false
+			if isRepeat {
+				confirmedRepeats++
+				if confirmedRepeats > maxRepeats {
+					return exhausted("repeat-loop")
+				}
+			} else {
+				confirmedRepeats = 0
+			}
+		}
+
 		switch {
 		// reply → this frame is done; its args are the frame result.
 		case sel.Action == cfg.ReplyTool:
@@ -337,6 +383,7 @@ func runFrame(ctx context.Context, cfg Config, deps Deps, budget int, cnt *count
 			if err := deps.Transcript.Append(ctx, Message{Role: RoleTool, Action: sel.Action, Result: res}); err != nil {
 				return nil, StatusFailed, "", err
 			}
+			lastActedSig = sig
 
 		// other harness tool (publish) → intrinsic handler.
 		case cfg.Intrinsics[sel.Action].Handle != nil:
@@ -349,6 +396,7 @@ func runFrame(ctx context.Context, cfg Config, deps Deps, budget int, cnt *count
 			if terminal {
 				return res, StatusAnswered, "", nil
 			}
+			lastActedSig = sig
 
 		// catalog action → dispatch (budget-gated).
 		default:
@@ -375,6 +423,7 @@ func runFrame(ctx context.Context, cfg Config, deps Deps, budget int, cnt *count
 			}); err != nil {
 				return nil, StatusFailed, "", err
 			}
+			lastActedSig = sig
 			logf("dispatch", map[string]any{"action": sel.Action, "price": price, "tx_id": rr.TxID, "error": rerr != nil})
 		}
 	}
@@ -397,6 +446,18 @@ func bracketSeed(parent []Message, args map[string]any) []Message {
 	instr, _ := args["instruction"].(string)
 	seed = append(seed, Message{Role: RoleUser, Content: "Subtask: " + instr})
 	return seed
+}
+
+// selectionSig is a stable identity for a selection: its action plus its args
+// marshaled to JSON. encoding/json sorts map keys (recursively), so the signature
+// is invariant to arg ordering — two selections of the same action with the same
+// argument values compare equal regardless of how the map was built.
+func selectionSig(sel *Selection) string {
+	b, err := json.Marshal(sel.Args)
+	if err != nil {
+		b = nil
+	}
+	return sel.Action + "\x00" + string(b)
 }
 
 // promptOf renders a frame's user content into a lookup query — what lookup

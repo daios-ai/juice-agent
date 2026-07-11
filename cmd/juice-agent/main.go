@@ -110,6 +110,7 @@ func setup(ctx context.Context, log *logger, cliHandle string) (*Executor, *juic
 		Tools:          []agent.Tool{replyTool(), subtaskTool(), publishTool()},
 		Always:         []agent.Candidate{lookupCandidate()},
 		MaxTurns:       cfg.MaxTurns,
+		MaxRepeats:     cfg.MaxRepeats,
 		CandidateLimit: cfg.CandidateLimit,
 		LookupLimit:    cfg.LookupLimit,
 		Intrinsics:     intrinsics,
