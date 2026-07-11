@@ -16,8 +16,7 @@ See `agent-design.md` for the full design and rationale.
    `gemma4:26b` (chat) + `nomic-embed-text` (embed); smaller models often can't tool-call reliably
    enough to drive the loop.
 2. **An agent account on that kernel, funded with credits** (below).
-3. Go 1.22+ to build. (TinyGo is only needed to *regenerate* the embedded reply artifact via
-   `make artifact`; the prebuilt one is committed.)
+3. Go 1.22+ to build.
 
 ## Build
 
@@ -37,19 +36,32 @@ juice user create @agent agent@example.com --password 's3cret-pass'
 juice admin deposit @agent 100000
 ```
 
-The daemon self-registers its two intrinsic actions (`@agent/reply`, `@agent/publish`) on first
-start; nothing else is needed kernel-side.
+The agent's `reply`/`publish`/`subtask` tools are plain-named harness affordances it intercepts
+itself — they are **not** registered on the platform, so nothing else is needed kernel-side.
 
-## Configuration
+## Filesystem layout & configuration
 
-Config is `agent.json` (path from `AGENT_CONFIG`, default `./agent.json`). Secrets never live in it:
-the password comes from `AGENT_PASSWORD` or the file named by `AGENT_PASSWORD_FILE`.
+Each agent lives in its own home under the juice-family root, `$JUICE_HOME` (default `~/.juice`):
+
+```
+$JUICE_HOME/agent/                 the juice-agent component root
+├── config.json                    OPTIONAL host-wide defaults shared by every agent
+└── <handle>/                      e.g. research/  (handle = directory name, no leading @)
+    ├── config.json                this agent's config (overrides the shared defaults)
+    ├── persona.md  knowledge.md  memory.md    hand-authored + learned files
+    └── data/                      transcripts (one JSONL per task) + the maker index
+```
+
+The home is **fixed, never cwd-relative**, and is created (mode 0700) on first launch, with blank
+`persona.md`/`knowledge.md`/`memory.md` written so you always have files to edit. Config is layered:
+the component-level `config.json` supplies host-wide defaults (e.g. `server_url`), and the per-agent
+`config.json` overrides them key-by-key. Secrets never live in config (see *Running* below). The
+handle is the `@handle` CLI arg (else `AGENT_HANDLE`, else `@agent`) — it names the directory, so it
+is not a config key.
 
 ```json
 {
   "server_url": "http://localhost:4040",
-  "handle": "@agent",
-  "data_dir": "./agent-data",
   "default_budget": 100,
   "max_turns": 32,
   "concurrency": 4,
@@ -80,17 +92,27 @@ the password comes from `AGENT_PASSWORD` or the file named by `AGENT_PASSWORD_FI
 ### As a daemon
 
 ```sh
-AGENT_PASSWORD='s3cret-pass' AGENT_CONFIG=./agent.json juice-agent serve
+juice-agent @agent            # serve is the default action on a handle
 ```
 
-It authenticates, registers its intrinsics, runs startup recovery, starts the configured channels
-and a worker pool, and serves until `SIGTERM`/`SIGINT` — on which it drains in-flight tasks,
-persists, and exits 0. Structured logs go to stderr.
+With no `--password-stdin`, `AGENT_PASSWORD`, or `AGENT_PASSWORD_FILE` set, it prompts for the
+password on the terminal (no echo). For unattended/systemd use, supply one of the non-interactive
+sources instead:
+
+```sh
+AGENT_PASSWORD='s3cret-pass' juice-agent @agent serve         # env
+echo 's3cret-pass' | juice-agent @agent --password-stdin      # pipe
+```
+
+The password precedence is `--password-stdin` → `AGENT_PASSWORD` → `AGENT_PASSWORD_FILE` →
+interactive prompt. It authenticates, runs startup recovery, starts the configured channels and a
+worker pool, and serves until `SIGTERM`/`SIGINT` — on which it drains in-flight tasks, persists, and
+exits 0. Structured logs go to stderr.
 
 ### One-shot (no channel, no daemon)
 
 ```sh
-AGENT_PASSWORD='s3cret-pass' juice-agent task "What is the current time? Reply with an ISO-8601 timestamp."
+AGENT_PASSWORD='s3cret-pass' juice-agent @agent task "What is the current time? Reply with an ISO-8601 timestamp."
 ```
 
 Runs one task and prints its outcome as JSON to stdout:
@@ -148,7 +170,7 @@ Every task yields:
 ## Observability
 
 - **Logs** — structured JSON to stderr (`event`, `task_id`, `turn`, `action`, `tx_id`, …).
-- **Transcripts** — one append-only JSONL per task under `data_dir/`; the durable record and replay
+- **Transcripts** — one append-only JSONL per task under the agent's `data/` dir; the durable record and replay
   log. A task interrupted at shutdown is marked on the next start's recovery scan.
 - **Ledger** — the kernel is the financial ground truth: `juice tx list` shows the agent's calls,
   their costs, and the ratings it left.

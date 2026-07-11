@@ -17,7 +17,7 @@ import (
 // runBench executes the experiment suite against a live agent and writes a
 // versioned JSON report. It is excluded from `go test ./...` (needs a real
 // kernel and LLM); it is the instrument for tracking competence across versions.
-func runBench(args []string, handle string) error {
+func runBench(args []string, handle string, stdinPass bool) error {
 	if len(args) < 1 {
 		return fmt.Errorf("usage: juice-agent bench <suite.json> [reps]")
 	}
@@ -35,7 +35,7 @@ func runBench(args []string, handle string) error {
 
 	log := newLogger()
 	ctx := context.Background()
-	e, _, _, _, err := setup(ctx, log, handle)
+	e, _, _, _, err := setup(ctx, log, handle, stdinPass)
 	if err != nil {
 		return err
 	}

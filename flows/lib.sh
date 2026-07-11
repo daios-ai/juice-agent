@@ -102,23 +102,31 @@ create_user() {
 # ---------------------------------------------------------------------------
 # agentd
 # ---------------------------------------------------------------------------
-# start_agentd dir [cfg-fragment] — write agent.json, launch the @agent daemon,
-# set ADATA and AHTTP. AGENT_HOME is the temp dir so persona/knowledge/memory
-# files stay out of the repo; memory is off by default (flows that test it enable
-# it in their fragment).
+# agent_home dir [handle] — echo an agent's home under JUICE_HOME=$dir. Handle
+# defaults to @agent; the leading @ is stripped for the directory name.
+agent_home() {
+    local dir="$1" handle="${2:-@agent}"
+    echo "$dir/agent/${handle#@}"
+}
+
+# start_agentd dir [cfg-fragment] — write the agent's config.json, launch the
+# @agent daemon with JUICE_HOME=$dir, set ADATA and AHTTP. The temp dir is
+# JUICE_HOME so persona/knowledge/memory and data stay out of the repo; memory is
+# off by default (flows that test it enable it in their fragment).
 start_agentd() {
     local dir="$1" extra="${2:-}"
-    ADATA="$dir/agent-data"
-    local acfg="$dir/agent.json"
-    cat > "$acfg" <<EOF
-{ "server_url": "$KURL", "handle": "@agent", "data_dir": "$ADATA",
+    local home; home=$(agent_home "$dir")
+    ADATA="$home/data"
+    mkdir -p "$home"
+    cat > "$home/config.json" <<EOF
+{ "server_url": "$KURL",
   "default_budget": 100, "max_turns": 12, "concurrency": 2,
   "lookup_limit": 8, "candidate_limit": 12, "compact_bytes": 262144, "rate_tasks": true,
   "memory": { "enabled": false },
   "channels": { "http": { "addr": "127.0.0.1:0" }, "step": { "poll_seconds": 1 } }
   ${extra:+, $extra} }
 EOF
-    AGENT_HOME="$dir" AGENT_CONFIG="$acfg" AGENT_PASSWORD=agent-pass "$AGENTD" serve >"$dir/agentd.log" 2>&1 &
+    JUICE_HOME="$dir" AGENT_PASSWORD=agent-pass "$AGENTD" @agent serve >"$dir/agentd.log" 2>&1 &
     AGENTD_PID=$!; track "$AGENTD_PID"
     local addr; addr=$(wait_line "$dir/agentd.log" '"event":"serving".*"http_addr":"\([^"]*\)"')
     [ -n "$addr" ] || { echo "agentd did not start" >&2; cat "$dir/agentd.log" >&2; return 1; }

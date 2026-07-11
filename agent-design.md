@@ -316,10 +316,11 @@ Beyond the per-task working memory of §5, an agent has two durable memories, bo
   knowledge, e.g. how Juice works). Human-written.
 - **Learned** — `memory.md`, the agent's own running summary of past tasks.
 
-Both live in the **agent home**, a directory keyed by handle (`<agents_dir>/<handle>/`) that also
-holds `agent.json` and `data/` (transcripts, maker index). `juice-agent @research serve` resolves
-this home, so a differently-behaved agent is a directory, not new code. This splits pi's `AGENTS.md`
-along the authorship seam.
+Both live in the **agent home**, a directory keyed by handle under the juice-family root
+(`$JUICE_HOME/agent/<handle>/`, default `~/.juice`) that also holds `config.json` and `data/`
+(transcripts, maker index). `juice-agent @research` resolves this home, so a differently-behaved
+agent is a directory, not new code. This splits pi's `AGENTS.md` along the authorship seam. The exact
+filesystem convention is normative in `requirements.md` §11.
 
 **System prompt.** Before each task the policy layer (not the pure loop) assembles one
 `system` message — role line + `persona.md` + `knowledge.md` + `memory.md` digest + the operating
@@ -366,25 +367,28 @@ not architecture. The loop never knows which channel a task came from.
 
 `juice-agent [@handle] serve` runs continuously: resolve the agent home from the handle → load
 config → authenticate as that handle (password grant; refresh-token rotation; re-login on
-revocation) → bootstrap (register `@handle/reply` and `@handle/publish` if absent — idempotent, like
-kernel native-action bootstrap) → load `persona.md` / `knowledge.md` / `memory.md` from the home and
+revocation) → assemble the harness tools (`reply`, `publish`, `subtask`), which are plain-named and
+intercepted, never registered on the platform, so startup makes no bootstrap round-trip for them (§4)
+→ load `persona.md` / `knowledge.md` / `memory.md` from the home and
 build the system prompt → run startup recovery (mark interrupted tasks) → start channels and the
 worker pool. Each task settles with the rating pass (§5b) and a best-effort **memory update** (§5c).
 `SIGTERM`/`SIGINT` drains as `juice serve` does: stop intake, let in-flight turns finish, persist,
 exit. There is no `juice-agent stop`.
 
-Handle comes from the CLI arg (`juice-agent @research serve`), else `AGENT_HANDLE`, else config
-`handle`; the home is `<agents_dir>/<handle>/` (`--home` overrides). Per-agent `agent.json` is read
-from the home, falling back to `AGENT_CONFIG`.
+`serve` is the default action on a handle, so `juice-agent @research` runs the daemon (`serve`/
+`task`/`bench` remain explicit; a bare `juice-agent` prints usage). The handle comes from the CLI arg,
+else `AGENT_HANDLE`, else `@agent`; it names the home `$JUICE_HOME/agent/<handle>/`. The home and its
+blank `persona.md`/`knowledge.md`/`memory.md` are created (mode 0700) on first launch. The password is
+resolved by a precedence chain — `--password-stdin`, `AGENT_PASSWORD`, `AGENT_PASSWORD_FILE`, else an
+interactive no-echo prompt (`golang.org/x/term`) — never a bare `--password` flag.
 
-Config is `agent.json` — kernel-style: flat keys, safe defaults, rejected if invalid at startup, no
-committed secrets (password from `AGENT_PASSWORD` or a mode-0600 file). Paths default inside the home:
+Config is `config.json` — kernel-style: flat keys, safe defaults, rejected if invalid at startup, no
+committed secrets. It is layered: a component-level `$JUICE_HOME/agent/config.json` (host-wide
+defaults such as `server_url`) is overridden key-by-key by the per-agent `<home>/config.json`:
 
 ```json
 {
   "server_url": "http://localhost:4040",
-  "handle": "@agent",
-  "agents_dir": "./agents",
   "default_budget": 100,
   "max_turns": 32,
   "concurrency": 4,
@@ -392,16 +396,16 @@ committed secrets (password from `AGENT_PASSWORD` or a mode-0600 file). Paths de
   "compact_bytes": 262144,
   "rate_tasks": true,
   "memory": { "enabled": true, "memory_bytes": 65536 },
-  "persona_file": "persona.md",
-  "knowledge_file": "knowledge.md",
-  "maker": { "enabled": true, "min_repeats": 3, "window": 50, "budget": 40 },
-  "channels": { "step": { "poll_seconds": 5 }, "http": { "addr": "" }, "cli": {} }
+  "maker": { "enabled": false, "min_repeats": 3, "window": 50, "budget": 40 },
+  "channels": { "step": { "poll_seconds": 5 }, "http": { "addr": "" } }
 }
 ```
 
-`persona_file` / `knowledge_file` are resolved relative to the home (absent files are simply
-skipped); transcripts and the maker's index live under `<home>/data/`; `memory.md` under the home.
-`memory.enabled=false` reverts to pi's strict stance (no automatic cross-task memory).
+The handle, the fixed `persona.md`/`knowledge.md`/`memory.md` filenames, and the derived `<home>/data/`
+are not config keys. Transcripts and the maker's index live under `<home>/data/`; `memory.md` under
+the home. `memory.enabled=false` reverts to pi's strict stance (no automatic cross-task memory). The
+legacy cwd-relative layout (`./agent.json`, `AGENT_HOME`, `AGENT_CONFIG`) is a clean cut-over: if
+detected it is logged and ignored, not read.
 
 Logging mirrors the kernel: structured lines to stderr, stdout reserved for resource payloads;
 required fields `time level event task_id channel turn action tx_id status duration_ms error`.
@@ -445,8 +449,8 @@ flow_role_law   a step addressed to @agent is picked up, worked, and completed u
 flow_rating     a dispatched tool call is rated 0/1 after the task, held in the kernel ledger       [real LLM]
 flow_maker      two similar requests trip the repetition trigger (real embeddings)                  [real LLM+embed]
 flow_persona    an agent whose persona.md demands a distinctive marker produces it in the answer    [real LLM]
-flow_named      juice-agent @alice and @bob launch as distinct users; each registers @x/reply;
-                a task addressed to @alice is answered as @alice                                     [real LLM]
+flow_named      juice-agent @alice and @bob launch as distinct kernel users (no reply/publish rows
+                in the catalog); a task addressed to @alice is answered as @alice                    [real LLM]
 flow_memory     after task 1 an entry lands in memory.md; task 2 (even across restart) loads it,
                 and the memory survives byte-bounded compaction                                      [real LLM]
 ```

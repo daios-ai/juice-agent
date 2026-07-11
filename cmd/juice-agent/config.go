@@ -7,16 +7,14 @@ import (
 	"strings"
 )
 
-// Config is the daemon's configuration (agent.json), kernel-style: flat keys,
-// safe local defaults, rejected if invalid at startup. Secrets never live here —
-// the password comes from AGENT_PASSWORD or a mode-0600 file.
+// Config is a single agent's configuration, kernel-style: flat keys, safe
+// defaults, rejected if malformed at startup. It is resolved by layering an
+// optional component-wide config.json under $JUICE_HOME/agent/ and the agent's
+// own config.json under $JUICE_HOME/agent/<handle>/ (§11 of requirements.md).
+// Secrets never live here — the password comes from --password-stdin,
+// AGENT_PASSWORD, AGENT_PASSWORD_FILE, or an interactive prompt (main.go).
 type Config struct {
 	ServerURL      string        `json:"server_url"`
-	Handle         string        `json:"handle"`
-	AgentsDir      string        `json:"agents_dir"`
-	DataDir        string        `json:"data_dir"`
-	PersonaFile    string        `json:"persona_file"`
-	KnowledgeFile  string        `json:"knowledge_file"`
 	Memory         MemoryConfig  `json:"memory"`
 	DefaultBudget  int           `json:"default_budget"`
 	MaxTurns       int           `json:"max_turns"`
@@ -29,8 +27,10 @@ type Config struct {
 	Maker          MakerConfig   `json:"maker"`
 	Channels       ChannelConfig `json:"channels"`
 
-	// Home is the resolved agent-home directory; computed, never from JSON.
-	Home string `json:"-"`
+	// Computed at resolution time from the handle and $JUICE_HOME; never JSON.
+	Handle  string `json:"-"`
+	Home    string `json:"-"`
+	DataDir string `json:"-"`
 }
 
 // MemoryConfig governs the agent's learned cross-task memory.
@@ -53,17 +53,11 @@ type HTTPChannelConfig struct {
 	Addr string `json:"addr"`
 }
 
-// DefaultConfig is the safe local baseline applied when a key is absent.
-// DataDir is left empty so home resolution can decide it (home/data for a named
-// agent, ./agent-data in legacy mode) without clobbering an explicit setting.
+// DefaultConfig is the safe baseline applied when a key is absent. Identity
+// (Handle) and paths (Home, DataDir) are computed by ResolveConfig, not here.
 func DefaultConfig() Config {
 	return Config{
 		ServerURL:      "http://localhost:4040",
-		Handle:         "@agent",
-		AgentsDir:      "./agents",
-		DataDir:        "",
-		PersonaFile:    "persona.md",
-		KnowledgeFile:  "knowledge.md",
 		Memory:         MemoryConfig{Enabled: true, MemoryBytes: 65536},
 		DefaultBudget:  100,
 		MaxTurns:       32,
@@ -77,98 +71,119 @@ func DefaultConfig() Config {
 	}
 }
 
-// resolve fixes the agent's identity and home from the launch inputs: an
-// optional CLI handle (`juice-agent @research`), AGENT_HANDLE, or the config's
-// own handle; and an optional AGENT_HOME override. A *named* launch (handle from
-// CLI or env) roots the agent in its own home under AgentsDir; otherwise the
-// legacy layout applies (home ".", data ./agent-data). Paths default inside the
-// home so a named agent is self-contained.
-func (c *Config) resolve(cliHandle, homeOverride string, named bool) {
+// juiceHome returns the family root: $JUICE_HOME, else ~/.juice. It is fixed,
+// never cwd-relative, so an agent attaches to the same state wherever launched.
+func juiceHome() string {
+	if h := os.Getenv("JUICE_HOME"); h != "" {
+		return h
+	}
+	if home, err := os.UserHomeDir(); err == nil && home != "" {
+		return filepath.Join(home, ".juice")
+	}
+	return ".juice"
+}
+
+// resolveHandle fixes the agent's identity: the CLI @handle arg, else
+// AGENT_HANDLE, else the default @agent.
+func resolveHandle(cliHandle string) string {
 	if cliHandle != "" {
-		c.Handle = cliHandle
+		return cliHandle
 	}
-	switch {
-	case homeOverride != "":
-		c.Home = homeOverride
-	case named:
-		c.Home = filepath.Join(c.AgentsDir, strings.TrimPrefix(c.Handle, "@"))
-	default:
-		c.Home = "."
+	if h := os.Getenv("AGENT_HANDLE"); h != "" {
+		return h
 	}
-	if c.DataDir == "" {
-		if c.Home == "." {
-			c.DataDir = "./agent-data"
-		} else {
-			c.DataDir = filepath.Join(c.Home, "data")
-		}
-	}
+	return "@agent"
 }
 
-// underHome resolves a file relative to the agent home (absolute paths and empty
-// names pass through unchanged).
-func (c Config) underHome(name string) string {
-	if name == "" || filepath.IsAbs(name) {
-		return name
-	}
-	return filepath.Join(c.Home, name)
-}
+// componentDir is $JUICE_HOME/agent — the juice-agent component root, one
+// subdirectory of the family home, holding one directory per named agent.
+func componentDir() string { return filepath.Join(juiceHome(), "agent") }
 
-func (c Config) personaPath() string   { return c.underHome(c.PersonaFile) }
-func (c Config) knowledgePath() string { return c.underHome(c.KnowledgeFile) }
-func (c Config) memoryPath() string    { return c.underHome("memory.md") }
-
-// ResolveConfig loads the config and fixes the agent's identity and home. The
-// handle is cliHandle (from a leading `@handle` arg), else AGENT_HANDLE, else the
-// config's handle; a launch is *named* when the handle came from the CLI or env.
-// A named agent's own `<home>/agent.json` takes precedence over AGENT_CONFIG, so
-// per-agent config is just a file in the home.
+// ResolveConfig computes the agent home from the handle and $JUICE_HOME, then
+// layers the component-wide config.json and the per-agent config.json over the
+// defaults (a later layer overrides only the keys it sets — a merge, not a
+// wholesale replace). A missing config file is fine; a malformed one is an error.
 func ResolveConfig(cliHandle string) (Config, error) {
-	cfg, err := LoadConfig(configPath())
-	if err != nil {
+	handle := resolveHandle(cliHandle)
+	component := componentDir()
+	home := filepath.Join(component, strings.TrimPrefix(handle, "@"))
+
+	cfg := DefaultConfig()
+	if err := overlayConfig(&cfg, filepath.Join(component, "config.json")); err != nil {
 		return cfg, err
 	}
-	envHandle := os.Getenv("AGENT_HANDLE")
-	named := cliHandle != "" || envHandle != ""
-	handle := cliHandle
-	if handle == "" {
-		handle = envHandle
+	if err := overlayConfig(&cfg, filepath.Join(home, "config.json")); err != nil {
+		return cfg, err
 	}
-	if handle == "" {
-		handle = cfg.Handle
-	}
-	homeOverride := os.Getenv("AGENT_HOME")
 
-	// Determine the tentative home to look for a home-local config, then reload
-	// from it if present.
-	tentative := &Config{Handle: cfg.Handle, AgentsDir: cfg.AgentsDir}
-	tentative.resolve(handle, homeOverride, named)
-	if tentative.Home != "." {
-		if raw, rerr := os.ReadFile(filepath.Join(tentative.Home, "agent.json")); rerr == nil {
-			home := DefaultConfig()
-			if json.Unmarshal(raw, &home) == nil {
-				cfg = home
-			}
-		}
-	}
-	cfg.resolve(handle, homeOverride, named)
+	cfg.Handle = handle
+	cfg.Home = home
+	cfg.DataDir = filepath.Join(home, "data")
 	return cfg, nil
 }
 
-// LoadConfig reads agent.json at path over the defaults. A missing file is not
-// an error (defaults apply); a malformed one is.
-func LoadConfig(path string) (Config, error) {
-	cfg := DefaultConfig()
+// overlayConfig unmarshals the JSON file at path over cfg, overriding only the
+// keys it contains. A nonexistent file is a no-op; a malformed one is an error.
+func overlayConfig(cfg *Config, path string) error {
 	raw, err := os.ReadFile(path)
 	if err != nil {
 		if os.IsNotExist(err) {
-			return cfg, nil
+			return nil
 		}
-		return cfg, err
+		return err
 	}
-	if err := json.Unmarshal(raw, &cfg); err != nil {
-		return cfg, err
+	return json.Unmarshal(raw, cfg)
+}
+
+// EnsureHome creates the agent home and data dir (mode 0700) and writes blank
+// persona.md/knowledge.md/memory.md if absent, so the operator always has
+// concrete files to edit. It never truncates an existing file (O_EXCL).
+func (c Config) EnsureHome() error {
+	if err := os.MkdirAll(c.Home, 0o700); err != nil {
+		return err
 	}
-	return cfg, nil
+	if err := os.MkdirAll(c.DataDir, 0o700); err != nil {
+		return err
+	}
+	for _, name := range []string{"persona.md", "knowledge.md", "memory.md"} {
+		f, err := os.OpenFile(filepath.Join(c.Home, name), os.O_CREATE|os.O_EXCL|os.O_WRONLY, 0o600)
+		if err != nil {
+			if os.IsExist(err) {
+				continue
+			}
+			return err
+		}
+		f.Close()
+	}
+	return nil
+}
+
+func (c Config) personaPath() string   { return filepath.Join(c.Home, "persona.md") }
+func (c Config) knowledgePath() string { return filepath.Join(c.Home, "knowledge.md") }
+func (c Config) memoryPath() string    { return filepath.Join(c.Home, "memory.md") }
+
+// legacyNotice returns a one-line warning if the pre-0.1.3 cwd-relative layout
+// is detected (a local agent.json/agent-data or the retired AGENT_HOME/
+// AGENT_CONFIG env vars). The daemon now uses $JUICE_HOME/agent/<handle>/ and
+// ignores these — a clean cut-over — so the operator is told to move state, not
+// silently attached to stale files.
+func legacyNotice() string {
+	var found []string
+	for _, p := range []string{"agent.json", "agent-data"} {
+		if _, err := os.Stat(p); err == nil {
+			found = append(found, "./"+p)
+		}
+	}
+	for _, e := range []string{"AGENT_HOME", "AGENT_CONFIG"} {
+		if os.Getenv(e) != "" {
+			found = append(found, "$"+e)
+		}
+	}
+	if len(found) == 0 {
+		return ""
+	}
+	return "legacy layout detected (" + strings.Join(found, ", ") +
+		"); the daemon now uses $JUICE_HOME/agent/<handle>/ and ignores these — move any needed state there"
 }
 
 // makerConfig returns the maker config with zero fields filled from defaults,

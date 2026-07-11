@@ -5,9 +5,12 @@
 package main
 
 import (
+	"bufio"
 	"context"
 	"encoding/json"
+	"errors"
 	"fmt"
+	"io"
 	"os"
 	"os/signal"
 	"strings"
@@ -17,6 +20,7 @@ import (
 
 	"github.com/daios-ai/juice-agent/agent"
 	"github.com/daios-ai/juice-agent/juice"
+	"golang.org/x/term"
 )
 
 // version and commit are injected at build time via -ldflags (see Makefile).
@@ -27,25 +31,37 @@ var (
 
 func main() {
 	args := os.Args[1:]
-	// An optional leading @handle names the agent to launch: `juice-agent @research serve`.
+	// An optional leading @handle names the agent to launch: `juice-agent @research`.
 	handle := ""
 	if len(args) > 0 && strings.HasPrefix(args[0], "@") {
 		handle = args[0]
 		args = args[1:]
 	}
-	if len(args) < 1 {
-		usage()
-		os.Exit(2)
+	// --password-stdin may appear anywhere; extract it before subcommand dispatch.
+	stdinPass := false
+	args = extractFlag(args, "--password-stdin", &stdinPass)
+
+	// serve is the default action when a handle is given with no subcommand, so
+	// `juice-agent @research` runs the daemon. A bare invocation prints usage.
+	cmd, rest := "", []string(nil)
+	if len(args) == 0 {
+		if handle == "" {
+			usage()
+			os.Exit(2)
+		}
+		cmd = "serve"
+	} else {
+		cmd, rest = args[0], args[1:]
 	}
-	cmd, rest := args[0], args[1:]
+
 	var err error
 	switch cmd {
 	case "serve":
-		err = runServe(rest, handle)
+		err = runServe(rest, handle, stdinPass)
 	case "task":
-		err = runTask(rest, handle)
+		err = runTask(rest, handle, stdinPass)
 	case "bench":
-		err = runBench(rest, handle)
+		err = runBench(rest, handle, stdinPass)
 	case "version", "--version", "-v":
 		fmt.Printf("juice-agent %s (%s)\n", version, commit)
 		return
@@ -59,25 +75,50 @@ func main() {
 	}
 }
 
+// extractFlag removes every occurrence of a boolean flag from args, setting
+// *set if it was present. CLI parsing here is manual (no flag package), so this
+// keeps `--password-stdin` position-independent.
+func extractFlag(args []string, name string, set *bool) []string {
+	out := args[:0]
+	for _, a := range args {
+		if a == name {
+			*set = true
+			continue
+		}
+		out = append(out, a)
+	}
+	return out
+}
+
 func usage() {
 	fmt.Fprintln(os.Stderr, `usage:
+  juice-agent @handle                         run the daemon as that agent (serve is the default)
   juice-agent [@handle] serve                 run the daemon (channels + worker pool)
   juice-agent [@handle] task "<prompt>"       run one task and print its outcome
   juice-agent [@handle] bench <suite.json>    run the experiment suite and write a report
 
-A leading @handle launches that named agent from its home (<agents_dir>/<handle>/).
-config: AGENT_CONFIG (default ./agent.json); password: AGENT_PASSWORD or AGENT_PASSWORD_FILE`)
+Each agent lives in its own home under $JUICE_HOME/agent/<handle>/ (JUICE_HOME default ~/.juice),
+holding config.json, persona.md, knowledge.md, memory.md, and data/. The handle is the @handle arg,
+else AGENT_HANDLE, else @agent.
+password (in precedence order): --password-stdin, AGENT_PASSWORD, AGENT_PASSWORD_FILE, or an
+interactive prompt when run in a terminal.`)
 }
 
 // setup does the shared startup: load config, authenticate, bootstrap the
 // intrinsic actions, and assemble the executor. It returns the executor, the
 // client, and the resolved loop config.
-func setup(ctx context.Context, log *logger, cliHandle string) (*Executor, *juice.Client, agent.Config, Config, error) {
+func setup(ctx context.Context, log *logger, cliHandle string, stdinPass bool) (*Executor, *juice.Client, agent.Config, Config, error) {
 	cfg, err := ResolveConfig(cliHandle)
 	if err != nil {
 		return nil, nil, agent.Config{}, cfg, fmt.Errorf("config: %w", err)
 	}
-	password, err := resolvePassword()
+	if notice := legacyNotice(); notice != "" {
+		log.event("legacy-notice", map[string]any{"message": notice})
+	}
+	if err := cfg.EnsureHome(); err != nil {
+		return nil, nil, agent.Config{}, cfg, fmt.Errorf("ensure home %s: %w", cfg.Home, err)
+	}
+	password, err := resolvePassword(cfg.Handle, stdinPass)
 	if err != nil {
 		return nil, nil, agent.Config{}, cfg, err
 	}
@@ -139,12 +180,12 @@ func setup(ctx context.Context, log *logger, cliHandle string) (*Executor, *juic
 	return exec, cl, loopCfg, cfg, nil
 }
 
-func runServe(_ []string, handle string) error {
+func runServe(_ []string, handle string, stdinPass bool) error {
 	log := newLogger()
 	runCtx, cancel := context.WithCancel(context.Background())
 	defer cancel()
 
-	exec, cl, _, cfg, err := setup(runCtx, log, handle)
+	exec, cl, _, cfg, err := setup(runCtx, log, handle, stdinPass)
 	if err != nil {
 		return err
 	}
@@ -175,13 +216,13 @@ func runServe(_ []string, handle string) error {
 	return nil
 }
 
-func runTask(args []string, handle string) error {
+func runTask(args []string, handle string, stdinPass bool) error {
 	if len(args) < 1 || strings.TrimSpace(args[0]) == "" {
 		return fmt.Errorf("usage: juice-agent task \"<prompt>\"")
 	}
 	log := newLogger()
 	ctx := context.Background()
-	exec, _, _, cfg, err := setup(ctx, log, handle)
+	exec, _, _, cfg, err := setup(ctx, log, handle, stdinPass)
 	if err != nil {
 		return err
 	}
@@ -221,16 +262,18 @@ func channelNames(cs []Channel) []string {
 	return out
 }
 
-func configPath() string {
-	if p := os.Getenv("AGENT_CONFIG"); p != "" {
-		return p
+// resolvePassword reads the daemon's password by a precedence chain, from
+// non-interactive to interactive (a bare --password flag is intentionally not
+// offered — it would leak via shell history and /proc/<pid>/cmdline). Secrets
+// never live in config.
+func resolvePassword(handle string, stdinFlag bool) (string, error) {
+	if stdinFlag {
+		line, err := bufio.NewReader(os.Stdin).ReadString('\n')
+		if err != nil && !errors.Is(err, io.EOF) {
+			return "", fmt.Errorf("reading --password-stdin: %w", err)
+		}
+		return strings.TrimRight(line, "\r\n"), nil
 	}
-	return "./agent.json"
-}
-
-// resolvePassword reads the daemon's password from AGENT_PASSWORD, else from the
-// file named by AGENT_PASSWORD_FILE. Secrets never live in config.
-func resolvePassword() (string, error) {
 	if p := os.Getenv("AGENT_PASSWORD"); p != "" {
 		return p, nil
 	}
@@ -241,7 +284,16 @@ func resolvePassword() (string, error) {
 		}
 		return strings.TrimSpace(string(b)), nil
 	}
-	return "", fmt.Errorf("no password: set AGENT_PASSWORD or AGENT_PASSWORD_FILE")
+	if fd := int(os.Stdin.Fd()); term.IsTerminal(fd) {
+		fmt.Fprintf(os.Stderr, "Password for %s: ", handle)
+		b, err := term.ReadPassword(fd)
+		fmt.Fprintln(os.Stderr)
+		if err != nil {
+			return "", fmt.Errorf("reading password: %w", err)
+		}
+		return strings.TrimSpace(string(b)), nil
+	}
+	return "", fmt.Errorf("no password: use --password-stdin, set AGENT_PASSWORD or AGENT_PASSWORD_FILE, or run in a terminal")
 }
 
 // logger writes structured JSON log lines to stderr (stdout stays reserved for

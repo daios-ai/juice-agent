@@ -41,10 +41,11 @@ flow_recovery() {
     echo "=== FLOW recovery ==="
     local dir; dir=$(new_dir)
     start_kernel "$dir"; create_agent
-    mkdir -p "$dir/agent-data"
+    local adata; adata="$(agent_home "$dir")/data"
+    mkdir -p "$adata"
     printf '%s\n%s\n' \
         '{"role":"user","content":"half-done task"}' \
-        '{"role":"assistant","action":"@sys/time"}' > "$dir/agent-data/orphan.jsonl"
+        '{"role":"assistant","action":"@sys/time"}' > "$adata/orphan.jsonl"
 
     start_agentd "$dir" || { fail recovery.agentd "no daemon"; return; }
     if grep -q '"event":"recovery"' "$dir/agentd.log" && grep -q 'orphan' "$dir/agentd.log"; then
@@ -52,7 +53,32 @@ flow_recovery() {
     else
         fail recovery.marks_interrupted "no recovery log for orphan"
     fi
-    assert_contains recovery.marker '"kind":"interrupted"' "$(tail -1 "$dir/agent-data/orphan.jsonl")"
+    assert_contains recovery.marker '"kind":"interrupted"' "$(tail -1 "$adata/orphan.jsonl")"
+}
+
+flow_init() {
+    echo "=== FLOW init (blank files created under \$JUICE_HOME/agent/<handle>/) ==="
+    local dir; dir=$(new_dir)
+    start_kernel "$dir"; create_agent
+    local home; home=$(agent_home "$dir")
+    start_agentd "$dir" || { fail init.agentd "no daemon"; return; }
+
+    # First launch materialises the home with blank persona/knowledge/memory + data/.
+    local missing=""
+    for f in persona.md knowledge.md memory.md; do
+        [ -f "$home/$f" ] || missing="$missing $f"
+        [ -s "$home/$f" ] && missing="$missing $f(nonempty)"
+    done
+    [ -d "$home/data" ] || missing="$missing data/"
+    [ -z "$missing" ] && ok init.blank_files_created || fail init.blank_files_created "missing/nonblank:$missing"
+
+    # An operator edit must survive a restart (init never truncates).
+    printf 'INIT-MARKER-9Z\n' > "$home/persona.md"
+    kill -9 "$AGENTD_PID" 2>/dev/null; wait "$AGENTD_PID" 2>/dev/null
+    start_agentd "$dir" || { fail init.restart "no daemon"; return; }
+    grep -q 'INIT-MARKER-9Z' "$home/persona.md" \
+        && ok init.non_truncating \
+        || fail init.non_truncating "persona.md truncated on restart"
 }
 
 flow_drain() {
@@ -159,8 +185,10 @@ flow_persona() {
     require_ollama || { skip persona.injected "Ollama/$CHAT_MODEL unavailable"; return; }
     local dir; dir=$(new_dir)
     start_kernel "$dir"; create_agent
-    # persona.md lives in the home (AGENT_HOME=$dir), carrying a distinctive marker.
-    printf 'Persona note PERSONA-MARKER-7Q: be terse.\n' > "$dir/persona.md"
+    # persona.md lives in the agent home, carrying a distinctive marker. The home
+    # must exist before the daemon starts; start_agentd creates it via mkdir.
+    local home; home=$(agent_home "$dir"); mkdir -p "$home"
+    printf 'Persona note PERSONA-MARKER-7Q: be terse.\n' > "$home/persona.md"
     start_agentd "$dir" || { fail persona.agentd "no daemon"; return; }
 
     local id out; id=$(submit_http "In one short sentence, what is the capital of France?" 100)
@@ -168,7 +196,7 @@ flow_persona() {
     assert_eq persona.answered "answered" "$(echo "$out" | jfield status)"
     # Structural: the persona must appear in the task's injected system prompt.
     # (Whether the model obeys a style rule is the model's business, not the daemon's.)
-    if grep -q 'PERSONA-MARKER-7Q' "$dir/agent-data/$id.jsonl" 2>/dev/null && grep -q '# Persona' "$dir/agent-data/$id.jsonl" 2>/dev/null; then
+    if grep -q 'PERSONA-MARKER-7Q' "$ADATA/$id.jsonl" 2>/dev/null && grep -q '# Persona' "$ADATA/$id.jsonl" 2>/dev/null; then
         ok persona.injected
     else
         fail persona.injected "persona.md not present in the task's system prompt"
@@ -181,13 +209,14 @@ flow_named() {
     start_kernel "$dir"
     create_user @alice alice-pass
     create_user @bob bob-pass
-    mkdir -p "$dir/alice" "$dir/bob"
-    echo "{ \"server_url\": \"$KURL\", \"handle\": \"@alice\", \"memory\": {\"enabled\": false} }" > "$dir/alice/agent.json"
-    echo "{ \"server_url\": \"$KURL\", \"handle\": \"@bob\",   \"memory\": {\"enabled\": false} }" > "$dir/bob/agent.json"
+    # One component-wide config.json ($JUICE_HOME/agent/config.json) supplies the
+    # shared server_url; each named agent inherits it and gets its own home.
+    mkdir -p "$dir/agent"
+    echo "{ \"server_url\": \"$KURL\", \"memory\": {\"enabled\": false} }" > "$dir/agent/config.json"
 
-    AGENT_HOME="$dir/alice" AGENT_PASSWORD=alice-pass "$AGENTD" @alice serve >"$dir/alice.log" 2>&1 &
+    JUICE_HOME="$dir" AGENT_PASSWORD=alice-pass "$AGENTD" @alice serve >"$dir/alice.log" 2>&1 &
     track $!
-    AGENT_HOME="$dir/bob" AGENT_PASSWORD=bob-pass "$AGENTD" @bob serve >"$dir/bob.log" 2>&1 &
+    JUICE_HOME="$dir" AGENT_PASSWORD=bob-pass "$AGENTD" @bob serve >"$dir/bob.log" 2>&1 &
     track $!
     wait_line "$dir/alice.log" '"event":"serving"' >/dev/null
     wait_line "$dir/bob.log"   '"event":"serving"' >/dev/null
@@ -208,10 +237,11 @@ flow_memory() {
     start_agentd "$dir" '"memory": {"enabled": true, "memory_bytes": 8192}' || { fail memory.agentd "no daemon"; return; }
 
     # Task 1: a memory entry must be written to the home.
+    local mem; mem="$(agent_home "$dir")/memory.md"
     local id; id=$(submit_http "What is the current time? Reply with an ISO-8601 timestamp." 100)
     await_http "$id" >/dev/null || { fail memory.await1 "no outcome"; return; }
     sleep 2
-    [ -s "$dir/memory.md" ] && ok memory.entry_written || fail memory.entry_written "memory.md empty"
+    [ -s "$mem" ] && ok memory.entry_written || fail memory.entry_written "memory.md empty"
 
     # Restart the daemon (same home) → memory persists and loads into the next task.
     kill -9 "$AGENTD_PID" 2>/dev/null; wait "$AGENTD_PID" 2>/dev/null
@@ -220,7 +250,7 @@ flow_memory() {
     await_http "$id2" >/dev/null || { fail memory.await2 "no outcome"; return; }
 
     # Task 2's transcript must carry the injected memory in its system prompt.
-    if grep -q '"kind":"system"' "$dir/agent-data/$id2.jsonl" 2>/dev/null && grep -q '# Memory' "$dir/agent-data/$id2.jsonl" 2>/dev/null; then
+    if grep -q '"kind":"system"' "$ADATA/$id2.jsonl" 2>/dev/null && grep -q '# Memory' "$ADATA/$id2.jsonl" 2>/dev/null; then
         ok memory.loaded_next_task
     else
         fail memory.loaded_next_task "task 2 transcript lacks injected memory"
@@ -228,7 +258,7 @@ flow_memory() {
 }
 
 # Mechanism flows (no LLM) run first and fast; LLM flows (real Ollama) follow.
-ALL=(flow_bootstrap flow_recovery flow_drain flow_named
+ALL=(flow_bootstrap flow_init flow_recovery flow_drain flow_named
      flow_task flow_persona flow_rating flow_role_law flow_memory flow_maker)
 
 if [ "$#" -gt 0 ]; then
