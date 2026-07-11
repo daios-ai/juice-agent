@@ -649,8 +649,8 @@ func countKind(msgs []Message, kind string) int {
 
 func TestRepeatChallengeThenBackDown(t *testing.T) {
 	// The model posts the same successful action twice; the second is a repeat, so
-	// the loop challenges it (does NOT dispatch), and the model backs down with
-	// reply. Exactly ONE dispatch, one challenge, a clean answered outcome.
+	// the loop drops it (does NOT dispatch) and nudges, and the model backs down
+	// with reply. Exactly ONE dispatch, one nudge, a clean answered outcome.
 	dec := &scriptedDecider{script: []Selection{
 		{Action: "@chat/message", Args: map[string]any{"text": "read it"}},
 		{Action: "@chat/message", Args: map[string]any{"text": "read it"}}, // repeat → challenged
@@ -675,19 +675,54 @@ func TestRepeatChallengeThenBackDown(t *testing.T) {
 	}
 }
 
-// repeatingDecider always selects the same action+args (a doom loop), until it
-// has been challenged, at which point it keeps insisting.
-type repeatingDecider struct{ action string }
-
-func (d *repeatingDecider) Decide(_ context.Context, _ []Message, _ []Candidate, _ []Tool) (*Selection, error) {
-	return &Selection{Action: d.action, Args: map[string]any{"text": "same"}}, nil
+// paraphrasingDecider keeps selecting the same action but with a *different*
+// argument every turn — the real doom loop (a sampled model rewords rather than
+// repeats verbatim). It optionally backs down with reply after `backdownAfter`
+// selections (0 = never backs down).
+type paraphrasingDecider struct {
+	action        string
+	n             int
+	backdownAfter int
 }
 
-func TestRepeatConfirmThenFloor(t *testing.T) {
-	// The model insists on the repeat past every challenge. With the default floor
-	// of 3 confirmed repeats, total dispatches are bounded to 4 (1 original + 3
-	// confirmed) and the frame hard-stops on repeat-loop, well under the turn cap.
-	dec := &repeatingDecider{action: "@chat/message"}
+func (d *paraphrasingDecider) Decide(_ context.Context, _ []Message, _ []Candidate, _ []Tool) (*Selection, error) {
+	d.n++
+	if d.backdownAfter > 0 && d.n > d.backdownAfter {
+		return &Selection{Action: "reply", Args: map[string]any{"answer": "done"}}, nil
+	}
+	// Distinct text each turn, so an args-based guard would never match.
+	return &Selection{Action: d.action, Args: map[string]any{"text": fmt.Sprintf("phrasing %d", d.n)}}, nil
+}
+
+func TestParaphraseLoopIntercepted(t *testing.T) {
+	// The case the old byte-identity guard missed: same action, different args every
+	// turn. Detection is action-based, so the repeats are dropped (never dispatched)
+	// and the model, nudged, backs down with reply. Exactly ONE dispatch.
+	dec := &paraphrasingDecider{action: "@chat/message", backdownAfter: 3}
+	cat := &fakeCatalog{seed: []Candidate{{Ref: "@chat/message"}}}
+	run := &recordingRunner{}
+	tr := &memTranscript{}
+
+	out, err := Run(context.Background(), Task{Budget: 1000}, baseConfig(), newDeps(dec, cat, run, tr))
+	if err != nil {
+		t.Fatal(err)
+	}
+	if out.Status != StatusAnswered {
+		t.Fatalf("status = %q, want answered", out.Status)
+	}
+	if len(run.calls) != 1 {
+		t.Fatalf("dispatched %v, want exactly one (paraphrased repeats dropped, not run)", run.calls)
+	}
+	if n := countKind(tr.msgs, "repeat-challenge"); n != 1 {
+		t.Fatalf("repeat-challenge messages = %d, want 1 (a single nudge, not accumulated)", n)
+	}
+}
+
+func TestRepeatLoopHardStops(t *testing.T) {
+	// A stubborn paraphrase loop that never backs down: repeats are dropped, and
+	// after maxRepeats (default 3) consecutive drops the frame hard-stops. The
+	// action dispatched exactly ONCE; one nudge; terminates well under the turn cap.
+	dec := &paraphrasingDecider{action: "@chat/message"}
 	cat := &fakeCatalog{seed: []Candidate{{Ref: "@chat/message"}}}
 	run := &recordingRunner{}
 	tr := &memTranscript{}
@@ -700,34 +735,20 @@ func TestRepeatConfirmThenFloor(t *testing.T) {
 	if out.Status != StatusFailed || out.Reason != "repeat-loop" {
 		t.Fatalf("outcome = %+v, want failed/repeat-loop", out)
 	}
-	if len(run.calls) != 4 {
-		t.Fatalf("dispatched %d, want 4 (1 original + 3 confirmed)", len(run.calls))
+	if len(run.calls) != 1 {
+		t.Fatalf("dispatched %d, want 1 (only the first call; repeats never dispatch)", len(run.calls))
+	}
+	if n := countKind(tr.msgs, "repeat-challenge"); n != 1 {
+		t.Fatalf("repeat-challenge messages = %d, want 1 (single nudge, not accumulated)", n)
 	}
 	if out.Turns >= cfg.MaxTurns {
 		t.Fatalf("turns = %d, want well under the cap %d (terminated on repeat-loop)", out.Turns, cfg.MaxTurns)
 	}
 }
 
-func TestRepeatFloorConfigurable(t *testing.T) {
-	// A floor of 1 bounds dispatches to 2 (1 original + 1 confirmed).
-	dec := &repeatingDecider{action: "@chat/message"}
-	cat := &fakeCatalog{seed: []Candidate{{Ref: "@chat/message"}}}
-	run := &recordingRunner{}
-	cfg := baseConfig()
-	cfg.MaxRepeats = 1
-
-	out, _ := Run(context.Background(), Task{Budget: 1000}, cfg, newDeps(dec, cat, run, &memTranscript{}))
-	if out.Status != StatusFailed || out.Reason != "repeat-loop" {
-		t.Fatalf("outcome = %+v, want failed/repeat-loop", out)
-	}
-	if len(run.calls) != 2 {
-		t.Fatalf("dispatched %d, want 2 (1 original + 1 confirmed)", len(run.calls))
-	}
-}
-
 func TestRepeatChangeOfCourseResets(t *testing.T) {
-	// After the challenge the model picks a DIFFERENT action; that is progress, so
-	// no hard-stop and the confirmed-repeat count resets.
+	// After the nudge the model picks a DIFFERENT action; that is progress, so the
+	// repeat streak resets and there is no hard-stop.
 	dec := &scriptedDecider{script: []Selection{
 		{Action: "@a", Args: map[string]any{"x": 1}},
 		{Action: "@a", Args: map[string]any{"x": 1}}, // repeat → challenged
@@ -779,21 +800,6 @@ func TestAlternationIsNotARepeat(t *testing.T) {
 	}
 }
 
-func TestSelectionSigArgOrderIndependent(t *testing.T) {
-	// The signature is invariant to how the args map was built (encoding/json sorts
-	// keys), so the same action with the same values always compares equal.
-	a := &Selection{Action: "@x", Args: map[string]any{"a": 1, "b": "two", "c": []any{3, 4}}}
-	b := &Selection{Action: "@x", Args: map[string]any{"c": []any{3, 4}, "b": "two", "a": 1}}
-	if selectionSig(a) != selectionSig(b) {
-		t.Fatalf("signatures differ for equal args:\n %q\n %q", selectionSig(a), selectionSig(b))
-	}
-	// Different values must NOT collide.
-	c := &Selection{Action: "@x", Args: map[string]any{"a": 1, "b": "two", "c": []any{3, 5}}}
-	if selectionSig(a) == selectionSig(c) {
-		t.Fatal("signatures collided for different args")
-	}
-}
-
 func TestReplyExemptFromRepeatGuard(t *testing.T) {
 	// reply is the escape hatch; it terminates on first selection and is never
 	// challenged as a repeat.
@@ -833,7 +839,7 @@ func TestBracketRepeatIsolation(t *testing.T) {
 	// tripping the parent's own guard. The parent recovers and answers.
 	dec := &bracketRepeatDecider{}
 	cfg := subtaskConfig()
-	cfg.MaxRepeats = 1 // child bounded to 2 dispatches (1 original + 1 confirmed)
+	cfg.MaxRepeats = 1 // child hard-stops after 1 dropped repeat
 	run := &recordingRunner{}
 	tr := &memTranscript{}
 
@@ -844,8 +850,8 @@ func TestBracketRepeatIsolation(t *testing.T) {
 	if out.Status != StatusAnswered || out.Answer["answer"] != "handled" {
 		t.Fatalf("outcome = %+v, want answered/handled (parent recovered)", out)
 	}
-	if len(run.calls) != 2 {
-		t.Fatalf("child dispatched %d, want 2 (bounded by the child's own guard)", len(run.calls))
+	if len(run.calls) != 1 {
+		t.Fatalf("child dispatched %d, want 1 (only the first call; repeats dropped)", len(run.calls))
 	}
 	// The parent's rolled-up subtask result carries the child's repeat-loop error.
 	var rollup map[string]any
@@ -862,7 +868,7 @@ func TestBracketRepeatIsolation(t *testing.T) {
 func TestRepeatGuardDisabled(t *testing.T) {
 	// MaxRepeats < 0 disables the guard: a looping action runs every turn until the
 	// turn cap, exactly as before, with no challenge inserted.
-	dec := &repeatingDecider{action: "@sys/time"}
+	dec := &paraphrasingDecider{action: "@sys/time"}
 	cat := &fakeCatalog{seed: []Candidate{{Ref: "@sys/time"}}}
 	run := &recordingRunner{}
 	tr := &memTranscript{}

@@ -211,27 +211,33 @@ only to transport-level and retryable kernel errors (network, 5xx, 429, `ErrTime
 ## 4c. Repeat guard
 
 Budget and the turn cap both fail against a cheap action that *succeeds* on every call: the model
-re-selects an identical `(action, args)` forever, the task reads `failed / turn-cap` even though it
-functionally succeeded, and any side-effect is spammed. The guard treats a repeat as a **question,
-not a verdict** — the model's own answer decides.
+keeps re-selecting the same action, never selects `reply`, and the task reads `failed / turn-cap`
+even though it functionally succeeded — with the side-effect spammed. Two live runs fixed the design.
+An exact-content detector is useless: shown its own prior output in the transcript, a sampled model
+*paraphrases* rather than repeats verbatim (one run posted the same reply 19 times, 16 distinct
+strings, zero byte-identical pairs). So the signal is the **action**, not its arguments.
 
-- **Detect.** Before dispatch, the loop signs each selection (`action` + JSON-canonical `args`,
-  keys sorted so ordering never matters) and compares it to the last selection it actually *acted*
-  on. `reply` is exempt — it is the exit we *want* the model to take.
-- **Challenge, don't dispatch.** On the first repeat the loop does **not** run it; it injects one
-  message — *"you already ran this and it succeeded; are you sure, or is the task complete? if
-  complete, select reply"* — and loops. The identical side-effect is thereby bounded to **one**: a
-  second only fires if the model insists past the question.
+- **Detect on the last action.** A selection whose action equals the last *dispatched* action is a
+  repeat (arguments ignored). `reply` is exempt — it is the exit we *want* the model to take.
+- **Drop and re-query, don't append.** A repeat is **neither persisted nor dispatched**: the loop
+  discards it, ensures a single reworded nudge sits at the tail — *"you just ran `<action>`, which
+  already completed; are you sure, or is the task complete? if complete, select `reply`"* — and
+  re-queries. This keeps the chat clean and, crucially, avoids **self-priming**: an autoregressive
+  model continues the patterns it sees, so leaving repeats in context makes the next repeat more
+  likely. Because the repeat never dispatches, the side-effect is bounded to the **one** legitimate
+  call.
 - **The model's answer is the signal.** Back down (`reply`, or a different action) → resolved
-  gracefully, the common case. Insist (same call again) → treated as confirmation and allowed once.
-- **Hard floor.** After `max_repeats` confirmed repeats (default 3) the frame hard-stops with
-  `reason = repeat-loop` (a bracket rolls up `{error: repeat-loop}` its parent can act on). State is
-  per-frame, so a bracket's repeats are its own and never trip the parent.
+  gracefully, the common case. Persist in the same action → dropped again.
+- **Turn-counted, hard floor.** Each re-query costs a turn (the model pays for its own fumble), so
+  `max_turns` bounds the rephrase loop. After `max_repeats` consecutive repeats (default 3) the frame
+  hard-stops with `reason = repeat-loop` (a bracket rolls up `{error: repeat-loop}` its parent can
+  act on). State is per-frame, so a bracket's repeats are its own and never trip the parent.
 
 This is opencode's confirm-before-repeat (it asks the *human* at 3 identical calls) turned into a
-*model*-in-the-loop self-check, with the deterministic floor kept underneath as the guarantee — a
+*model*-in-the-loop rephrase-and-retry, with a deterministic floor underneath as the guarantee — a
 shape none of pi (no rail), opencode (human prompt), or OpenClaw (count breaker at 30) has.
-`max_repeats < 0` disables it.
+`max_repeats < 0` disables it. A known cost: a legitimate run of the same action over different
+inputs is nudged and, past the floor, hard-stopped; exempting specific actions is a future refinement.
 
 ## 5. Persistence, compaction, memory
 

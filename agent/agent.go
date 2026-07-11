@@ -9,14 +9,13 @@ package agent
 
 import (
 	"context"
-	"encoding/json"
 	"fmt"
 	"sort"
 	"strings"
 )
 
-// Role labels a transcript message. The values map onto @sys/llm/decide's
-// message roles (system, user, assistant, tool).
+// Role labels a transcript message. The values are the LLM chat roles (system,
+// user, assistant, tool).
 type Role string
 
 const (
@@ -68,9 +67,10 @@ type Candidate struct {
 	Stats       ActionStats    `json:"stats"`
 }
 
-// Selection is one @sys/llm/decide result: the chosen action, args already
-// validated against that action's input_schema by the kernel, and an optional
-// natural-language message.
+// Selection is one model turn extracted by the Decider: the chosen action, its
+// args, and an optional natural-language message. Args are validated later — a
+// harness tool's required keys in-loop, a catalog action's schema kernel-side at
+// dispatch.
 type Selection struct {
 	Action  string         `json:"action"`
 	Args    map[string]any `json:"args,omitempty"`
@@ -117,10 +117,10 @@ type Transcript interface {
 	All() []Message
 }
 
-// Intrinsic is an agent-native capability the harness intercepts instead of
-// dispatching through Runner. Its action is nonetheless registered in the kernel
-// (zero price) so decide can select it and validate its args. Handle returns the
-// tool result, whether the run should terminate, and an error.
+// Intrinsic is an agent-native capability (e.g. publish) the harness intercepts
+// by tool name instead of dispatching through Runner. It is not registered on the
+// platform — it is a plain-named harness tool, not a catalog action. Handle
+// returns the tool result, whether the run should terminate, and an error.
 type Intrinsic struct {
 	Handle func(ctx context.Context, args map[string]any) (result map[string]any, terminal bool, err error)
 }
@@ -250,17 +250,22 @@ func runFrame(ctx context.Context, cfg Config, deps Deps, budget int, cnt *count
 	}
 	decideErrors := 0
 
-	// Repeat guard (§4c): on a repeated (action, args), challenge the model once
-	// before dispatching; only a confirmed insistence acts, and only up to
-	// maxRepeats times before the frame hard-stops. lastActedSig is the signature
-	// of the last selection actually acted on; "" (frame start) never matches.
+	// Repeat guard (§4c): a repeated *action* (reply exempt) is neither persisted
+	// nor dispatched — the loop drops it and re-queries after a single reworded
+	// nudge, so the repeat never enters the chat (no pollution, no self-priming)
+	// and the side-effect is bounded to the one legitimate call. lastAction is the
+	// last dispatched action ("" at frame start never matches); repeatStreak counts
+	// consecutive drops; nudged keeps the nudge to one line per stuck point.
 	maxRepeats := cfg.MaxRepeats
 	if maxRepeats == 0 {
 		maxRepeats = 3
 	}
-	var lastActedSig string
-	awaitingConfirm := false
-	confirmedRepeats := 0
+	var lastAction string
+	repeatStreak := 0
+	nudged := false
+	// progressed marks a genuinely dispatched action, resetting the repeat guard so
+	// the next identical action is measured from here.
+	progressed := func(action string) { lastAction, repeatStreak, nudged = action, 0, false }
 
 	// feedback records a self-correction nudge and reports whether the cap is now
 	// exceeded (so the caller ends the frame).
@@ -308,6 +313,29 @@ func runFrame(ctx context.Context, cfg Config, deps Deps, budget int, cnt *count
 			continue
 		}
 		decideErrors = 0
+
+		// Repeat guard (§4c): a repeated action is dropped before it is persisted or
+		// dispatched; the loop re-queries after a single reworded nudge. Each retry
+		// already cost a turn (counted at the loop top), so MaxTurns bounds the
+		// rephrase loop; maxRepeats consecutive drops end the frame with repeat-loop.
+		if maxRepeats >= 0 && sel.Action != cfg.ReplyTool && sel.Action == lastAction {
+			repeatStreak++
+			if repeatStreak > maxRepeats {
+				return exhausted("repeat-loop")
+			}
+			logf("repeat_retry", map[string]any{"turn": cnt.turns, "depth": depth, "action": sel.Action, "streak": repeatStreak})
+			if !nudged {
+				if err := deps.Transcript.Append(ctx, Message{Role: RoleSystem, Kind: "repeat-challenge",
+					Content: fmt.Sprintf("You just ran %q, which already completed. Are you sure you want to "+
+						"run it again? If the task is complete, select the %q tool with your answer; otherwise "+
+						"select the action that moves things forward.", sel.Action, cfg.ReplyTool)}); err != nil {
+					return nil, StatusFailed, "", err
+				}
+				nudged = true
+			}
+			continue
+		}
+
 		if err := deps.Transcript.Append(ctx, Message{
 			Role: RoleAssistant, Action: sel.Action, Args: sel.Args, Content: sel.Message,
 		}); err != nil {
@@ -327,35 +355,6 @@ func runFrame(ctx context.Context, cfg Config, deps Deps, budget int, cnt *count
 					return exhausted("decide-error: missing arg " + miss)
 				}
 				continue
-			}
-		}
-
-		// Repeat guard (§4c): reply is exempt (it is the escape we want). A first
-		// repeat is challenged, not dispatched; a repeat that persists past the
-		// challenge is a confirmation, allowed up to maxRepeats before hard-stop.
-		sig := selectionSig(sel)
-		isRepeat := maxRepeats >= 0 && sel.Action != cfg.ReplyTool && sig == lastActedSig
-		if isRepeat && !awaitingConfirm {
-			awaitingConfirm = true
-			logf("repeat_challenge", map[string]any{"turn": cnt.turns, "depth": depth, "action": sel.Action})
-			if err := deps.Transcript.Append(ctx, Message{Role: RoleSystem, Kind: "repeat-challenge",
-				Content: fmt.Sprintf("You just selected %q with the same arguments as your previous call, "+
-					"which already completed. Are you sure you want to run it again? If the task is now "+
-					"complete, select the %q tool with your answer. If a different step is needed, select that "+
-					"action instead. Only repeat this exact call if it is truly necessary.", sel.Action, cfg.ReplyTool)}); err != nil {
-				return nil, StatusFailed, "", err
-			}
-			continue
-		}
-		if awaitingConfirm {
-			awaitingConfirm = false
-			if isRepeat {
-				confirmedRepeats++
-				if confirmedRepeats > maxRepeats {
-					return exhausted("repeat-loop")
-				}
-			} else {
-				confirmedRepeats = 0
 			}
 		}
 
@@ -383,7 +382,7 @@ func runFrame(ctx context.Context, cfg Config, deps Deps, budget int, cnt *count
 			if err := deps.Transcript.Append(ctx, Message{Role: RoleTool, Action: sel.Action, Result: res}); err != nil {
 				return nil, StatusFailed, "", err
 			}
-			lastActedSig = sig
+			progressed(sel.Action)
 
 		// other harness tool (publish) → intrinsic handler.
 		case cfg.Intrinsics[sel.Action].Handle != nil:
@@ -396,7 +395,7 @@ func runFrame(ctx context.Context, cfg Config, deps Deps, budget int, cnt *count
 			if terminal {
 				return res, StatusAnswered, "", nil
 			}
-			lastActedSig = sig
+			progressed(sel.Action)
 
 		// catalog action → dispatch (budget-gated).
 		default:
@@ -423,7 +422,7 @@ func runFrame(ctx context.Context, cfg Config, deps Deps, budget int, cnt *count
 			}); err != nil {
 				return nil, StatusFailed, "", err
 			}
-			lastActedSig = sig
+			progressed(sel.Action)
 			logf("dispatch", map[string]any{"action": sel.Action, "price": price, "tx_id": rr.TxID, "error": rerr != nil})
 		}
 	}
@@ -446,18 +445,6 @@ func bracketSeed(parent []Message, args map[string]any) []Message {
 	instr, _ := args["instruction"].(string)
 	seed = append(seed, Message{Role: RoleUser, Content: "Subtask: " + instr})
 	return seed
-}
-
-// selectionSig is a stable identity for a selection: its action plus its args
-// marshaled to JSON. encoding/json sorts map keys (recursively), so the signature
-// is invariant to arg ordering — two selections of the same action with the same
-// argument values compare equal regardless of how the map was built.
-func selectionSig(sel *Selection) string {
-	b, err := json.Marshal(sel.Args)
-	if err != nil {
-		b = nil
-	}
-	return sel.Action + "\x00" + string(b)
 }
 
 // promptOf renders a frame's user content into a lookup query — what lookup
