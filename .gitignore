@@ -1,9 +1,10 @@
 # build output (single binary at repo root, juice-style)
 /juice-agent
 
-# runtime data (transcripts, task index)
+# runtime data (transcripts, task index, learned cross-task memory)
 /agent-data/
 *.jsonl
+memory.md
 
 # local kernel state
 *.db
