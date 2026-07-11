@@ -265,7 +265,10 @@ func TestConcurrentBracketTasksDoNotCrossTalk(t *testing.T) {
 			t.Fatalf("task %d outcome = %+v", i, out)
 		}
 		data, _ := os.ReadFile(filepath.Join(dir, "task-"+strconv.Itoa(i)+".jsonl"))
-		if strings.Count(string(data), `"role":"user","content":"go"`) != 1 {
+		// Exactly one *root* user message (the bracket inherits the parent's history,
+		// so a bracket-tagged copy of "go" is expected and excluded here). A second
+		// root "go" would mean another task's run bled into this file.
+		if strings.Count(string(data), `{"role":"user","content":"go"}`) != 1 {
 			t.Fatalf("task %d transcript has cross-task content:\n%s", i, data)
 		}
 	}

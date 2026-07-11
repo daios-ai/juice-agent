@@ -168,19 +168,25 @@ A long task pollutes the chat with lookups and dead ends. The `subtask` tool let
 scope and **rolls up** to a single result in the parent chat.
 
 - **Down.** Selecting `subtask {instruction, context?}` opens a child frame seeded with the parent's
-  system prompt(s) (persona/knowledge/memory carry down) + the context + the instruction. The
-  parent's turn-by-turn history is *not* inherited — the frame starts clean.
-- **Inside.** The child runs the ordinary loop with its own working set. All its turns — lookups,
-  results, dead ends — live in this frame only.
+  **full turn-by-turn history** (so the subtask knows the real context — what was read, tried, and
+  decided) + the optional context + the instruction. Inheritance flows only *down*; the child's own
+  turns still roll up as one result, so the parent chat stays clean regardless.
+- **Inside.** The child runs the ordinary loop with its own working set, but is **not offered the
+  `subtask` tool** — nesting is capped at one sublevel. A subtask must do the work itself, not
+  re-delegate: since the child is a clone of the parent (same prompt, same context), an available
+  `subtask` tool one level down makes it re-delegate the same instruction indefinitely (observed
+  live — a 30-deep spiral to `turn-cap`). Withholding the tool is a structural cap, not a soft nudge.
+  All its turns — lookups, results, dead ends — live in this frame only.
 - **Up.** Selecting `reply` inside the bracket *pops* it: the parent chat gets exactly one
   tool-result (`{action: subtask, result: <reply args>}`); the child's internal turns never enter
   the parent's model view.
 
 **The bound is a shared counter.** Turns and credits are one `counters{turns, spent}` per task,
 threaded by pointer through the recursion — a subtask tree totals ≤ `max_turns` and ≤ `budget`, not
-per-frame. There is no depth cap and no recursion base-case problem: you cannot spend turns you do
-not have. Exhaustion inside a bracket rolls up an error result the parent can act on; at the root it
-fails the task with `turn-cap`. This is the property none of pi/opencode/OpenClaw has — their
+per-frame: you cannot spend turns you do not have. (Depth is separately capped at one sublevel by
+withholding the `subtask` tool from a child — see *Inside* — so the tree is at most root → subtasks,
+never deeper.) Exhaustion inside a bracket rolls up an error result the parent can act on; at the
+root it fails the task with `turn-cap`. This is the property none of pi/opencode/OpenClaw has — their
 subagents each get a *fresh* budget; ours share one.
 
 **Durable but clean.** Every record is teed to the one task transcript, tagged with its bracket id,

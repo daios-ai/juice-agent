@@ -635,6 +635,61 @@ func (d *loopingSubtaskDecider) Decide(_ context.Context, _ []Message, _ []Candi
 	return &Selection{Action: "@sys/time"}, nil
 }
 
+// toolNamingDecider records the harness tools it is offered on each turn, opens a
+// subtask once, then replies from whatever frame it is in.
+type toolNamingDecider struct {
+	offered [][]string
+	opened  bool
+}
+
+func (d *toolNamingDecider) Decide(_ context.Context, _ []Message, _ []Candidate, tools []Tool) (*Selection, error) {
+	names := make([]string, 0, len(tools))
+	for _, t := range tools {
+		names = append(names, t.Name)
+	}
+	d.offered = append(d.offered, names)
+	if !d.opened {
+		d.opened = true
+		return &Selection{Action: "subtask", Args: map[string]any{"instruction": "do it"}}, nil
+	}
+	return &Selection{Action: "reply", Args: map[string]any{"answer": "done"}}, nil
+}
+
+func TestSubtaskChildNotOfferedSubtaskTool(t *testing.T) {
+	// The child of a subtask must NOT be offered the subtask tool — nesting is
+	// capped at one sublevel so a cloned subtask cannot re-delegate and spiral.
+	dec := &toolNamingDecider{}
+	out, err := Run(context.Background(), Task{Budget: 100}, subtaskConfig(), newDeps(dec, &fakeCatalog{}, &recordingRunner{}, &memTranscript{}))
+	if err != nil {
+		t.Fatal(err)
+	}
+	if out.Status != StatusAnswered {
+		t.Fatalf("outcome = %+v, want answered", out)
+	}
+	// Turn 1 is the root (offered subtask, and it opened one); turn 2 runs inside
+	// the bracket and must not see subtask.
+	has := func(names []string, want string) bool {
+		for _, n := range names {
+			if n == want {
+				return true
+			}
+		}
+		return false
+	}
+	if len(dec.offered) < 2 {
+		t.Fatalf("expected at least 2 decide calls, got %d", len(dec.offered))
+	}
+	if !has(dec.offered[0], "subtask") {
+		t.Fatalf("root turn should be offered subtask, offered=%v", dec.offered[0])
+	}
+	if has(dec.offered[1], "subtask") {
+		t.Fatalf("subtask child must NOT be offered subtask, offered=%v", dec.offered[1])
+	}
+	if !has(dec.offered[1], "reply") {
+		t.Fatalf("subtask child should still be offered reply, offered=%v", dec.offered[1])
+	}
+}
+
 // --- repeat guard (§4c) -----------------------------------------------------
 
 func countKind(msgs []Message, kind string) int {

@@ -366,7 +366,10 @@ func runFrame(ctx context.Context, cfg Config, deps Deps, budget int, cnt *count
 			}
 			return sel.Args, StatusAnswered, "", nil
 
-		// subtask → open a bracket sharing the counters; roll its result up.
+		// subtask → open a bracket sharing the counters; roll its result up. The
+		// child inherits the parent's context (bracketSeed) but is NOT offered the
+		// subtask tool, capping nesting at one sublevel: a subtask must do the work
+		// itself, not re-delegate — which, cloned from the parent, would spiral.
 		case cfg.SubtaskTool != "" && sel.Action == cfg.SubtaskTool:
 			child, cerr := deps.Transcript.Child(ctx, bracketSeed(deps.Transcript.Messages(), sel.Args))
 			if cerr != nil {
@@ -375,7 +378,10 @@ func runFrame(ctx context.Context, cfg Config, deps Deps, budget int, cnt *count
 			childDeps := deps
 			childDeps.Transcript = child
 			childDeps.Steering = nil
-			res, _, _, ferr := runFrame(ctx, cfg, childDeps, budget, cnt, depth+1, logf)
+			childCfg := cfg
+			childCfg.SubtaskTool = ""
+			childCfg.Tools = withoutTool(cfg.Tools, cfg.SubtaskTool)
+			res, _, _, ferr := runFrame(ctx, childCfg, childDeps, budget, cnt, depth+1, logf)
 			if ferr != nil {
 				return nil, StatusFailed, "", ferr
 			}
@@ -428,17 +434,13 @@ func runFrame(ctx context.Context, cfg Config, deps Deps, budget int, cnt *count
 	}
 }
 
-// bracketSeed builds a subtask frame's opening conversation: the parent's system
-// prompt(s) (persona/knowledge/memory carry down), the optional context, and the
-// instruction. The parent's turn-by-turn history is deliberately NOT inherited —
-// a bracket starts clean with only what the parent hands it.
+// bracketSeed builds a subtask frame's opening conversation: the parent's full
+// turn-by-turn history (so the subtask knows the real context — what was read,
+// tried, and decided, not a distilled summary), then the optional explicit
+// context, then the instruction. Inheritance flows only *down*: the child's own
+// turns still roll up as a single result, so the parent chat stays clean.
 func bracketSeed(parent []Message, args map[string]any) []Message {
-	var seed []Message
-	for _, m := range parent {
-		if m.Kind == "system" {
-			seed = append(seed, m)
-		}
-	}
+	seed := append([]Message{}, parent...)
 	if c, _ := args["context"].(string); strings.TrimSpace(c) != "" {
 		seed = append(seed, Message{Role: RoleUser, Content: "Context from the parent task:\n" + c})
 	}
@@ -585,6 +587,21 @@ func trimLookup(res map[string]any) map[string]any {
 		out = append(out, slim)
 	}
 	return map[string]any{"results": out}
+}
+
+// withoutTool returns tools with the named tool removed (used to withhold the
+// subtask tool from a subtask frame, capping nesting depth at one sublevel).
+func withoutTool(tools []Tool, name string) []Tool {
+	if name == "" {
+		return tools
+	}
+	out := make([]Tool, 0, len(tools))
+	for _, t := range tools {
+		if t.Name != name {
+			out = append(out, t)
+		}
+	}
+	return out
 }
 
 // toolSchema returns the input schema of the named harness tool, or nil.
