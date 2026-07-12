@@ -9,12 +9,13 @@ document and the design differ, this document governs the implementation. It dep
 restates, the kernel contract in `juicedocs/requirements.md` (cited as *kernel §N*); a requirement
 here must not violate one there.
 
-Revision 0.1.3 adopts the juice-family filesystem convention (§11): a fixed `$JUICE_HOME/agent/<handle>/`
-home per agent (no cwd-relative or `named`/unnamed split), layered `config.json` in place of
-`agent.json`, a password precedence chain ending in an interactive no-echo prompt
-(`golang.org/x/term`), `serve` as the default action on a handle, a clean cut-over from the legacy
-layout, and mandatory creation of blank `persona.md`/`knowledge.md`/`memory.md` at agent
-initialization (§9). Token persistence is a deferred future item.
+Revision 0.1.3 adopts the juice-family filesystem convention (§11): a fixed
+`$JUICE_HOME/agent/agents/<handle>/` home per agent (no cwd-relative or `named`/unnamed split),
+layered `config.json` in place of `agent.json`, a password precedence chain ending in an interactive
+no-echo prompt (`golang.org/x/term`), `serve` as the default action on a handle, a clean cut-over from
+the legacy layout, an always-present step channel, and creation of blank
+`persona.md`/`knowledge.md`/`memory.md` plus a dumped standard `config.json` at agent initialization
+(§9, §11). Token persistence is a deferred future item.
 
 ## 1. Purpose and position
 
@@ -217,7 +218,7 @@ greppable, diffable, hand-editable), differing only in authorship:
 - **Learned** — `memory.md`, the agent's own running summary of past tasks.
 
 All three are fixed filenames (never operator-configurable, per the family convention, §11) and live
-in the **agent home**, `$JUICE_HOME/agent/<handle>/`, which also holds `config.json` and `data/`.
+in the **agent home**, `$JUICE_HOME/agent/agents/<handle>/`, which also holds `config.json` and `data/`.
 `juice-agent @research serve` resolves this home, so a differently-behaved agent is a directory, not
 new code.
 
@@ -269,16 +270,19 @@ configuration, not architecture. Implementations:
 The daemon conforms to the juice-family filesystem convention: **one root, one subdirectory per
 component.** All state lives under `$JUICE_HOME` (env var, default `~/.juice`, identical on macOS),
 in the component subdirectory `agent/`. juice-agent is the family's first *plural* component — one
-binary hosting many named agents — so each agent nests one level deeper, under its handle:
+binary hosting many named agents. To keep the component root uncluttered and free of name collisions
+(mirroring the kernel's own `$JUICE_HOME/kernel/`), the component holds its shared `config.json`
+directly, and the per-agent homes nest under an `agents/` subtree:
 
 ```text
 $JUICE_HOME/agent/                 the component root
 ├── config.json                    OPTIONAL host-wide defaults shared by every agent
-├── research/                      one agent — its handle is the directory name
-│   ├── config.json                this agent's config (overrides the shared defaults)
-│   ├── persona.md  knowledge.md  memory.md    hand-authored + learned files (§9)
-│   └── data/                      transcripts (one JSONL per task) + the maker index
-└── triage/  …
+└── agents/                        one directory per named agent (isolated from component files)
+    ├── research/                  one agent — its handle is the directory name
+    │   ├── config.json            this agent's config (auto-dumped; overrides shared defaults)
+    │   ├── persona.md  knowledge.md  memory.md    hand-authored + learned files (§9)
+    │   └── data/                  transcripts (one JSONL per task) + the maker index
+    └── triage/  …
 ```
 
 (A `tokens/` credential store is a deferred future item — see the password section below.)
@@ -288,26 +292,38 @@ Requirements, mirroring the convention:
 1. The root is `$JUICE_HOME` (default `~/.juice`); all state is under `$JUICE_HOME/agent/`.
 2. **Fixed default, never cwd-relative** — the agent attaches to the same state wherever it is
    launched from. There is no `named`/unnamed distinction and no cwd fallback: the default handle
-   `@agent` lives at `$JUICE_HOME/agent/agent/` like every other agent.
-3. The daemon `MkdirAll`s the agent home (mode `0700`) at startup, before any write, and creates the
-   blank authored/learned files (§9).
+   `@agent` lives at `$JUICE_HOME/agent/agents/agent/` like every other agent.
+3. The daemon `MkdirAll`s the agent home and its `data/` (mode `0700`) at startup, before any write,
+   and provisions the home if absent: blank `persona.md`/`knowledge.md`/`memory.md` (§9) and a
+   standard `config.json` (§below). Provisioning never truncates an existing file.
 4. Filenames are uniform by role, namespaced by the subdirectory: `config.json` (operator,
    hand-written), the fixed `persona.md`/`knowledge.md`/`memory.md`, `data/`. No component-prefixed
    name such as `agent.json` is used.
 5. Migration is a **clean cut-over**: the daemon reads only `$JUICE_HOME` and does **not** read the
    retired cwd-relative layout. If a legacy `./agent.json`, `./agent-data/`, or the retired
    `AGENT_HOME`/`AGENT_CONFIG` env var is detected, a one-line notice is logged telling the operator
-   to move state under `$JUICE_HOME/agent/<handle>/`; the legacy inputs are otherwise ignored (never
-   read, never auto-moved).
+   to move state under `$JUICE_HOME/agent/agents/<handle>/`; the legacy inputs are otherwise ignored
+   (never read, never auto-moved).
+6. **Every agent always has a step channel.** The step channel is the primary kernel-native intake,
+   so it is never left unconfigured: if config resolution yields no step channel (or a non-positive
+   poll interval), a default is injected. A daemon therefore always polls for work.
 
 ### Handle, config, and secrets
 
 The handle is the CLI `@handle` arg, else `AGENT_HANDLE`, else the default `@agent` — it is the home
 directory's name, not a config key. Config is layered: the component-level
 `$JUICE_HOME/agent/config.json` supplies host-wide defaults (e.g. `server_url`), and the per-agent
-`$JUICE_HOME/agent/<handle>/config.json` overrides them key-by-key (a merge, not a wholesale replace)
-— a self-contained agent is one directory, and shared keys are written once. Both files use flat
-keys, safe defaults, and are rejected if malformed at startup. **No secrets live in config.**
+`$JUICE_HOME/agent/agents/<handle>/config.json` overrides them key-by-key (a merge, not a wholesale
+replace) — a self-contained agent is one directory, and shared keys are written once. Both files use
+flat keys, safe defaults, and are rejected if malformed at startup. **No secrets live in config.**
+
+On first launch, if the per-agent `config.json` is absent, the daemon **dumps a standard one** — the
+resolved effective config (component defaults folded in, step channel present), written once and
+never overwritten thereafter — so the operator always has a working, editable file and a fresh agent
+is functional out of the box (this is what closes the "silent daemon with no intake" failure mode).
+Because it captures the effective `server_url` at creation, it stays consistent across restarts; the
+component `config.json` then serves as the template source for *new* agents and the override base for
+agents lacking their own file.
 
 The kernel password is resolved by a precedence chain, from non-interactive to interactive — a bare
 `--password <value>` flag is **not** offered (it would leak via shell history and
@@ -359,7 +375,7 @@ removes the binary only and never `$JUICE_HOME`.
 | `compact_bytes`    | `262144`               | agent | transcript byte budget triggering compaction (§7)                             |
 | `rate_tasks`       | `true`                 | agent | run the post-task rating pass (§8)                                            |
 | `maker`            | `{enabled:false, min_repeats:3, window:50, budget:40, threshold:0.85}` | agent | self-extension trigger (§8)       |
-| `channels`         | —                      | agent | `step {poll_seconds}` and/or `http {addr}`; only listed channels run          |
+| `channels`         | step always on         | agent | `step {poll_seconds}` (always present, §11 rule 6) and optional `http {addr}` |
 
 `handle`, `data_dir`, and the persona/knowledge/memory filenames are not config keys: the handle is
 the home directory's name (CLI arg / `AGENT_HANDLE`), `data_dir` is derived as `<home>/data`, and the
@@ -388,16 +404,17 @@ steering injection, candidate merge and eviction, subtask bracket roll-up and sh
 compaction trigger, recovery idempotence. The product package additionally covers system-prompt
 assembly, the byte-bounded memory update, the rating pass, and the maker trigger, plus the §11
 filesystem contract: `JUICE_HOME`-rooted home resolution (fixed, never cwd-relative), layered
-config (component defaults overridden per agent), the password precedence chain, idempotent home
-creation at mode 0700, blank-file initialization that never truncates an existing file, and
-keep-old-if-present legacy migration. `juice` is tested against `httptest` kernels. Every production
-file has its `_test.go`.
+config (component defaults overridden per agent), the guaranteed step channel, the password
+precedence chain, idempotent home creation at mode 0700, blank-file and standard-`config.json`
+initialization that never truncates an existing file, and clean-cut-over legacy detection. `juice` is
+tested against `httptest` kernels. Every production file has its `_test.go`.
 
 **Flows (`flows/`).** End-to-end shell scripts against the compiled binary, booting a real
 `juice serve` on a temp DB with the **real Ollama the kernel ships with** (no fake model). Mechanism
 flows (`bootstrap`, `init`, `recovery`, `drain`) touch no model and are deterministic — `init` asserts
-that a first launch under a temp `JUICE_HOME` creates `$JUICE_HOME/agent/<handle>/` with blank
-`persona.md`/`knowledge.md`/`memory.md` and leaves pre-existing files untouched on relaunch. LLM
+that a first launch under a temp `JUICE_HOME` creates `$JUICE_HOME/agent/agents/<handle>/` with blank
+`persona.md`/`knowledge.md`/`memory.md` and a dumped `config.json` carrying a step channel, and leaves
+pre-existing files untouched on relaunch. LLM
 flows (`task`,
 `role_law`, `rating`, `maker`, `persona`, `named`, `memory`) assert robust structural properties, not
 exact model text, and skip (never fail) when the chat model is absent. The budget and turn-cap rails

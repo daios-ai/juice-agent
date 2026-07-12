@@ -317,7 +317,7 @@ Beyond the per-task working memory of §5, an agent has two durable memories, bo
 - **Learned** — `memory.md`, the agent's own running summary of past tasks.
 
 Both live in the **agent home**, a directory keyed by handle under the juice-family root
-(`$JUICE_HOME/agent/<handle>/`, default `~/.juice`) that also holds `config.json` and `data/`
+(`$JUICE_HOME/agent/agents/<handle>/`, default `~/.juice`) that also holds `config.json` and `data/`
 (transcripts, maker index). `juice-agent @research` resolves this home, so a differently-behaved
 agent is a directory, not new code. This splits pi's `AGENTS.md` along the authorship seam. The exact
 filesystem convention is normative in `requirements.md` §11.
@@ -377,8 +377,9 @@ exit. There is no `juice-agent stop`.
 
 `serve` is the default action on a handle, so `juice-agent @research` runs the daemon (`serve`/
 `task`/`bench` remain explicit; a bare `juice-agent` prints usage). The handle comes from the CLI arg,
-else `AGENT_HANDLE`, else `@agent`; it names the home `$JUICE_HOME/agent/<handle>/`. The home and its
-blank `persona.md`/`knowledge.md`/`memory.md` are created (mode 0700) on first launch. The password is
+else `AGENT_HANDLE`, else `@agent`; it names the home `$JUICE_HOME/agent/agents/<handle>/`. The home,
+its blank `persona.md`/`knowledge.md`/`memory.md`, and a dumped standard `config.json` (always with a
+step channel) are created (mode 0700) on first launch. The password is
 resolved by a precedence chain — `--password-stdin`, `AGENT_PASSWORD`, `AGENT_PASSWORD_FILE`, else an
 interactive no-echo prompt (`golang.org/x/term`) — never a bare `--password` flag.
 

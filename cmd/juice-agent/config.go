@@ -95,18 +95,23 @@ func resolveHandle(cliHandle string) string {
 	return "@agent"
 }
 
-// componentDir is $JUICE_HOME/agent — the juice-agent component root, one
-// subdirectory of the family home, holding one directory per named agent.
+// defaultStepPoll is the fallback poll interval (seconds) for the step channel,
+// which every agent always has (see ensureStepChannel).
+const defaultStepPoll = 5
+
+// componentDir is $JUICE_HOME/agent — the juice-agent component root, holding the
+// optional shared config.json and the `agents/` subtree of per-agent homes.
 func componentDir() string { return filepath.Join(juiceHome(), "agent") }
 
-// ResolveConfig computes the agent home from the handle and $JUICE_HOME, then
-// layers the component-wide config.json and the per-agent config.json over the
-// defaults (a later layer overrides only the keys it sets — a merge, not a
-// wholesale replace). A missing config file is fine; a malformed one is an error.
+// ResolveConfig computes the agent home ($JUICE_HOME/agent/agents/<handle>/) from
+// the handle, then layers the component-wide config.json and the per-agent
+// config.json over the defaults (a later layer overrides only the keys it sets —
+// a merge, not a wholesale replace). A missing config file is fine; a malformed
+// one is an error. The step channel is always present (ensureStepChannel).
 func ResolveConfig(cliHandle string) (Config, error) {
 	handle := resolveHandle(cliHandle)
 	component := componentDir()
-	home := filepath.Join(component, strings.TrimPrefix(handle, "@"))
+	home := filepath.Join(component, "agents", strings.TrimPrefix(handle, "@"))
 
 	cfg := DefaultConfig()
 	if err := overlayConfig(&cfg, filepath.Join(component, "config.json")); err != nil {
@@ -115,11 +120,26 @@ func ResolveConfig(cliHandle string) (Config, error) {
 	if err := overlayConfig(&cfg, filepath.Join(home, "config.json")); err != nil {
 		return cfg, err
 	}
+	ensureStepChannel(&cfg)
 
 	cfg.Handle = handle
 	cfg.Home = home
 	cfg.DataDir = filepath.Join(home, "data")
 	return cfg, nil
+}
+
+// ensureStepChannel guarantees the agent always has a working step channel — the
+// kernel-native intake by which other users and agents hand it work. It is the
+// primary way the daemon receives tasks, so it is never left unconfigured: an
+// absent channel is defaulted, and a non-positive poll interval is repaired.
+func ensureStepChannel(c *Config) {
+	if c.Channels.Step == nil {
+		c.Channels.Step = &StepChannelConfig{PollSeconds: defaultStepPoll}
+		return
+	}
+	if c.Channels.Step.PollSeconds <= 0 {
+		c.Channels.Step.PollSeconds = defaultStepPoll
+	}
 }
 
 // overlayConfig unmarshals the JSON file at path over cfg, overriding only the
@@ -135,9 +155,12 @@ func overlayConfig(cfg *Config, path string) error {
 	return json.Unmarshal(raw, cfg)
 }
 
-// EnsureHome creates the agent home and data dir (mode 0700) and writes blank
-// persona.md/knowledge.md/memory.md if absent, so the operator always has
-// concrete files to edit. It never truncates an existing file (O_EXCL).
+// EnsureHome creates the agent home and data dir (mode 0700), writes blank
+// persona.md/knowledge.md/memory.md if absent, and dumps a standard config.json
+// if absent, so the operator always has concrete files to edit and the agent is
+// functional out of the box. It never truncates an existing file. The dumped
+// config is the resolved effective config (component defaults folded in, step
+// channel guaranteed by ResolveConfig), so it stays consistent across restarts.
 func (c Config) EnsureHome() error {
 	if err := os.MkdirAll(c.Home, 0o700); err != nil {
 		return err
@@ -154,6 +177,18 @@ func (c Config) EnsureHome() error {
 			return err
 		}
 		f.Close()
+	}
+	cfgPath := filepath.Join(c.Home, "config.json")
+	if _, err := os.Stat(cfgPath); os.IsNotExist(err) {
+		b, err := json.MarshalIndent(c, "", "  ")
+		if err != nil {
+			return err
+		}
+		if err := os.WriteFile(cfgPath, append(b, '\n'), 0o600); err != nil {
+			return err
+		}
+	} else if err != nil {
+		return err
 	}
 	return nil
 }

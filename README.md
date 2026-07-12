@@ -46,18 +46,21 @@ Each agent lives in its own home under the juice-family root, `$JUICE_HOME` (def
 ```
 $JUICE_HOME/agent/                 the juice-agent component root
 ├── config.json                    OPTIONAL host-wide defaults shared by every agent
-└── <handle>/                      e.g. research/  (handle = directory name, no leading @)
-    ├── config.json                this agent's config (overrides the shared defaults)
-    ├── persona.md  knowledge.md  memory.md    hand-authored + learned files
-    └── data/                      transcripts (one JSONL per task) + the maker index
+└── agents/
+    └── <handle>/                  e.g. research/  (handle = directory name, no leading @)
+        ├── config.json            this agent's config (auto-dumped; overrides shared defaults)
+        ├── persona.md  knowledge.md  memory.md    hand-authored + learned files
+        └── data/                  transcripts (one JSONL per task) + the maker index
 ```
 
-The home is **fixed, never cwd-relative**, and is created (mode 0700) on first launch, with blank
-`persona.md`/`knowledge.md`/`memory.md` written so you always have files to edit. Config is layered:
-the component-level `config.json` supplies host-wide defaults (e.g. `server_url`), and the per-agent
-`config.json` overrides them key-by-key. Secrets never live in config (see *Running* below). The
-handle is the `@handle` CLI arg (else `AGENT_HANDLE`, else `@agent`) — it names the directory, so it
-is not a config key.
+The home is **fixed, never cwd-relative**, and is provisioned on first launch (mode 0700): blank
+`persona.md`/`knowledge.md`/`memory.md` so you always have files to edit, plus a **standard
+`config.json` dumped automatically** — with a step channel enabled — so a fresh agent is functional
+out of the box (an existing file is never overwritten). Config is layered: the component-level
+`config.json` supplies host-wide defaults (e.g. `server_url`), and the per-agent `config.json`
+overrides them key-by-key. Every agent always has a step channel (the kernel-native intake), even if
+config omits one. Secrets never live in config (see *Running* below). The handle is the `@handle` CLI
+arg (else `AGENT_HANDLE`, else `@agent`) — it names the directory, so it is not a config key.
 
 ```json
 {

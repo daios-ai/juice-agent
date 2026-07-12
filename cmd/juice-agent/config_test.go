@@ -1,6 +1,7 @@
 package main
 
 import (
+	"encoding/json"
 	"os"
 	"path/filepath"
 	"testing"
@@ -25,7 +26,7 @@ func TestResolveConfigDefaultsWhenNoFiles(t *testing.T) {
 	if cfg.Handle != "@research" {
 		t.Fatalf("handle = %q", cfg.Handle)
 	}
-	wantHome := filepath.Join(root, "agent", "research")
+	wantHome := filepath.Join(root, "agent", "agents", "research")
 	if cfg.Home != wantHome {
 		t.Fatalf("home = %q, want %q", cfg.Home, wantHome)
 	}
@@ -38,6 +39,21 @@ func TestResolveConfigDefaultsWhenNoFiles(t *testing.T) {
 	// Defaults applied when no config file exists.
 	if cfg.MaxTurns != 32 || cfg.DefaultBudget != 100 || cfg.ServerURL != "http://localhost:4040" {
 		t.Fatalf("defaults not applied: %+v", cfg)
+	}
+}
+
+func TestResolveConfigAlwaysHasStepChannel(t *testing.T) {
+	setJuiceHome(t)
+	// No config files at all — the step channel must still be present.
+	cfg, err := ResolveConfig("@research")
+	if err != nil {
+		t.Fatal(err)
+	}
+	if cfg.Channels.Step == nil {
+		t.Fatal("step channel absent with no config; must be guaranteed")
+	}
+	if cfg.Channels.Step.PollSeconds != defaultStepPoll {
+		t.Fatalf("step poll = %d, want %d", cfg.Channels.Step.PollSeconds, defaultStepPoll)
 	}
 }
 
@@ -62,7 +78,7 @@ func TestResolveHandlePrecedence(t *testing.T) {
 func TestResolveConfigLayeredMerge(t *testing.T) {
 	root := setJuiceHome(t)
 	component := filepath.Join(root, "agent")
-	home := filepath.Join(component, "triage")
+	home := filepath.Join(component, "agents", "triage")
 	if err := os.MkdirAll(home, 0o700); err != nil {
 		t.Fatal(err)
 	}
@@ -94,7 +110,7 @@ func TestResolveConfigLayeredMerge(t *testing.T) {
 
 func TestResolveConfigMalformedIsError(t *testing.T) {
 	root := setJuiceHome(t)
-	home := filepath.Join(root, "agent", "agent")
+	home := filepath.Join(root, "agent", "agents", "agent")
 	if err := os.MkdirAll(home, 0o700); err != nil {
 		t.Fatal(err)
 	}
@@ -131,6 +147,40 @@ func TestEnsureHomeCreatesDirAndBlankFiles(t *testing.T) {
 		if fi.Size() != 0 {
 			t.Fatalf("%s not blank: %d bytes", name, fi.Size())
 		}
+	}
+}
+
+func TestEnsureHomeDumpsStandardConfigWithStep(t *testing.T) {
+	setJuiceHome(t)
+	cfg, err := ResolveConfig("@research")
+	if err != nil {
+		t.Fatal(err)
+	}
+	if err := cfg.EnsureHome(); err != nil {
+		t.Fatal(err)
+	}
+	// A standard config.json must be dumped, and it must carry a step channel.
+	raw, err := os.ReadFile(filepath.Join(cfg.Home, "config.json"))
+	if err != nil {
+		t.Fatalf("config.json not dumped: %v", err)
+	}
+	var dumped Config
+	if err := json.Unmarshal(raw, &dumped); err != nil {
+		t.Fatalf("dumped config is not valid JSON: %v", err)
+	}
+	if dumped.Channels.Step == nil {
+		t.Fatal("dumped config.json has no step channel")
+	}
+	// It must not overwrite an operator-edited config on a later init.
+	if err := os.WriteFile(filepath.Join(cfg.Home, "config.json"), []byte(`{"max_turns":99}`), 0o600); err != nil {
+		t.Fatal(err)
+	}
+	if err := cfg.EnsureHome(); err != nil {
+		t.Fatal(err)
+	}
+	raw, _ = os.ReadFile(filepath.Join(cfg.Home, "config.json"))
+	if string(raw) != `{"max_turns":99}` {
+		t.Fatalf("existing config.json was overwritten: %s", raw)
 	}
 }
 

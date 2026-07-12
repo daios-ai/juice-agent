@@ -103,10 +103,11 @@ create_user() {
 # agentd
 # ---------------------------------------------------------------------------
 # agent_home dir [handle] — echo an agent's home under JUICE_HOME=$dir. Handle
-# defaults to @agent; the leading @ is stripped for the directory name.
+# defaults to @agent; the leading @ is stripped for the directory name. Homes
+# nest under the component's agents/ subtree ($JUICE_HOME/agent/agents/<handle>).
 agent_home() {
     local dir="$1" handle="${2:-@agent}"
-    echo "$dir/agent/${handle#@}"
+    echo "$dir/agent/agents/${handle#@}"
 }
 
 # start_agentd dir [cfg-fragment] — write the agent's config.json, launch the

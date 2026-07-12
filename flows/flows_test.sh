@@ -57,13 +57,20 @@ flow_recovery() {
 }
 
 flow_init() {
-    echo "=== FLOW init (blank files created under \$JUICE_HOME/agent/<handle>/) ==="
+    echo "=== FLOW init (home under agents/; blank files + auto-dumped config w/ step) ==="
     local dir; dir=$(new_dir)
     start_kernel "$dir"; create_agent
     local home; home=$(agent_home "$dir")
-    start_agentd "$dir" || { fail init.agentd "no daemon"; return; }
+    # Shared server_url via the component config; NO per-agent config, so the
+    # daemon must auto-dump one (with a step channel) on first launch.
+    mkdir -p "$dir/agent"
+    echo "{ \"server_url\": \"$KURL\", \"memory\": {\"enabled\": false} }" > "$dir/agent/config.json"
 
-    # First launch materialises the home with blank persona/knowledge/memory + data/.
+    JUICE_HOME="$dir" AGENT_PASSWORD=agent-pass "$AGENTD" @agent serve >"$dir/agentd.log" 2>&1 &
+    local pid=$!; track "$pid"
+    wait_line "$dir/agentd.log" '"event":"\(serving\)"' >/dev/null || { fail init.serving "no daemon"; cat "$dir/agentd.log" >&2; return; }
+
+    # The home lives under agents/, with blank persona/knowledge/memory + data/.
     local missing=""
     for f in persona.md knowledge.md memory.md; do
         [ -f "$home/$f" ] || missing="$missing $f"
@@ -72,10 +79,19 @@ flow_init() {
     [ -d "$home/data" ] || missing="$missing data/"
     [ -z "$missing" ] && ok init.blank_files_created || fail init.blank_files_created "missing/nonblank:$missing"
 
+    # A standard config.json was auto-dumped, and it carries a step channel.
+    if [ -f "$home/config.json" ] && grep -q '"step"' "$home/config.json"; then
+        ok init.config_dumped_with_step
+    else
+        fail init.config_dumped_with_step "no auto-dumped config.json with a step channel"
+    fi
+
     # An operator edit must survive a restart (init never truncates).
     printf 'INIT-MARKER-9Z\n' > "$home/persona.md"
-    kill -9 "$AGENTD_PID" 2>/dev/null; wait "$AGENTD_PID" 2>/dev/null
-    start_agentd "$dir" || { fail init.restart "no daemon"; return; }
+    kill -9 "$pid" 2>/dev/null; wait "$pid" 2>/dev/null
+    JUICE_HOME="$dir" AGENT_PASSWORD=agent-pass "$AGENTD" @agent serve >"$dir/agentd2.log" 2>&1 &
+    local pid2=$!; track "$pid2"
+    wait_line "$dir/agentd2.log" '"event":"\(serving\)"' >/dev/null || { fail init.restart "no daemon"; return; }
     grep -q 'INIT-MARKER-9Z' "$home/persona.md" \
         && ok init.non_truncating \
         || fail init.non_truncating "persona.md truncated on restart"
@@ -218,8 +234,8 @@ flow_named() {
     track $!
     JUICE_HOME="$dir" AGENT_PASSWORD=bob-pass "$AGENTD" @bob serve >"$dir/bob.log" 2>&1 &
     track $!
-    wait_line "$dir/alice.log" '"event":"serving"' >/dev/null
-    wait_line "$dir/bob.log"   '"event":"serving"' >/dev/null
+    wait_line "$dir/alice.log" '"event":"\(serving\)"' >/dev/null
+    wait_line "$dir/bob.log"   '"event":"\(serving\)"' >/dev/null
 
     # Each named agent logs in and serves under its own handle (distinct users on
     # one kernel; no fake per-agent actions are registered).
