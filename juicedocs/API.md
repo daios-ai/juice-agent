@@ -28,7 +28,7 @@ No envelope objects. `GET /v1/steps` returns `[…]` directly. Metadata such as 
 The handler rejects invalid inputs before calling the kernel. `rating` must be 0 or 1; returns `ErrInvalidInput` when violated.
 
 **R8 — Action responses include both `id` and `action`.**  
-Every read or list response for an action resource includes both `id` (UUID, for management operations) and a computed `action` field containing `@owner/name` (for running). Clients can copy the `action` value directly into run requests without a separate lookup. For `kind=http` actions, responses also include a decomposed `http` object `{method, url, params}` — identical in shape for manually-created and OpenAPI-imported actions — that round-trips with the `source`/`method`/`param` create and update inputs. Responses also carry the action's non-secret auth summary: `requires_grant` (always present — `true` iff a caller must connect a per-caller credential before calling, i.e. a delegated scheme) and, when the action has upstream auth, `auth_scheme` (the scheme name, e.g. `delegated_bearer`). These are the scheme and flag only, never config or secrets (R9).
+Every read or list response for an action resource includes both `id` (UUID, for management operations) and a computed `action` field containing `@owner/name` (for running). Clients can copy the `action` value directly into run requests without a separate lookup. For `kind=http` actions, responses also include a decomposed `http` object `{method, url, params}` — identical in shape for manually-created and OpenAPI-imported actions — that round-trips with the `source`/`method`/`param` create and update inputs. Responses also carry the action's non-secret auth summary: `requires_grant` (always present — `true` iff a caller must connect a per-caller credential before calling, i.e. a delegated scheme) and, when the action has upstream auth, `auth_scheme` (the scheme name, e.g. `delegated_bearer`). These are the scheme and flag only, never config or secrets (R9). A `kind=remote_proxy` action additionally carries `peer_state` — `offline` (the owner peer's friend-sync is missing or stale) or `unfunded` (this kernel's cached credit on the peer is below the action's price), omitted when healthy — a display-only hint from the §13 peer-sync cache that never gates a call.
 
 **R9 — Secrets never serialize.**  
 Auth configs (`Action.source` upstream credentials) are write-only: accepted on create and update, never present in any read, list, log, receipt, hash, or manifest response. There is no read path for a stored secret. The non-secret `auth_scheme` name and `requires_grant` flag (R8) are not secrets and are exposed; the `config` and `secrets` of an auth are never returned.
@@ -101,21 +101,23 @@ Federation has no HTTP surface: peer identity, gossip, manifests, the friend han
 | Operation | HTTP | CLI |
 |-----------|------|-----|
 | Create user | `POST /v1/users` `{handle, email, password}` → 201 user | `juice user create <user> <email> [--password]` |
-| Get self | `GET /v1/me` → user (`id`, `handle`, `email`, `available`, `locked`, `grants`) | `juice user me` |
+| Get self | `GET /v1/me` → user (`id`, `handle`, `email`, `available`, `locked`, `grants`, `connections`) | `juice user me` |
 | Update self | `PUT /v1/me` `{[email], [current_password, password]}` → user | `juice user update [--email] [--password]` |
 
 `handle` is immutable. `email` and `password` are updatable by the authenticated user; `password` change requires `current_password` to verify the existing credential. At least one of `email` or `password` must be provided. Proxy users (federation peers) cannot be created here, cannot log in, and hold no tokens; they exist only through peer acceptance, authenticate per request by federation signature, and cannot use `PUT /v1/me`.
 
-### Grants (delegated OAuth)
+### Grants and connections (delegated auth)
 
 | Operation | HTTP | CLI |
 |-----------|------|-----|
-| Start consent | `POST /v1/grants/start` `{action, [redirect_uri], [flow]}` → `{state, authorize_url}` (code) or `{state, verification_uri, user_code, interval, expires_in}` (device) | `juice user connect <action> [--device]` |
-| Complete consent | `POST /v1/grants/complete` `{state, [code]}` → `{status, action, created_at}` or `{status: "pending"}` | (driven by `user connect`) |
-| Attach token | `POST /v1/grants` `{action, token}` → `{status, action, created_at}` | `juice user connect <action> --token <pat>` |
-| Disconnect | `DELETE /v1/grants?action=@owner/name` → `{revoked, action}` | `juice user disconnect <action>` |
+| Plan consent | `GET /v1/grants/plan?selector=` → `{groups: [{provider, scheme, scopes, destinations, connected, covered, actions: [{action, granted}]}], skipped}` | (driven by `user connect`) |
+| Start consent | `POST /v1/grants/start` `{selector, provider, [redirect_uri], [flow]}` → `{status:"granted", actions}` (already covered) or `{state, authorize_url}` (code) or `{state, verification_uri, user_code, interval, expires_in}` (device) | `juice user connect <selector> [--device]` |
+| Complete consent | `POST /v1/grants/complete` `{state, [code]}` → `{status, provider, actions, created_at}` or `{status: "pending"}` | (driven by `user connect`) |
+| Attach token | `POST /v1/grants` `{selector, [provider], token}` → `{status, provider, actions, created_at}` | `juice user connect <selector> --token <pat>` |
+| Disconnect grants | `DELETE /v1/grants?selector=` → `{revoked: [actions]}` (legacy `?action=` accepted) | `juice user disconnect <selector>` |
+| Disconnect account | `DELETE /v1/grants?account=<provider_key>` → `{revoked: [actions], connection}` | `juice user disconnect --account <provider>` |
 
-A `Grant` delegates the caller's upstream identity to one delegated action (§8). For an `oauth_delegated` action the client hosts the redirect target — a loopback listener for local clients (CLI/desktop), a registered callback for hosted ones — and the server holds only in-memory PKCE/device state and performs the token exchange, so the refresh token never transits the client. For a `delegated_bearer` action there is no browser roundtrip: the caller supplies a static token (a personal access token / per-user API key) once via `POST /v1/grants`, and the CLI's `--token` reads it without echo when the flag value is empty (keeping it out of shell history). Running an action that lacks a grant returns `grant_required` (403) with the action in `meta`, so a client can offer consent inline; the CLI (`juice run`) does exactly that on an interactive terminal and otherwise prints a `juice user connect` hint. Grants are listed token-free under `grants` in `GET /v1/me` and are never otherwise readable.
+A `Grant` is per-action consent (§8): a pointer binding one action to a `Connection` — the caller's upstream account credential, stored once per `(user, provider)` and shared by every grant that points at it. A **selector** (`@owner`, `@owner/path`, or a full `@owner/name`; path-segment matched, trailing `/*` stripped) names a set of delegated actions; `user connect` fetches the plan, groups them by upstream account, shows the delta, and covers each group with one gesture: one browser consent (requesting the union of the group's scopes) for `oauth_delegated`, or one token paste for `delegated_bearer`. Connecting an action whose account is already connected with covering scopes grants instantly with no browser. For `oauth_delegated` the client hosts the redirect target — a loopback listener for local clients (CLI/desktop), a registered callback for hosted ones — and the server holds only in-memory PKCE/device state and performs the token exchange, so the refresh token never transits the client. The CLI's `--token` reads without echo when the flag value is empty (keeping it out of shell history). Running an action that lacks a grant returns `grant_required` (403) with the action in `meta`; the CLI (`juice run`) offers consent inline on an interactive terminal and otherwise prints a `juice user connect <directory>` hint. Grants and connections are listed token-free under `grants`/`connections` in `GET /v1/me` and are never otherwise readable.
 
 ### Actions
 
@@ -156,7 +158,7 @@ The per-caller schemes hold no secret in `auth`; each caller supplies their cred
 |-----------|------|-----|
 | Run action | `POST /v1/run` `{action, args}` → `{result, tx_id, trace_id, process_id}` | `juice run <action> [json]` |
 
-`run` is the single execution entry point: it atomically creates a process funded with exactly the action's price (parked from the caller's available balance), issues the root call, and the process closes itself when the root call has returned and no steps remain outstanding. There is no process handle to manage and no funding amount to choose. `args` defaults to `{}` when omitted. Zero-price actions (e.g. `@sys/lookup`) run with zero funding — no special handling.
+`run` is the single execution entry point: it atomically creates a process funded with exactly the action's price (parked from the caller's available balance), issues the root call, and the process closes itself when the root call has returned and no steps remain outstanding. A remote-proxy `run` may fail with a federation-relationship error distinct from the caller's own funds: `peer_unreachable` (502) — the peer was offline and the request provably never left this kernel, so the call was refunded rather than parked (retry when it is back); or `peer_unfunded` (402, `meta.peer` names the peer) — this kernel's prepaid credit on the peer is exhausted, an operator top-up condition, never the caller's balance (§13). There is no process handle to manage and no funding amount to choose. `args` defaults to `{}` when omitted. Zero-price actions (e.g. `@sys/lookup`) run with zero funding — no special handling.
 
 ### Processes
 
@@ -194,7 +196,7 @@ A step is a funded continuation: creation snapshots the action's price as `step.
 
 ### System Actions
 
-Native actions registered at bootstrap, owned by `@sys`, public, runnable like any other action — `juice run @sys/lookup '{"query":"…"}'`. `@sys/lookup` results carry `action_id`, `action` (`@owner/name`), `description`, `score`, `input_schema`, and `output_schema`:
+Native actions registered at bootstrap, owned by `@sys`, public, runnable like any other action — `juice run @sys/lookup '{"query":"…"}'`. `@sys/lookup` results carry `action_id`, `action` (`@owner/name`), `description`, `score`, `input_schema`, and `output_schema`. `score` is a dimensionless relevance-times-quality rank score (lexical and semantic legs fused by reciprocal-rank fusion, weighted by stats); it is comparable only for ordering within one response, not across queries or as a probability:
 
 | Action | Price | Purpose |
 |--------|-------|---------|
@@ -225,11 +227,12 @@ The operator verbs no ordinary user performs — money, access, federation trust
 | Show user | `juice admin show <user>` |
 | Suspend user | `juice admin suspend <user>` |
 | Unsuspend user | `juice admin unsuspend <user>` |
+| Rename user handle | `juice admin rename <user> <new-handle>` — frees the old handle for reuse |
 | Deposit credits | `juice admin deposit <user\|key> <amount> [--reason --external-key]` |
 | Withdraw credits | `juice admin withdraw <user\|key> <amount> [--reason --external-key]` |
 | Friend a kernel | `juice admin friend <key>` |
 | Unfriend a kernel | `juice admin unfriend <user\|key>` |
-| List peers | `juice admin peers [--gossip] [--all]` — friended peers by default (`handle`, `public_key`, `available`, `locked`; no internal id); `--all` (`?all=1`) also lists denied/unfriended peers; `--gossip` adds the known-network directory roster |
+| List peers | `juice admin peers [--gossip] [--all]` — friended peers by default (`handle`, `public_key`, `available`, `locked`, plus the §13 sync cache `peer_credit` (our credit on the peer) and `last_seen`; no internal id); `--all` (`?all=1`) also lists denied/unfriended peers; `--gossip` adds the known-network directory roster |
 | Inspect a kernel | `juice admin inspect <key\|user>` — identity, public actions, transacted friends, reachability. `source` is `live`/`local`/`none`: an offline but friended peer degrades to last-known local data (`online:false`) |
 | Show own identity | `juice admin identity` — this kernel's public key, handle, listen addresses |
 
