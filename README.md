@@ -1,11 +1,13 @@
+<p align="center"><img src="juice-logo.svg" alt="juice" width="96"></p>
+
 # juice-agent
 
 A Go daemon implementing a general task-solving agent whose entire tool set is a
 [Juice](../juice) kernel's action catalog. It registers as a kernel *user*, discovers actions with
-`@sys/lookup`, reasons with `@sys/llm/decide`, and dispatches every tool through `POST /v1/run` — so
+`@sys/lookup`, reasons with `@sys/llm/chat`, and dispatches every tool through `POST /v1/run` — so
 it pays for what it runs, rates the tools it uses, and (optionally) publishes new actions to
 automate recurring work. The loop is pi-style: a small hand-owned cycle that stops when the model
-selects the terminal `@agent/reply` action.
+selects the terminal `reply` tool.
 
 See `agent-design.md` for the full design and rationale.
 
@@ -22,7 +24,26 @@ See `agent-design.md` for the full design and rationale.
 
 ```sh
 make build        # -> ./juice-agent
+make install      # -> $PREFIX/bin/juice-agent  (PREFIX ?= ~/.local; puts it on your PATH)
 ```
+
+## Quickstart
+
+With a Juice kernel already running (see Prerequisites), from zero to one answered task:
+
+```sh
+make install                                              # build + put juice-agent on PATH
+
+# create and fund the agent's kernel account (as the kernel operator)
+juice user create @agent agent@example.com --password 's3cret-pass'
+juice admin deposit @agent 100000
+
+# run a single task to confirm it works — prints the outcome as JSON
+AGENT_PASSWORD='s3cret-pass' juice-agent @agent task "What is 2+2? Reply with just the number."
+```
+
+To then run it as a long-lived daemon that accepts work over channels, see *Running* and *Giving the
+daemon work* below.
 
 ## One-time setup on the kernel
 
