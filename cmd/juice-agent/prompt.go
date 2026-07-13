@@ -60,8 +60,8 @@ func (p *Prompter) Build(memoryDigest string) agent.Message {
 	}
 	b.WriteString("\n# Operating\nPrefer actions with a proven track record; try an untested one " +
 		"only when nothing proven fits. For a multi-step sub-problem, open the subtask tool with a " +
-		"specific instruction — it works in its own scope and returns only its result, keeping this " +
-		"chat clean. Stay within your credit budget. When you have the answer, select the " + reply + " tool.")
+		"specific instruction — it works in its own scope and returns only its result. Stay within " +
+		"your credit budget. When you have the answer, select the " + reply + " tool.")
 	return agent.Message{Role: agent.RoleSystem, Kind: "system", Content: strings.TrimSpace(b.String())}
 }
 
