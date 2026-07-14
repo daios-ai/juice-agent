@@ -249,7 +249,7 @@ func buildChannels(cfg Config, cl *juice.Client) []Channel {
 	}
 	if sc := cfg.Channels.Step; sc != nil {
 		interval := time.Duration(sc.PollSeconds) * time.Second
-		out = append(out, NewStep(stepAdapter{cl: cl}, interval, cfg.DefaultBudget))
+		out = append(out, NewStep(stepAdapter{cl: cl}, interval, cfg.DefaultBudget, cfg.Handle))
 	}
 	return out
 }

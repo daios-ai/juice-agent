@@ -118,7 +118,15 @@ func (a stepAdapter) WaitingSteps(ctx context.Context) ([]StepInfo, error) {
 	}
 	out := make([]StepInfo, 0, len(steps))
 	for _, s := range steps {
-		out = append(out, StepInfo{ID: s.ID, PartialArgs: s.PartialArgs, CreatedBy: s.CreatedBy})
+		out = append(out, StepInfo{
+			ID:             s.ID,
+			OwnerHandle:    s.OwnerHandle,
+			RequiredCaller: s.RequiredCallerHandle,
+			ActionRef:      s.ActionRef,
+			PartialArgs:    s.PartialArgs,
+			AllowedInput:   s.AllowedInput,
+			CreatedBy:      s.CreatedBy,
+		})
 	}
 	return out, nil
 }
