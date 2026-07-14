@@ -154,6 +154,37 @@ flow_role_law() {
     fi
 }
 
+flow_step() {
+    echo "=== FLOW step (intake + egress mechanics; no LLM required) ==="
+    local dir; dir=$(new_dir)
+    start_kernel "$dir" || { fail step.kernel "no kernel"; return; }
+    create_agent
+    create_user @other other-pass
+    start_agentd "$dir" || { fail step.agentd "no daemon"; return; }
+
+    # A step addressed to @agent is picked up and COMPLETED by the daemon even
+    # with no LLM: a failed loop still acks the step (waiting -> done). The
+    # reply/ack rides in the completion transaction's args, readable by the sender.
+    echo '{"to":"@agent","message":"deterministic ping"}' > "$dir/m.json"
+    local sid; sid=$(kj run @sys/message "@$dir/m.json" | python3 -c "import sys,json; print(json.load(sys.stdin)['result']['step_id'])" 2>/dev/null)
+    assert_nonempty step.created "$sid"
+    local st="" deadline=$(( $(date +%s) + 30 ))
+    while [ "$(date +%s)" -lt "$deadline" ]; do
+        st=$(kj step show "$sid" | jfield status); [ "$st" = "done" ] && break; sleep 0.5
+    done
+    assert_eq step.completed_by_daemon done "$st"
+    local tx args; tx=$(kj step show "$sid" | jfield tx_id)
+    args=$(kj tx show "$tx" | python3 -c 'import sys,json; print(json.dumps(json.load(sys.stdin).get("args",{})))' 2>/dev/null)
+    assert_contains step.reply_in_tx_args "deterministic ping" "$args"
+
+    # A step addressed to @other is not the agent's work: the daemon leaves it
+    # waiting (only steps whose required caller is the agent are its to do).
+    echo '{"to":"@other","message":"not for the agent"}' > "$dir/o.json"
+    local oid; oid=$(kj run @sys/message "@$dir/o.json" | python3 -c "import sys,json; print(json.load(sys.stdin)['result']['step_id'])" 2>/dev/null)
+    sleep 3 # several daemon polls
+    assert_eq step.foreign_untouched waiting "$(kj step show "$oid" | jfield status)"
+}
+
 flow_rating() {
     echo "=== FLOW rating (real LLM: agent rates its tool use) ==="
     require_ollama || { skip rating.tx_rated "Ollama/$CHAT_MODEL unavailable"; return; }
@@ -274,7 +305,7 @@ flow_memory() {
 }
 
 # Mechanism flows (no LLM) run first and fast; LLM flows (real Ollama) follow.
-ALL=(flow_bootstrap flow_init flow_recovery flow_drain flow_named
+ALL=(flow_bootstrap flow_init flow_recovery flow_drain flow_step flow_named
      flow_task flow_persona flow_rating flow_role_law flow_memory flow_maker)
 
 if [ "$#" -gt 0 ]; then

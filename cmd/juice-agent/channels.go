@@ -6,6 +6,7 @@ import (
 	"net"
 	"net/http"
 	"strconv"
+	"strings"
 	"sync"
 	"sync/atomic"
 	"time"
@@ -142,10 +143,19 @@ func renderArgs(args map[string]any) string {
 // StepInfo is a waiting step addressed to the agent, projected to what the
 // channel needs. cmd/juice-agent adapts juice.Step into this, keeping the channel
 // package independent of the kernel client.
+//
+// The step is the message: OwnerHandle is the sender (the channel/session
+// identity), PartialArgs is the envelope, ActionRef is the onward action the
+// reply is delivered through (its completion), and AllowedInput is the reply
+// contract (the onward action's input_schema minus the pre-bound keys).
 type StepInfo struct {
-	ID          string
-	PartialArgs map[string]any
-	CreatedBy   string
+	ID             string
+	OwnerHandle    string         // sender/payer — the channel and session key
+	RequiredCaller string         // whom the step is addressed to; ours to do iff it is us
+	ActionRef      string         // the onward (completion-target) action
+	PartialArgs    map[string]any // the request envelope
+	AllowedInput   map[string]any // reply contract: input_schema \ keys(partial_args)
+	CreatedBy      string
 }
 
 // StepSource lists and completes the agent's waiting steps. Implemented over the
@@ -157,30 +167,55 @@ type StepSource interface {
 
 // Step is the kernel-native intake surface: it polls the kernel for waiting
 // steps addressed to the agent, turns each into a task, and delivers the outcome
-// by completing the step. This is how any other agent (e.g. @chat) or a human,
-// via @sys/message, hands work to the agent with zero pairwise integration.
+// by completing the step. This is how any other agent (e.g. @chat), a human via
+// @sys/message, or a channel bridge hands work to the agent with zero pairwise
+// integration.
+//
+// One active task per conversation: a session is (owner_handle, thread); a step
+// for a session already in flight is deferred until that session's task settles,
+// so a sender's messages are processed in order and never interleave. The trade
+// is up to one poll interval of latency for a queued follow-up.
+//
+// Recovery needs no persisted claim state: the kernel's step status is the
+// durable guard. `seen` (in-memory) only prevents re-submitting a step between
+// polls within one run. On restart it resets, so a still-`waiting` step (the
+// agent crashed before completing it) is re-polled and redone, while a completed
+// step is `done` kernel-side and never returned again — no double-delivery. A
+// crash mid-task may repeat the loop's side effects (the at-least-once caveat);
+// the kernel settles the interrupted trace as failed independently (§5).
 type Step struct {
 	src      StepSource
 	interval time.Duration
 	budget   int
+	handle   string // this agent's handle; only steps addressed to it are its work
 
 	submit func(agent.Task)
 	stop   chan struct{}
 	once   sync.Once
 
 	mu      sync.Mutex
-	stepFor map[string]string // taskID -> stepID
-	seen    map[string]bool   // stepIDs already submitted (avoid re-submit between polls)
+	pending map[string]stepMeta // taskID -> provenance (kept out of Task so the loop stays channel-blind)
+	seen    map[string]bool     // stepIDs already submitted (avoid re-submit between polls)
+	active  map[string]bool     // sessions with a task in flight (one active task per conversation)
+}
+
+// stepMeta is a task's channel provenance: the originating step, its conversation
+// session, and the reply contract. Kept in the channel, never in the Task.
+type stepMeta struct {
+	stepID       string
+	session      string
+	allowedInput map[string]any
 }
 
 // NewStep builds a step channel polling src every interval, stamping tasks with
-// budget.
-func NewStep(src StepSource, interval time.Duration, budget int) *Step {
+// budget. handle is the agent's own handle: only steps whose required caller is
+// this agent are its work (a step it merely owns is skipped).
+func NewStep(src StepSource, interval time.Duration, budget int, handle string) *Step {
 	if interval <= 0 {
 		interval = 5 * time.Second
 	}
-	return &Step{src: src, interval: interval, budget: budget, stop: make(chan struct{}),
-		stepFor: map[string]string{}, seen: map[string]bool{}}
+	return &Step{src: src, interval: interval, budget: budget, handle: handle, stop: make(chan struct{}),
+		pending: map[string]stepMeta{}, seen: map[string]bool{}, active: map[string]bool{}}
 }
 
 func (s *Step) Name() string { return "step" }
@@ -212,22 +247,48 @@ func (s *Step) scan(ctx context.Context) {
 		return
 	}
 	for _, st := range steps {
-		s.mu.Lock()
-		dup := s.seen[st.ID]
-		if !dup {
-			s.seen[st.ID] = true
+		if !s.addressedToMe(st) {
+			continue // a step the agent owns but is not the required caller of is not its work
 		}
-		s.mu.Unlock()
-		if dup {
+		session := sessionKey(st)
+		s.mu.Lock()
+		// One active task per conversation: a step for a busy session is deferred
+		// (not marked seen) so a later poll re-evaluates it once the session frees.
+		if s.seen[st.ID] || s.active[session] {
+			s.mu.Unlock()
 			continue
 		}
+		s.seen[st.ID] = true
+		s.active[session] = true
 		taskID := "step-" + st.ID
-		s.mu.Lock()
-		s.stepFor[taskID] = st.ID
+		s.pending[taskID] = stepMeta{stepID: st.ID, session: session, allowedInput: st.AllowedInput}
 		s.mu.Unlock()
 		s.submit(agent.Task{ID: taskID, Channel: "step", Budget: s.budget,
 			Messages: []agent.Message{{Role: agent.RoleUser, Content: promptFromStep(st)}}})
 	}
+}
+
+// addressedToMe reports whether a waiting step is this agent's to do: its
+// required caller must be this agent. An empty required caller (only test fakes
+// produce that; the kernel always sets it) is treated as addressed here.
+func (s *Step) addressedToMe(st StepInfo) bool {
+	return st.RequiredCaller == "" || sameHandle(st.RequiredCaller, s.handle)
+}
+
+// sessionKey groups a sender's steps into one conversation: the sender
+// (owner_handle) plus an optional thread carried in the envelope. Follow-ups
+// from the same sender/thread share a session.
+func sessionKey(st StepInfo) string {
+	sender := st.OwnerHandle
+	if thread, ok := st.PartialArgs["thread"].(string); ok && thread != "" {
+		return sender + "\x1f" + thread
+	}
+	return sender
+}
+
+// sameHandle compares two @handles ignoring an optional leading '@'.
+func sameHandle(a, b string) bool {
+	return strings.TrimPrefix(a, "@") == strings.TrimPrefix(b, "@")
 }
 
 // promptFromStep renders a step's parked request into the task prompt. A
@@ -243,12 +304,18 @@ func promptFromStep(st StepInfo) string {
 	return renderArgs(st.PartialArgs)
 }
 
-// Deliver completes the originating step with the task's answer, settling it
-// under the role law.
+// Deliver completes the originating step with the task's answer. Completing runs
+// the step's onward action, which delivers the reply (for @sys/sink the reply
+// rides in the completion transaction's args, readable by the sender). A failed
+// or interrupted task still completes (ack), so the sender's process is released
+// and the exchange never dangles.
 func (s *Step) Deliver(taskID string, out agent.Outcome) {
 	s.mu.Lock()
-	stepID, ok := s.stepFor[taskID]
-	delete(s.stepFor, taskID)
+	meta, ok := s.pending[taskID]
+	delete(s.pending, taskID)
+	if ok {
+		delete(s.active, meta.session) // free the conversation for its next queued step
+	}
 	s.mu.Unlock()
 	if !ok {
 		return
@@ -256,8 +323,60 @@ func (s *Step) Deliver(taskID string, out agent.Outcome) {
 	args := out.Answer
 	if args == nil {
 		args = map[string]any{"status": string(out.Status)}
+		if out.Reason != "" {
+			args["reason"] = out.Reason
+		}
+	} else {
+		args = shapeReply(args, meta.allowedInput)
 	}
-	_ = s.src.CompleteStep(context.Background(), stepID, args)
+	_ = s.src.CompleteStep(context.Background(), meta.stepID, args)
+}
+
+// shapeReply maps the loop's reply (the reply tool's {answer: text}) onto the
+// onward action's reply contract. For an unconstrained onward (e.g. @sys/sink)
+// the reply rides through as {answer: text} (readable in the completion tx args).
+// For a delivery action that declares a text-carrying field (text/message/…) the
+// answer is placed under it, so a bridge's action shape drives the mapping — the
+// agent needs no per-bridge knowledge. When it cannot map confidently, the reply
+// passes through unchanged and the kernel validates.
+func shapeReply(answer, allowed map[string]any) map[string]any {
+	text, ok := answer["answer"].(string)
+	if !ok {
+		return answer // non-standard reply; pass through
+	}
+	props, _ := allowed["properties"].(map[string]any)
+	if len(props) == 0 {
+		return map[string]any{"answer": text} // unconstrained onward (sink): reply rides in tx args
+	}
+	for _, name := range []string{"text", "message", "answer", "body", "reply", "content"} {
+		if isStringProp(props, name) {
+			return map[string]any{name: text}
+		}
+	}
+	if only := onlyStringProp(props); only != "" {
+		return map[string]any{only: text}
+	}
+	return answer // cannot map confidently; let the kernel validate
+}
+
+func isStringProp(props map[string]any, name string) bool {
+	m, ok := props[name].(map[string]any)
+	return ok && m["type"] == "string"
+}
+
+// onlyStringProp returns the sole string property's name, or "" if there is not
+// exactly one.
+func onlyStringProp(props map[string]any) string {
+	found := ""
+	for name, spec := range props {
+		if m, ok := spec.(map[string]any); ok && m["type"] == "string" {
+			if found != "" {
+				return ""
+			}
+			found = name
+		}
+	}
+	return found
 }
 
 // Steering is unused by the step channel in v1.
