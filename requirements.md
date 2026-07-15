@@ -35,13 +35,16 @@ private protocol.
 ## 2. Packages and implementation constraints
 
 Use Go. `go build ./...` and `go test ./...` must pass **offline** — no kernel, no LLM, no network.
-Only two seams are load-bearing, so there are exactly three Go packages:
+The Go packages:
 
 ```text
 agent/           the loop: pure, interface-driven
 juice/           kernel client: the only package that speaks HTTP to the kernel
-cmd/juice-agent/ package main: everything else (lifecycle, config, home resolution, channels,
-                 the policy shell, the maker, the bench runner)
+channels/        the intake/egress channels: the generic Step channel, HTTP, and the
+                 service-channel driver (with a per-pair loop guard) any notified service reuses;
+                 pure over interfaces (dedicated-service I/O lives in the cmd adapters)
+cmd/juice-agent/ package main: everything else (lifecycle, config, home resolution, the channel
+                 adapters over the client, the policy shell, the maker, the bench runner)
 bench/           experiment-suite data (tasks.json, results/) — no Go
 flows/           end-to-end shell flows against the compiled binary — no Go
 ```
@@ -50,8 +53,16 @@ Dependency law, mirroring the kernel's own (kernel §2):
 
 - `agent` must import neither `net/http` nor `juice`. It depends only on the small interfaces it
   defines (`Decider`, `Catalog`, `Runner`, `Transcript`); tests use fakes. This keeps the loop pure.
+- `channels` imports `agent` only — never `juice` or `net/http` on the kernel path. Each channel speaks
+  the kernel through an interface (`StepSource`, `ServiceActions`) the `cmd` adapters implement, so
+  channels stay kernel-free like the loop. Notification-driven services share one `Service` driver
+  (poll→read→post→complete, at-least-once via a persisted read cursor, a per-(session, sender) loop
+  guard); a new such channel supplies only a `ServiceActions` adapter (read/post/ack + session key +
+  auth), never the delivery logic. A channel claims the agent's steps by `owner_handle`; the generic
+  Step channel excludes claimed senders.
 - `juice` is the only package that speaks HTTP to the kernel.
-- `cmd/juice-agent` depends on both and is the sole `package main`.
+- `cmd/juice-agent` depends on all of them, wires the client into the channel adapters, and is the sole
+  `package main`.
 
 Keep file and package counts small; name files for their function; do not split a file for size
 alone. **Every production Go file must have a corresponding `_test.go`** with independent tests for
@@ -258,6 +269,13 @@ configuration, not architecture. Implementations:
   (`required_caller = @handle`); the step's `partial_args` carry the request; completing the step
   delivers the outcome under the role law (kernel §10). This makes `@sys/message` and any other agent
   an input with zero pairwise integration.
+- `service` — a dedicated notification-driven service (e.g. juice-ui `@chat`): the generic `Service`
+  driver polls the service's notification steps, reads each conversation's new messages, runs the loop,
+  posts the reply, and completes the step (at-least-once via a persisted read cursor), with a
+  per-(session, sender) loop guard. A channel supplies only its read/post/ack actions, session key, and
+  grant recipe (the cmd adapter); the delivery logic is shared. The guard is configured per channel
+  under `channels.<name>.loop`: more than `max_events` replies to one counterpart within
+  `window_seconds` trips a `cooldown_seconds` pause; omitted numbers default to `20 / 60s / 60s`.
 - `http` — Juice-independent: a local HTTP endpoint accepting tasks directly, enabled only when
   `channels.http.addr` is non-empty.
 - `cli` — a one-shot dev surface (`juice-agent task "<prompt>"`), needing no channel; it runs one
@@ -375,7 +393,7 @@ removes the binary only and never `$JUICE_HOME`.
 | `compact_bytes`    | `262144`               | agent | transcript byte budget triggering compaction (§7)                             |
 | `rate_tasks`       | `true`                 | agent | run the post-task rating pass (§8)                                            |
 | `maker`            | `{enabled:false, min_repeats:3, window:50, budget:40, threshold:0.85}` | agent | self-extension trigger (§8)       |
-| `channels`         | step always on         | agent | `step {poll_seconds}` (always present, §11 rule 6) and optional `http {addr}` |
+| `channels`         | step always on         | agent | `step {poll_seconds}` (always present, §11 rule 6), optional `http {addr}`, and optional `chat {enabled, poll_seconds, loop{enabled, max_events, window_seconds, cooldown_seconds}}` (the juice-ui @chat channel) |
 
 `handle`, `data_dir`, and the persona/knowledge/memory filenames are not config keys: the handle is
 the home directory's name (CLI arg / `AGENT_HANDLE`), `data_dir` is derived as `<home>/data`, and the

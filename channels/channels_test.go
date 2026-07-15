@@ -1,4 +1,4 @@
-package main
+package channels
 
 import (
 	"bytes"
@@ -175,6 +175,26 @@ func TestStepChannelSkipsForeignRequiredCaller(t *testing.T) {
 	defer mu.Unlock()
 	if len(ids) != 1 || ids[0] != "step-mine" {
 		t.Fatalf("submitted %v, want only [step-mine] (foreign step skipped)", ids)
+	}
+}
+
+// A step whose sender (owner_handle) is claimed by a dedicated channel is left
+// for that channel, even though it is addressed to the agent.
+func TestStepChannelExcludesClaimedSource(t *testing.T) {
+	src := &fakeStepSource{steps: []StepInfo{
+		{ID: "generic", OwnerHandle: "@alice", RequiredCaller: "@agent", PartialArgs: map[string]any{"message": "hi"}},
+		{ID: "chat", OwnerHandle: "@chat", RequiredCaller: "@agent", PartialArgs: map[string]any{"room": "r1"}},
+	}}
+	ch := NewStep(src, 2*time.Millisecond, 20, "@agent", "@chat")
+	var ids []string
+	var mu sync.Mutex
+	ch.Start(context.Background(), func(tk agent.Task) { mu.Lock(); ids = append(ids, tk.ID); mu.Unlock() })
+	time.Sleep(20 * time.Millisecond)
+	ch.Stop()
+	mu.Lock()
+	defer mu.Unlock()
+	if len(ids) != 1 || ids[0] != "step-generic" {
+		t.Fatalf("submitted %v, want only [step-generic] (@chat step left for the chat channel)", ids)
 	}
 }
 

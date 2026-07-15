@@ -1,7 +1,8 @@
 # Channel Mechanism — Design Notes (settled & verified)
 
-Status: **settled**, every claim driven on a throwaway kernel (2026-07-14). No
-agent code written. Supersedes all earlier framings in this file's history.
+Status: **settled**. The mechanism was driven on a throwaway kernel (2026-07-14);
+the intake/egress harness is now implemented in `cmd/juice-agent` (2026-07-15).
+Supersedes all earlier framings in this file's history.
 
 ## 1. Purpose
 
@@ -16,15 +17,20 @@ it** (`required_caller = @agent`). A message *back* is the **completion** of tha
 step: completing runs the step's **onward action**, which is the reply's delivery
 path. This is what a continuation is — "when you have the result, run this with it."
 
-- **Intake** — poll `GET /v1/steps?status=waiting`. The kernel surfaces only steps
-  whose `required_caller` is the agent, so the inbox *is* "messages addressed to
-  me." The **channel** is `owner_handle` (the sender/bridge); the **envelope**
-  (request + reply routing) is `partial_args`.
+- **Intake** — poll `GET /v1/steps?status=waiting`. The kernel returns steps where
+  the agent is **owner OR required caller** (`CanListStep`), so the agent keeps
+  only those whose `required_caller` is itself — steps it merely created/owns are
+  skipped. Its inbox is then "messages addressed to me." The **channel** is
+  `owner_handle` (the sender/bridge); the **envelope** (request + reply routing)
+  is `partial_args`.
 - **Egress** — the agent **completes the step** with its reply; the step's onward
   action runs **in the creator's process** and delivers. For a platform bridge the
-  onward action is the bridge's push action (e.g. `@slackbridge/post`); for
-  agent↔agent it can be `@sys/sink` and the peer polls a fresh reply message.
-  `@sys/message → @sys/sink` is just the degenerate "notify, deliver nothing" case.
+  onward action is the bridge's push action (e.g. `@slackbridge/post`), which posts
+  the reply to the platform. For an `@sys/message` sender (agent↔agent, or the UI)
+  the onward is `@sys/sink`: the reply is **not** a fresh message back — it rides in
+  the **completion transaction's args**, which the sender reads (watch the step
+  until `done`, then read the completing tx's `args`). `@sys/message → @sys/sink`
+  is the degenerate "notify" case.
 - **Funding** — reasoning is free (`@sys/llm/*` = 0); **delivery is funded by the
   step's parked price** (the sender/bridge prepaid it when minting); any **paid
   tools** the agent calls while reasoning are self-funded `run`s from its wallet
@@ -130,8 +136,10 @@ bounded-price paid service.
 - Egress via completion pushed real deliveries to SMS/Slack recorder endpoints with
   correct routing and rich media; the agent needed no permission on the bridges'
   private delivery actions.
-- Addressing: a step to `@other` was invisible to `@agent` (kernel routes by
-  `required_caller`).
+- Addressing: the kernel returns steps where the agent is owner OR required caller
+  (`CanListStep`); the agent filters to `required_caller == @agent`, skipping steps
+  it owns. (A step to `@other`, where the agent is neither party, never appears at
+  all.)
 - Rich steps mint without WASM via `POST /v1/steps` off a seed outbox trace
   (many steps per seed).
 - Steps expose `owner_handle` (channel key), `partial_args`, `action` (onward),

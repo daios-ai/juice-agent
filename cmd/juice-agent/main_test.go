@@ -8,6 +8,7 @@ import (
 	"reflect"
 	"testing"
 
+	"github.com/daios-ai/juice-agent/channels"
 	"github.com/daios-ai/juice-agent/juice"
 )
 
@@ -15,9 +16,10 @@ import (
 // interfaces the higher layers depend on. If a method drifts, this fails to
 // build rather than at runtime.
 var (
-	_ Kernel     = (*juice.Client)(nil)
-	_ Publisher  = (*juice.Client)(nil)
-	_ StepSource = stepAdapter{}
+	_ Kernel                 = (*juice.Client)(nil)
+	_ Publisher              = (*juice.Client)(nil)
+	_ channels.StepSource    = stepAdapter{}
+	_ channels.ServiceActions = (*chatAdapter)(nil)
 )
 
 func TestLoggerEmitsStructuredJSON(t *testing.T) {

@@ -21,6 +21,8 @@ type fakeKernel struct {
 	runResults  map[string]map[string]any // action -> result
 	lastRunArgs map[string]any
 	rated       map[string]any
+	connectors  []map[string]any // returned under /v1/me connectors
+	lastGrant   map[string]any   // last POST /v1/grants body
 }
 
 func newFakeKernel() *fakeKernel {
@@ -99,7 +101,17 @@ func (f *fakeKernel) handler() http.Handler {
 		if !authed(w, r) {
 			return
 		}
-		writeJSON(w, 200, map[string]any{"id": "u1", "handle": "@agent", "available": 500, "locked": 0})
+		writeJSON(w, 200, map[string]any{"id": "u1", "handle": "@agent", "available": 500, "locked": 0,
+			"connectors": f.connectors})
+	})
+
+	mux.HandleFunc("/v1/grants", func(w http.ResponseWriter, r *http.Request) {
+		if !authed(w, r) {
+			return
+		}
+		body, _ := io.ReadAll(r.Body)
+		json.Unmarshal(body, &f.lastGrant)
+		writeJSON(w, 200, map[string]any{"status": "granted"})
 	})
 
 	return mux
@@ -298,6 +310,55 @@ func TestIsRetryable(t *testing.T) {
 	for i, c := range cases {
 		if got := IsRetryable(c.err); got != c.want {
 			t.Errorf("case %d (%v): IsRetryable = %v, want %v", i, c.err, got, c.want)
+		}
+	}
+}
+
+func TestConnectGrantPostsSelectorAndToken(t *testing.T) {
+	f := newFakeKernel()
+	c := startFake(t, f)
+	if err := c.ConnectGrant(context.Background(), "@chat/msg", "key-abc"); err != nil {
+		t.Fatalf("connect grant: %v", err)
+	}
+	if f.lastGrant["selector"] != "@chat/msg" || f.lastGrant["token"] != "key-abc" {
+		t.Fatalf("grant body = %v", f.lastGrant)
+	}
+}
+
+func TestMeDecodesConnectors(t *testing.T) {
+	f := newFakeKernel()
+	f.connectors = []map[string]any{{
+		"directory": "@chat/msg",
+		"actions":   []map[string]any{{"action": "@chat/msg/read"}, {"action": "@chat/msg/message"}},
+	}}
+	c := startFake(t, f)
+	self, err := c.Me(context.Background())
+	if err != nil {
+		t.Fatalf("me: %v", err)
+	}
+	if len(self.Connectors) != 1 || self.Connectors[0].Directory != "@chat/msg" {
+		t.Fatalf("connectors = %+v", self.Connectors)
+	}
+	if len(self.Connectors[0].Actions) != 2 || self.Connectors[0].Actions[0].Action != "@chat/msg/read" {
+		t.Fatalf("connector actions = %+v", self.Connectors[0].Actions)
+	}
+}
+
+func TestIsGrantRequired(t *testing.T) {
+	cases := []struct {
+		err  error
+		want bool
+	}{
+		{&KernelError{Status: 403, Code: "grant_required"}, true},
+		{&KernelError{Status: 403, Code: ""}, true}, // defensive status fallback
+		{&KernelError{Status: 401, Code: "unauthenticated"}, false},
+		{&KernelError{Status: 500, Code: "internal"}, false},
+		{errors.New("plain"), false},
+		{nil, false},
+	}
+	for i, c := range cases {
+		if got := IsGrantRequired(c.err); got != c.want {
+			t.Errorf("case %d (%v): IsGrantRequired = %v, want %v", i, c.err, got, c.want)
 		}
 	}
 }

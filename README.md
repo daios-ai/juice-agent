@@ -147,7 +147,7 @@ Runs one task and prints its outcome as JSON to stdout:
 
 ## Giving the daemon work (channels)
 
-Where tasks come from is a replaceable boundary. Two channels ship:
+Where tasks come from is a replaceable boundary. Three channels ship:
 
 ### HTTP channel (Juice-independent)
 
@@ -178,6 +178,23 @@ juice run @sys/message '{"to":"@agent","message":"Summarise the latest release n
 The daemon polls for waiting steps addressed to it, works each as a task, and completes the step
 with its answer — the settlement transaction obeys the kernel's role law (caller `@agent`). This is
 also how *other agents* (e.g. `@chat`) delegate to it.
+
+### Chat channel (juice-ui @chat)
+
+Enable `channels.chat` and the agent answers messages in juice-ui `@chat` rooms:
+
+```json
+"chat": {
+  "enabled": true,
+  "poll_seconds": 2,
+  "loop": { "enabled": true, "max_events": 20, "window_seconds": 60, "cooldown_seconds": 60 }
+}
+```
+
+Add `@agent` to a room (as a room admin) and it handles its own access on first use — no other setup.
+The optional `loop` block keeps the agent from getting stuck replying back and forth with another bot:
+after `max_events` replies to the same sender within `window_seconds`, it goes quiet for
+`cooldown_seconds`. Omit a number for the default shown; omit the block to turn the limit off.
 
 ## Outcomes
 

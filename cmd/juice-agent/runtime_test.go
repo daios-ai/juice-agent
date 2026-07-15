@@ -7,6 +7,7 @@ import (
 	"time"
 
 	"github.com/daios-ai/juice-agent/agent"
+	"github.com/daios-ai/juice-agent/channels"
 )
 
 // captureChannel records deliveries and can inject one task at Start.
@@ -72,7 +73,7 @@ func newExecutor(dir string) *Executor {
 func TestRuntimeRoutesOutcomeBackToChannel(t *testing.T) {
 	ch := &captureChannel{name: "test", seed: &agent.Task{ID: "j1", Channel: "test", Budget: 10,
 		Messages: []agent.Message{{Role: agent.RoleUser, Content: "hi"}}}}
-	rt := NewRuntime(newExecutor(t.TempDir()), []Channel{ch}, 2, func(string, map[string]any) {})
+	rt := NewRuntime(newExecutor(t.TempDir()), []channels.Channel{ch}, 2, func(string, map[string]any) {})
 
 	ctx := context.Background()
 	if err := rt.Start(ctx, 2); err != nil {

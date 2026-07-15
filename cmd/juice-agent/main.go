@@ -19,6 +19,7 @@ import (
 	"time"
 
 	"github.com/daios-ai/juice-agent/agent"
+	"github.com/daios-ai/juice-agent/channels"
 	"github.com/daios-ai/juice-agent/juice"
 	"golang.org/x/term"
 )
@@ -194,14 +195,14 @@ func runServe(_ []string, handle string, stdinPass bool) error {
 		log.event("recovery", map[string]any{"interrupted": marked})
 	}
 
-	channels := buildChannels(cfg, cl)
-	rt := NewRuntime(exec, channels, cfg.Concurrency, log.event)
+	chans := buildChannels(cfg, cl, log.event)
+	rt := NewRuntime(exec, chans, cfg.Concurrency, log.event)
 	if err := rt.Start(runCtx, cfg.Concurrency); err != nil {
 		return err
 	}
-	fields := map[string]any{"channels": channelNames(channels), "concurrency": cfg.Concurrency}
-	for _, ch := range channels {
-		if hc, ok := ch.(*HTTP); ok {
+	fields := map[string]any{"channels": channelNames(chans), "concurrency": cfg.Concurrency}
+	for _, ch := range chans {
+		if hc, ok := ch.(*channels.HTTP); ok {
 			fields["http_addr"] = hc.Addr
 		}
 	}
@@ -241,20 +242,46 @@ func runTask(args []string, handle string, stdinPass bool) error {
 	return enc.Encode(out)
 }
 
-// buildChannels constructs the enabled intake surfaces from config.
-func buildChannels(cfg Config, cl *juice.Client) []Channel {
-	var out []Channel
+// buildChannels constructs the enabled intake surfaces from config. A dedicated
+// service channel (chat) claims its own steps, so its sender handle is excluded
+// from the generic step channel — the two partition the agent's steps without
+// overlap. The chat channel is the generic Service driver configured by a
+// chatAdapter (the reference: a new service is an adapter + this wiring).
+func buildChannels(cfg Config, cl *juice.Client, log func(string, map[string]any)) []channels.Channel {
+	var out []channels.Channel
+	var exclude []string
+	chatOn := cfg.Channels.Chat != nil && cfg.Channels.Chat.Enabled
+	if chatOn {
+		exclude = append(exclude, chatHandle)
+	}
 	if hc := cfg.Channels.HTTP; hc != nil && hc.Addr != "" {
-		out = append(out, NewHTTP(hc.Addr, cfg.DefaultBudget))
+		out = append(out, channels.NewHTTP(hc.Addr, cfg.DefaultBudget))
 	}
 	if sc := cfg.Channels.Step; sc != nil {
 		interval := time.Duration(sc.PollSeconds) * time.Second
-		out = append(out, NewStep(stepAdapter{cl: cl}, interval, cfg.DefaultBudget, cfg.Handle))
+		out = append(out, channels.NewStep(stepAdapter{cl: cl}, interval, cfg.DefaultBudget, cfg.Handle, exclude...))
+	}
+	if chatOn {
+		cc := cfg.Channels.Chat
+		out = append(out, channels.NewService(&chatAdapter{cl: cl, handle: cfg.Handle}, channels.ServiceConfig{
+			Name:     "chat",
+			Handle:   cfg.Handle,
+			Interval: time.Duration(cc.PollSeconds) * time.Second,
+			Budget:   cfg.DefaultBudget,
+			DataDir:  cfg.DataDir,
+			Loop: channels.LoopConfig{
+				Enabled:  cc.Loop.Enabled,
+				Max:      cc.Loop.MaxEvents,
+				Window:   time.Duration(cc.Loop.WindowSeconds) * time.Second,
+				Cooldown: time.Duration(cc.Loop.CooldownSeconds) * time.Second,
+			},
+			Log: log,
+		}))
 	}
 	return out
 }
 
-func channelNames(cs []Channel) []string {
+func channelNames(cs []channels.Channel) []string {
 	out := make([]string, 0, len(cs))
 	for _, c := range cs {
 		out = append(out, c.Name())

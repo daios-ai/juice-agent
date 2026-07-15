@@ -1,4 +1,4 @@
-package main
+package channels
 
 import (
 	"context"
@@ -187,7 +187,8 @@ type Step struct {
 	src      StepSource
 	interval time.Duration
 	budget   int
-	handle   string // this agent's handle; only steps addressed to it are its work
+	handle   string          // this agent's handle; only steps addressed to it are its work
+	exclude  map[string]bool // owner_handles claimed by a dedicated channel (e.g. @chat); skipped here
 
 	submit func(agent.Task)
 	stop   chan struct{}
@@ -209,12 +210,19 @@ type stepMeta struct {
 
 // NewStep builds a step channel polling src every interval, stamping tasks with
 // budget. handle is the agent's own handle: only steps whose required caller is
-// this agent are its work (a step it merely owns is skipped).
-func NewStep(src StepSource, interval time.Duration, budget int, handle string) *Step {
+// this agent are its work (a step it merely owns is skipped). exclude names
+// owner_handles a dedicated channel claims (e.g. "@chat") — steps from those
+// senders are left for that channel, so the generic and dedicated channels
+// partition the agent's steps without overlap.
+func NewStep(src StepSource, interval time.Duration, budget int, handle string, exclude ...string) *Step {
 	if interval <= 0 {
 		interval = 5 * time.Second
 	}
-	return &Step{src: src, interval: interval, budget: budget, handle: handle, stop: make(chan struct{}),
+	ex := map[string]bool{}
+	for _, h := range exclude {
+		ex[strings.TrimPrefix(h, "@")] = true
+	}
+	return &Step{src: src, interval: interval, budget: budget, handle: handle, exclude: ex, stop: make(chan struct{}),
 		pending: map[string]stepMeta{}, seen: map[string]bool{}, active: map[string]bool{}}
 }
 
@@ -269,9 +277,13 @@ func (s *Step) scan(ctx context.Context) {
 }
 
 // addressedToMe reports whether a waiting step is this agent's to do: its
-// required caller must be this agent. An empty required caller (only test fakes
-// produce that; the kernel always sets it) is treated as addressed here.
+// required caller must be this agent, and its sender must not be claimed by a
+// dedicated channel. An empty required caller (only test fakes produce that; the
+// kernel always sets it) is treated as addressed here.
 func (s *Step) addressedToMe(st StepInfo) bool {
+	if s.exclude[strings.TrimPrefix(st.OwnerHandle, "@")] {
+		return false // a dedicated channel (e.g. chat) claims this sender
+	}
 	return st.RequiredCaller == "" || sameHandle(st.RequiredCaller, s.handle)
 }
 
@@ -383,3 +395,16 @@ func onlyStringProp(props map[string]any) string {
 func (s *Step) Steering(string) []agent.Message { return nil }
 
 func (s *Step) Stop() { s.once.Do(func() { close(s.stop) }) }
+
+// Channel is one task-intake surface. Start begins producing tasks (submitting
+// each via the callback) and returns once producers are running; Deliver reports
+// a finished task's outcome; Steering supplies optional mid-task input; Stop
+// halts production. Every channel — the generic Step channel, HTTP, and dedicated
+// service channels like chat — satisfies this one interface.
+type Channel interface {
+	Name() string
+	Start(ctx context.Context, submit func(agent.Task)) error
+	Deliver(taskID string, out agent.Outcome)
+	Steering(taskID string) []agent.Message
+	Stop()
+}

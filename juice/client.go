@@ -564,17 +564,37 @@ func (c *Client) ResolveID(ctx context.Context, ref string) (string, error) {
 
 // Self is the authenticated identity (GET /v1/me).
 type Self struct {
-	ID        string `json:"id"`
-	Handle    string `json:"handle"`
-	Available int    `json:"available"`
-	Locked    int    `json:"locked"`
+	ID         string      `json:"id"`
+	Handle     string      `json:"handle"`
+	Available  int         `json:"available"`
+	Locked     int         `json:"locked"`
+	Connectors []Connector `json:"connectors"`
 }
 
-// Me returns the client's own identity and wallet.
+// Connector is a directory-grouped grant node from GET /v1/me: the folder the
+// granted actions share (e.g. "@chat/msg") and the actions granted beneath it. It
+// lets a caller check whether a grant selector is already connected without
+// exposing any token.
+type Connector struct {
+	Directory string `json:"directory"`
+	Actions   []struct {
+		Action string `json:"action"`
+	} `json:"actions"`
+}
+
+// Me returns the client's own identity, wallet, and grant connectors.
 func (c *Client) Me(ctx context.Context) (Self, error) {
 	var s Self
 	err := c.do(ctx, http.MethodGet, "/v1/me", nil, &s)
 	return s, err
+}
+
+// ConnectGrant attaches a static token as the grant for selector (a
+// delegated_bearer group): POST /v1/grants {selector, token} (kernel API §8). It
+// is idempotent — reconnecting overwrites the stored token.
+func (c *Client) ConnectGrant(ctx context.Context, selector, token string) error {
+	return c.do(ctx, http.MethodPost, "/v1/grants",
+		map[string]any{"selector": selector, "token": token}, nil)
 }
 
 // Step is a waiting step addressed to the client (a task-intake record).
@@ -631,6 +651,19 @@ func Code(err error) string {
 		return ke.Code
 	}
 	return ""
+}
+
+// IsGrantRequired reports whether err is the kernel's lazy-consent rejection
+// (§8): running an action the caller has not yet granted (code "grant_required",
+// HTTP 403). Callers provision the grant and retry. The status fallback is
+// defensive: a grant_required always carries the code, but any 403 is treated as a
+// missing grant so provisioning is attempted rather than the call failing outright.
+func IsGrantRequired(err error) bool {
+	if Code(err) == "grant_required" {
+		return true
+	}
+	var ke *KernelError
+	return errors.As(err, &ke) && ke.Status == http.StatusForbidden
 }
 
 // IsRetryable reports whether err is worth retrying with backoff: transport

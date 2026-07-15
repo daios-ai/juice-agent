@@ -43,6 +43,7 @@ type MemoryConfig struct {
 type ChannelConfig struct {
 	Step *StepChannelConfig `json:"step,omitempty"`
 	HTTP *HTTPChannelConfig `json:"http,omitempty"`
+	Chat *ChatChannelConfig `json:"chat,omitempty"`
 }
 
 type StepChannelConfig struct {
@@ -51,6 +52,25 @@ type StepChannelConfig struct {
 
 type HTTPChannelConfig struct {
 	Addr string `json:"addr"`
+}
+
+// ChatChannelConfig enables the chat channel (juice-ui @chat rooms). Off by
+// default; the agent must be a room member (the @chat/msg grant is provisioned on
+// demand — see chatAdapter.ensureGrant).
+type ChatChannelConfig struct {
+	Enabled     bool              `json:"enabled"`
+	PollSeconds int               `json:"poll_seconds"`
+	Loop        LoopChannelConfig `json:"loop"`
+}
+
+// LoopChannelConfig bounds the chat channel's reply rate to any one counterpart,
+// breaking runaway agent↔agent exchanges. Zero fields fall back to the driver's
+// defaults (20 / 60s / 60s).
+type LoopChannelConfig struct {
+	Enabled         bool `json:"enabled"`
+	MaxEvents       int  `json:"max_events"`
+	WindowSeconds   int  `json:"window_seconds"`
+	CooldownSeconds int  `json:"cooldown_seconds"`
 }
 
 // DefaultConfig is the safe baseline applied when a key is absent. Identity
