@@ -8,7 +8,7 @@ import (
 // clock is a controllable time source for the guard's injected now().
 type clock struct{ t time.Time }
 
-func (c *clock) now() time.Time  { return c.t }
+func (c *clock) now() time.Time      { return c.t }
 func (c *clock) add(d time.Duration) { c.t = c.t.Add(d) }
 
 func newClock() *clock { return &clock{t: time.Unix(1_700_000_000, 0)} }

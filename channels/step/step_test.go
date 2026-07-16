@@ -1,87 +1,23 @@
-package channels
+package step
 
 import (
-	"bytes"
 	"context"
-	"encoding/json"
-	"net/http"
-	"net/http/httptest"
-	"strings"
 	"sync"
 	"testing"
 	"time"
 
 	"github.com/daios-ai/juice-agent/agent"
+	"github.com/daios-ai/juice-agent/channels"
 )
-
-func TestHTTPChannelSubmitsAndDelivers(t *testing.T) {
-	h := NewHTTP(":0", 50) // addr unused; we drive handlers directly
-	var got agent.Task
-	var wg sync.WaitGroup
-	wg.Add(1)
-	h.submit = func(tk agent.Task) { got = tk; wg.Done() }
-	h.outcomes = map[string]agent.Outcome{}
-	h.done = map[string]chan struct{}{}
-
-	// POST /task
-	body, _ := json.Marshal(map[string]any{"prompt": "do the thing", "budget": 30})
-	req := httptest.NewRequest(http.MethodPost, "/task", bytes.NewReader(body))
-	rec := httptest.NewRecorder()
-	h.handleTask(rec, req)
-	if rec.Code != http.StatusAccepted {
-		t.Fatalf("status = %d, want 202", rec.Code)
-	}
-	var resp struct {
-		TaskID string `json:"task_id"`
-	}
-	json.Unmarshal(rec.Body.Bytes(), &resp)
-	wg.Wait()
-
-	if got.Channel != "http" || got.Budget != 30 {
-		t.Fatalf("task = %+v", got)
-	}
-	if len(got.Messages) != 1 || got.Messages[0].Content != "do the thing" {
-		t.Fatalf("messages = %+v", got.Messages)
-	}
-
-	// GET /task/{id} before delivery -> running
-	rec = httptest.NewRecorder()
-	h.handleOutcome(rec, httptest.NewRequest(http.MethodGet, "/task/"+resp.TaskID, nil))
-	if rec.Code != http.StatusAccepted {
-		t.Fatalf("pre-delivery status = %d, want 202", rec.Code)
-	}
-
-	// Deliver, then GET -> outcome
-	h.Deliver(resp.TaskID, agent.Outcome{Status: agent.StatusAnswered, Answer: map[string]any{"answer": "did it"}})
-	rec = httptest.NewRecorder()
-	h.handleOutcome(rec, httptest.NewRequest(http.MethodGet, "/task/"+resp.TaskID, nil))
-	if rec.Code != http.StatusOK {
-		t.Fatalf("post-delivery status = %d, want 200", rec.Code)
-	}
-	if !strings.Contains(rec.Body.String(), "did it") {
-		t.Fatalf("outcome body = %s", rec.Body.String())
-	}
-}
-
-func TestHTTPMissingPromptRejected(t *testing.T) {
-	h := NewHTTP(":0", 50)
-	h.done = map[string]chan struct{}{}
-	rec := httptest.NewRecorder()
-	body, _ := json.Marshal(map[string]any{"budget": 10})
-	h.handleTask(rec, httptest.NewRequest(http.MethodPost, "/task", bytes.NewReader(body)))
-	if rec.Code != http.StatusBadRequest {
-		t.Fatalf("status = %d, want 400", rec.Code)
-	}
-}
 
 // fakeStepSource serves canned waiting steps and records completions.
 type fakeStepSource struct {
 	mu        sync.Mutex
-	steps     []StepInfo
+	steps     []channels.StepInfo
 	completed map[string]map[string]any
 }
 
-func (f *fakeStepSource) WaitingSteps(context.Context) ([]StepInfo, error) {
+func (f *fakeStepSource) WaitingSteps(context.Context) ([]channels.StepInfo, error) {
 	f.mu.Lock()
 	defer f.mu.Unlock()
 	return f.steps, nil
@@ -104,7 +40,7 @@ func (f *fakeStepSource) CompleteStep(_ context.Context, id string, args map[str
 }
 
 func TestStepChannelSubmitsAndCompletes(t *testing.T) {
-	src := &fakeStepSource{steps: []StepInfo{
+	src := &fakeStepSource{steps: []channels.StepInfo{
 		{ID: "s1", OwnerHandle: "@chat", RequiredCaller: "@agent",
 			PartialArgs: map[string]any{"message": "please summarise X"}, CreatedBy: "@chat"},
 	}}
@@ -145,7 +81,7 @@ func TestStepChannelSubmitsAndCompletes(t *testing.T) {
 }
 
 func TestStepChannelDoesNotResubmit(t *testing.T) {
-	src := &fakeStepSource{steps: []StepInfo{{ID: "s1", RequiredCaller: "@agent", PartialArgs: map[string]any{"message": "x"}}}}
+	src := &fakeStepSource{steps: []channels.StepInfo{{ID: "s1", RequiredCaller: "@agent", PartialArgs: map[string]any{"message": "x"}}}}
 	ch := NewStep(src, 2*time.Millisecond, 20, "@agent")
 	var count int
 	var mu sync.Mutex
@@ -161,7 +97,7 @@ func TestStepChannelDoesNotResubmit(t *testing.T) {
 
 // A step the agent merely owns (addressed to someone else) is not its work.
 func TestStepChannelSkipsForeignRequiredCaller(t *testing.T) {
-	src := &fakeStepSource{steps: []StepInfo{
+	src := &fakeStepSource{steps: []channels.StepInfo{
 		{ID: "mine", OwnerHandle: "@alice", RequiredCaller: "@agent", PartialArgs: map[string]any{"message": "for me"}},
 		{ID: "theirs", OwnerHandle: "@agent", RequiredCaller: "@bob", PartialArgs: map[string]any{"message": "for bob"}},
 	}}
@@ -178,10 +114,10 @@ func TestStepChannelSkipsForeignRequiredCaller(t *testing.T) {
 	}
 }
 
-// A step whose sender (owner_handle) is claimed by a dedicated channel is left
-// for that channel, even though it is addressed to the agent.
+// A step whose sender (owner_handle) is claimed by a dedicated channel is left for
+// that channel, even though it is addressed to the agent.
 func TestStepChannelExcludesClaimedSource(t *testing.T) {
-	src := &fakeStepSource{steps: []StepInfo{
+	src := &fakeStepSource{steps: []channels.StepInfo{
 		{ID: "generic", OwnerHandle: "@alice", RequiredCaller: "@agent", PartialArgs: map[string]any{"message": "hi"}},
 		{ID: "chat", OwnerHandle: "@chat", RequiredCaller: "@agent", PartialArgs: map[string]any{"room": "r1"}},
 	}}
@@ -199,11 +135,11 @@ func TestStepChannelExcludesClaimedSource(t *testing.T) {
 }
 
 func TestSessionKey(t *testing.T) {
-	base := StepInfo{OwnerHandle: "@sms", PartialArgs: map[string]any{"message": "hi"}}
+	base := channels.StepInfo{OwnerHandle: "@sms", PartialArgs: map[string]any{"message": "hi"}}
 	if got := sessionKey(base); got != "@sms" {
 		t.Fatalf("no-thread session = %q, want @sms", got)
 	}
-	threaded := StepInfo{OwnerHandle: "@sms", PartialArgs: map[string]any{"thread": "+1555", "message": "hi"}}
+	threaded := channels.StepInfo{OwnerHandle: "@sms", PartialArgs: map[string]any{"thread": "+1555", "message": "hi"}}
 	if got := sessionKey(threaded); got != "@sms\x1f+1555" {
 		t.Fatalf("threaded session = %q", got)
 	}
@@ -216,7 +152,7 @@ func TestSessionKey(t *testing.T) {
 // Two steps in one conversation run one at a time; the second is picked up only
 // after the first is delivered.
 func TestStepChannelSerializesPerSession(t *testing.T) {
-	src := &fakeStepSource{steps: []StepInfo{
+	src := &fakeStepSource{steps: []channels.StepInfo{
 		{ID: "a", OwnerHandle: "@sms", RequiredCaller: "@agent", PartialArgs: map[string]any{"thread": "t1", "message": "1"}},
 		{ID: "b", OwnerHandle: "@sms", RequiredCaller: "@agent", PartialArgs: map[string]any{"thread": "t1", "message": "2"}},
 	}}
@@ -272,9 +208,9 @@ func TestShapeReply(t *testing.T) {
 }
 
 func TestStepChannelDeliverShapesToDeliveryAction(t *testing.T) {
-	// A step whose onward action declares a "text" field: the agent's answer must
-	// be delivered as {text: ...} so the delivery action (e.g. a bridge) sends it.
-	src := &fakeStepSource{steps: []StepInfo{{
+	// A step whose onward action declares a "text" field: the agent's answer must be
+	// delivered as {text: ...} so the delivery action (e.g. a bridge) sends it.
+	src := &fakeStepSource{steps: []channels.StepInfo{{
 		ID: "s1", OwnerHandle: "@smsbridge", RequiredCaller: "@agent",
 		ActionRef:    "@smsbridge/deliver",
 		PartialArgs:  map[string]any{"to": "+1555", "incoming": "hi"},
@@ -297,7 +233,7 @@ func TestStepChannelDeliverShapesToDeliveryAction(t *testing.T) {
 }
 
 func TestStepChannelDeliverFailedStillCompletes(t *testing.T) {
-	src := &fakeStepSource{steps: []StepInfo{{ID: "s1", RequiredCaller: "@agent", PartialArgs: map[string]any{"message": "x"}}}}
+	src := &fakeStepSource{steps: []channels.StepInfo{{ID: "s1", RequiredCaller: "@agent", PartialArgs: map[string]any{"message": "x"}}}}
 	ch := NewStep(src, 2*time.Millisecond, 20, "@agent")
 	var got agent.Task
 	var wg sync.WaitGroup

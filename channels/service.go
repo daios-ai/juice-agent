@@ -270,7 +270,7 @@ func freshFromOthers(msgs []Msg, after int64, handle string) (fresh []Msg, maxSe
 		if m.Seq > maxSeq {
 			maxSeq = m.Seq
 		}
-		if m.Seq > after && !sameHandle(m.From, handle) {
+		if m.Seq > after && !SameHandle(m.From, handle) {
 			fresh = append(fresh, m)
 		}
 	}

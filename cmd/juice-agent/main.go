@@ -20,6 +20,9 @@ import (
 
 	"github.com/daios-ai/juice-agent/agent"
 	"github.com/daios-ai/juice-agent/channels"
+	"github.com/daios-ai/juice-agent/channels/chat"
+	httpchan "github.com/daios-ai/juice-agent/channels/http"
+	"github.com/daios-ai/juice-agent/channels/step"
 	"github.com/daios-ai/juice-agent/juice"
 	"golang.org/x/term"
 )
@@ -202,7 +205,7 @@ func runServe(_ []string, handle string, stdinPass bool) error {
 	}
 	fields := map[string]any{"channels": channelNames(chans), "concurrency": cfg.Concurrency}
 	for _, ch := range chans {
-		if hc, ok := ch.(*channels.HTTP); ok {
+		if hc, ok := ch.(*httpchan.HTTP); ok {
 			fields["http_addr"] = hc.Addr
 		}
 	}
@@ -242,12 +245,18 @@ func runTask(args []string, handle string, stdinPass bool) error {
 	return enc.Encode(out)
 }
 
-// buildChannels constructs the enabled intake surfaces from config. A dedicated
-// service channel (chat) claims its own steps, so its sender handle is excluded
-// from the generic step channel — the two partition the agent's steps without
-// overlap. The chat channel is the generic Service driver configured by a
-// chatAdapter (the reference: a new service is an adapter + this wiring).
+// chatHandle is the sender the chat channel claims; the generic step channel
+// excludes it so the two partition the agent's steps without overlap.
+const chatHandle = "@chat"
+
+// buildChannels constructs the enabled intake surfaces from config. One
+// kernelAdapter is the single kernel bridge shared by every channel: the step
+// channel takes it as a channels.StepSource, chat as the full channels.Kernel. A
+// dedicated service channel (chat) claims its own steps, so its sender handle is
+// excluded from the step channel. Adding a channel is one case here plus a package
+// under channels/ (see requirements §10).
 func buildChannels(cfg Config, cl *juice.Client, log func(string, map[string]any)) []channels.Channel {
+	k := kernelAdapter{cl: cl}
 	var out []channels.Channel
 	var exclude []string
 	chatOn := cfg.Channels.Chat != nil && cfg.Channels.Chat.Enabled
@@ -255,28 +264,22 @@ func buildChannels(cfg Config, cl *juice.Client, log func(string, map[string]any
 		exclude = append(exclude, chatHandle)
 	}
 	if hc := cfg.Channels.HTTP; hc != nil && hc.Addr != "" {
-		out = append(out, channels.NewHTTP(hc.Addr, cfg.DefaultBudget))
+		out = append(out, httpchan.NewHTTP(hc.Addr, cfg.DefaultBudget))
 	}
 	if sc := cfg.Channels.Step; sc != nil {
 		interval := time.Duration(sc.PollSeconds) * time.Second
-		out = append(out, channels.NewStep(stepAdapter{cl: cl}, interval, cfg.DefaultBudget, cfg.Handle, exclude...))
+		out = append(out, step.NewStep(k, interval, cfg.DefaultBudget, cfg.Handle, exclude...))
 	}
 	if chatOn {
 		cc := cfg.Channels.Chat
-		out = append(out, channels.NewService(&chatAdapter{cl: cl, handle: cfg.Handle}, channels.ServiceConfig{
-			Name:     "chat",
-			Handle:   cfg.Handle,
-			Interval: time.Duration(cc.PollSeconds) * time.Second,
-			Budget:   cfg.DefaultBudget,
-			DataDir:  cfg.DataDir,
-			Loop: channels.LoopConfig{
+		out = append(out, chat.New(k, cfg.Handle,
+			time.Duration(cc.PollSeconds)*time.Second, cfg.DefaultBudget, cfg.DataDir,
+			channels.LoopConfig{
 				Enabled:  cc.Loop.Enabled,
 				Max:      cc.Loop.MaxEvents,
 				Window:   time.Duration(cc.Loop.WindowSeconds) * time.Second,
 				Cooldown: time.Duration(cc.Loop.CooldownSeconds) * time.Second,
-			},
-			Log: log,
-		}))
+			}, log))
 	}
 	return out
 }

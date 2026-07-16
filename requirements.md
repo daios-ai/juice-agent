@@ -40,11 +40,11 @@ The Go packages:
 ```text
 agent/           the loop: pure, interface-driven
 juice/           kernel client: the only package that speaks HTTP to the kernel
-channels/        the intake/egress channels: the generic Step channel, HTTP, and the
-                 service-channel driver (with a per-pair loop guard) any notified service reuses;
-                 pure over interfaces (dedicated-service I/O lives in the cmd adapters)
-cmd/juice-agent/ package main: everything else (lifecycle, config, home resolution, the channel
-                 adapters over the client, the policy shell, the maker, the bench runner)
+channels/        the intake/egress framework: Channel interface + the Kernel seam (channel.go),
+                 the generic service-channel driver with its loop guard (service.go, loopguard.go);
+                 one subpackage per channel — channels/step, channels/http, channels/chat, …
+cmd/juice-agent/ package main: everything else (lifecycle, config, home resolution, the one
+                 kernelAdapter over the client, the policy shell, the maker, the bench runner)
 bench/           experiment-suite data (tasks.json, results/) — no Go
 flows/           end-to-end shell flows against the compiled binary — no Go
 ```
@@ -53,13 +53,15 @@ Dependency law, mirroring the kernel's own (kernel §2):
 
 - `agent` must import neither `net/http` nor `juice`. It depends only on the small interfaces it
   defines (`Decider`, `Catalog`, `Runner`, `Transcript`); tests use fakes. This keeps the loop pure.
-- `channels` imports `agent` only — never `juice` or `net/http` on the kernel path. Each channel speaks
-  the kernel through an interface (`StepSource`, `ServiceActions`) the `cmd` adapters implement, so
-  channels stay kernel-free like the loop. Notification-driven services share one `Service` driver
-  (poll→read→post→complete, at-least-once via a persisted read cursor, a per-(session, sender) loop
-  guard); a new such channel supplies only a `ServiceActions` adapter (read/post/ack + session key +
-  auth), never the delivery logic. A channel claims the agent's steps by `owner_handle`; the generic
-  Step channel excludes claimed senders.
+- The `channels` framework root and every channel subpackage import `agent` (subpackages also import
+  `channels`) — never `juice` or `net/http` on the kernel path. A channel reaches the kernel only
+  through the `channels.Kernel` interface (list/complete steps, run actions, grants), implemented once
+  by a single `cmd` `kernelAdapter` and injected into every channel — so channels stay kernel-free like
+  the loop, and no per-channel kernel code lives outside `cmd`. Notification-driven services share one
+  `Service` driver (poll→read→post→complete, at-least-once via a persisted read cursor, a
+  per-(session, sender) loop guard); such a channel supplies only a `ServiceActions` adapter
+  (read/post/ack + session key + auth), never the delivery logic. A channel claims the agent's steps by
+  `owner_handle`; the generic Step channel excludes claimed senders.
 - `juice` is the only package that speaks HTTP to the kernel.
 - `cmd/juice-agent` depends on all of them, wires the client into the channel adapters, and is the sole
   `package main`.
@@ -280,6 +282,14 @@ configuration, not architecture. Implementations:
   `channels.http.addr` is non-empty.
 - `cli` — a one-shot dev surface (`juice-agent task "<prompt>"`), needing no channel; it runs one
   task and prints the outcome as JSON.
+
+**Adding a channel.** Create a subpackage `channels/<name>/` (importing `agent` + `channels`, never
+`juice`). For a notification-driven service, implement `channels.ServiceActions` (list steps, read,
+post, complete, session key, transient classification) over the injected `channels.Kernel`, put any
+auth (grant) recipe there, and return `channels.NewService(...)` to reuse the shared driver — the
+delivery loop, cursor, and loop guard come for free. A simple message-in-step bridge (SMS/Slack) needs
+no new package: the `step` channel already carries it. Then add one case to `buildChannels` in `cmd`
+and a config block. No kernel code is written outside the single `cmd` `kernelAdapter`.
 
 ## 11. Daemon lifecycle and configuration
 

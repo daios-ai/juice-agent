@@ -14,12 +14,13 @@ import (
 
 // Compile-time guarantees that the juice client and adapters satisfy the
 // interfaces the higher layers depend on. If a method drifts, this fails to
-// build rather than at runtime.
+// build rather than at runtime. kernelAdapter is the single kernel bridge for
+// every channel; satisfying channels.Kernel also satisfies channels.StepSource
+// (embedded), so the step channel is covered too.
 var (
-	_ Kernel                 = (*juice.Client)(nil)
-	_ Publisher              = (*juice.Client)(nil)
-	_ channels.StepSource    = stepAdapter{}
-	_ channels.ServiceActions = (*chatAdapter)(nil)
+	_ Kernel          = (*juice.Client)(nil)
+	_ Publisher       = (*juice.Client)(nil)
+	_ channels.Kernel = kernelAdapter{}
 )
 
 func TestLoggerEmitsStructuredJSON(t *testing.T) {
