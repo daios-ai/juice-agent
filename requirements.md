@@ -275,8 +275,11 @@ configuration, not architecture. Implementations:
   driver polls the service's notification steps, reads each conversation's new messages, runs the loop,
   posts the reply, and completes the step (at-least-once via a persisted read cursor), with a
   per-(session, sender) loop guard. A channel supplies only its read/post/ack actions, session key, and
-  grant recipe (the cmd adapter); the delivery logic is shared. The guard is configured per channel
-  under `channels.<name>.loop`: more than `max_events` replies to one counterpart within
+  grant recipe (the cmd adapter); the delivery logic is shared. For continuity, the driver keeps a
+  bounded per-session **conversation window** and seeds a task with the last `context_messages` visible
+  turns (the incoming messages and the agent's posted answers only — no tool traces) ahead of the new
+  message; the read cursor stays the dedup watermark, separate from context. The guard is configured
+  per channel under `channels.<name>.loop`: more than `max_events` replies to one counterpart within
   `window_seconds` trips a `cooldown_seconds` pause; omitted numbers default to `20 / 60s / 60s`.
 - `http` — Juice-independent: a local HTTP endpoint accepting tasks directly, enabled only when
   `channels.http.addr` is non-empty.
@@ -403,7 +406,7 @@ removes the binary only and never `$JUICE_HOME`.
 | `compact_bytes`    | `262144`               | agent | transcript byte budget triggering compaction (§7)                             |
 | `rate_tasks`       | `true`                 | agent | run the post-task rating pass (§8)                                            |
 | `maker`            | `{enabled:false, min_repeats:3, window:50, budget:40, threshold:0.85}` | agent | self-extension trigger (§8)       |
-| `channels`         | step always on         | agent | `step {poll_seconds}` (always present, §11 rule 6), optional `http {addr}`, and optional `chat {enabled, poll_seconds, loop{enabled, max_events, window_seconds, cooldown_seconds}}` (the juice-ui @chat channel) |
+| `channels`         | step always on         | agent | `step {poll_seconds}` (always present, §11 rule 6), optional `http {addr}`, and optional `chat {enabled, poll_seconds, context_messages, loop{enabled, max_events, window_seconds, cooldown_seconds}}` (the juice-ui @chat channel) |
 
 `handle`, `data_dir`, and the persona/knowledge/memory filenames are not config keys: the handle is
 the home directory's name (CLI arg / `AGENT_HANDLE`), `data_dir` is derived as `<home>/data`, and the

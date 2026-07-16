@@ -75,7 +75,7 @@ func (f *fakeKernel) Transient(err error) bool     { return false }
 func (f *fakeKernel) GrantRequired(err error) bool { return errors.Is(err, errGrant) }
 
 func TestChatNewBuildsNamedService(t *testing.T) {
-	svc := New(newFakeKernel(), "@agent", time.Hour, 20, t.TempDir(), channels.LoopConfig{}, nil)
+	svc := New(newFakeKernel(), channels.ServiceConfig{Handle: "@agent", Interval: time.Hour, Budget: 20, DataDir: t.TempDir()})
 	if svc.Name() != "chat" {
 		t.Fatalf("Name() = %q, want chat", svc.Name())
 	}

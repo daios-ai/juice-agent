@@ -339,3 +339,82 @@ func TestServiceLoopGuardSuppresses(t *testing.T) {
 		t.Fatalf("cursor = %d, want 2 after suppression", got)
 	}
 }
+
+func TestServiceSeedsPriorConversation(t *testing.T) {
+	fs := newFakeService()
+	fs.rooms["r1"] = []Msg{{Seq: 1, From: "@alice", Text: "capital of France?"}}
+	fs.steps = []StepInfo{step("d1", "r1")}
+	s, tasks := newSvc(t, fs, LoopConfig{}, nil)
+
+	s.scan(context.Background())
+	// First task: no prior history — just the new message.
+	if got := (*tasks)[0].Messages; len(got) != 1 || got[0].Content != "@alice: capital of France?" {
+		t.Fatalf("task1 messages = %+v, want the single new message", got)
+	}
+	s.Deliver((*tasks)[0].ID, answered("Paris."))
+
+	// A follow-up in the same room.
+	fs.rooms["r1"] = append(fs.rooms["r1"], Msg{Seq: 2, From: "@alice", Text: "and its population?"})
+	fs.steps = []StepInfo{step("d2", "r1")}
+	s.scan(context.Background())
+
+	got := (*tasks)[1].Messages
+	want := []agent.Message{
+		{Role: agent.RoleUser, Content: "@alice: capital of France?"},
+		{Role: agent.RoleAssistant, Content: "Paris."},
+		{Role: agent.RoleUser, Content: "@alice: and its population?"},
+	}
+	if len(got) != len(want) {
+		t.Fatalf("task2 messages = %+v, want 3 turns (prior exchange + new message)", got)
+	}
+	for i := range want {
+		if got[i].Role != want[i].Role || got[i].Content != want[i].Content {
+			t.Fatalf("task2 turn %d = %+v, want %+v", i, got[i], want[i])
+		}
+	}
+}
+
+func TestServiceContextDisabledIsSingleMessage(t *testing.T) {
+	fs := newFakeService()
+	fs.rooms["r1"] = []Msg{{Seq: 1, From: "@alice", Text: "q1"}}
+	fs.steps = []StepInfo{step("d1", "r1")}
+	s := NewService(fs, ServiceConfig{Name: "svc", Handle: "@agent", Interval: time.Hour,
+		Budget: 20, DataDir: t.TempDir(), ContextMessages: -1}) // disabled
+	var tasks []agent.Task
+	s.submit = func(tk agent.Task) { tasks = append(tasks, tk) }
+
+	s.scan(context.Background())
+	s.Deliver(tasks[0].ID, answered("a1"))
+	fs.rooms["r1"] = append(fs.rooms["r1"], Msg{Seq: 2, From: "@alice", Text: "q2"})
+	fs.steps = []StepInfo{step("d2", "r1")}
+	s.scan(context.Background())
+
+	if got := tasks[1].Messages; len(got) != 1 || got[0].Content != "@alice: q2" {
+		t.Fatalf("disabled: task2 must be a single new message, got %+v", got)
+	}
+}
+
+func TestServiceContextRecordedOnlyAfterPost(t *testing.T) {
+	fs := newFakeService()
+	fs.rooms["r1"] = []Msg{{Seq: 1, From: "@alice", Text: "q"}}
+	fs.steps = []StepInfo{step("d1", "r1")}
+	s, tasks := newSvc(t, fs, LoopConfig{}, nil)
+	s.scan(context.Background())
+
+	// A transient post failure must leave the conversation store untouched.
+	fs.postErr = errors.New("down")
+	fs.transient = true
+	s.Deliver((*tasks)[0].ID, answered("a"))
+	if s.conv.seed("r1") != nil {
+		t.Fatal("transient post failure must not record a conversation turn")
+	}
+
+	// Recovery: the post succeeds and the exchange is recorded.
+	fs.postErr = nil
+	fs.steps = []StepInfo{step("d1", "r1")}
+	s.scan(context.Background())
+	s.Deliver((*tasks)[len(*tasks)-1].ID, answered("a"))
+	if got := s.conv.seed("r1"); len(got) != 2 || got[0].Content != "@alice: q" || got[1].Content != "a" {
+		t.Fatalf("after a successful post the exchange must be recorded, got %+v", got)
+	}
+}

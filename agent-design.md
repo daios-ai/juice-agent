@@ -148,8 +148,11 @@ The working set is *per task* and starts fresh each run: what the agent can do i
 catalog offers at that moment, local, imported, or federated.
 
 **Steering.** Channels may push mid-task messages; the loop injects them before the next model
-call, exactly as pi does. Follow-ups (input after completion) are channel semantics: a follow-up
-is a new task that reopens the prior transcript.
+call, exactly as pi does. Follow-ups (input after completion) are channel semantics: a follow-up is a
+new task **seeded with the conversation's recent turns**, which a dedicated channel keeps in a small
+per-session store and prepends to the task's messages — so the model has continuity while the loop
+stays session-agnostic (it just receives messages, §4). Only the *visible* turns are seeded — the
+incoming messages and the agent's posted answers — never the prior tool calls or reasoning.
 
 **Delegation to other agents** stays out of the loop (as in pi): to use another agent, call its
 published actions or park a step — the kernel is the orchestrator. *In-loop* decomposition is the
@@ -263,7 +266,10 @@ budget — a proxy, chosen for legibility over precision.
 **Within-task memory.** This section covers only the *working* memory of a single task: the
 transcript and its compaction summary. Two other memories — the **authored** persona/knowledge the
 agent is given, and the **learned** cross-task memory it accumulates — are the subject of §5c, which
-also specifies the system prompt that carries them into each task. Both stay legible files in pi's
+also specifies the system prompt that carries them into each task. A dedicated channel may also keep a
+**per-conversation window** of recent visible turns that it seeds into follow-up tasks (§4 Steering,
+requirements §10) — channel state for continuity, distinct from these agent memories and holding no
+tool traces. Both stay legible files in pi's
 spirit (readable, greppable, diffable), not a semantic store.
 
 ## 5b. Stats, ratings, and self-extension

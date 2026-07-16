@@ -65,6 +65,7 @@ type Service struct {
 	budget   int
 	fallback string
 	cursors  *cursorStore
+	conv     *convStore // per-session conversation history for context; nil when disabled
 	guard    *loopGuard // nil when the loop guard is disabled
 	log      func(string, map[string]any)
 
@@ -78,11 +79,13 @@ type Service struct {
 }
 
 // route is a submitted task's destination: the conversation, the step to complete
-// once the reply is posted, and the cursor value to advance to on success.
+// once the reply is posted, the cursor value to advance to on success, and the
+// incoming text (to record as the user turn once the reply is posted).
 type route struct {
-	session string
-	stepID  string
-	maxSeq  int64
+	session  string
+	stepID   string
+	maxSeq   int64
+	userText string
 }
 
 // LoopConfig configures the per-(session,sender) loop guard. Zero fields fall back
@@ -95,24 +98,31 @@ type LoopConfig struct {
 }
 
 // ServiceConfig parameterizes a Service. Name stamps each task's channel (and
-// names the cursor file); Handle is the agent's own handle; DataDir holds the
-// persisted read cursor; Fallback is posted when a task yields no answer; Now
-// (tests) defaults to time.Now; Log may be nil.
+// names the cursor/conversation files); Handle is the agent's own handle; DataDir
+// holds the persisted read cursor and conversation history; Fallback is posted when
+// a task yields no answer; ContextMessages is how many recent conversation turns to
+// seed as context (0 → default, < 0 disables); Now (tests) defaults to time.Now;
+// Log may be nil.
 type ServiceConfig struct {
-	Name     string
-	Handle   string
-	Interval time.Duration
-	Budget   int
-	DataDir  string
-	Fallback string
-	Loop     LoopConfig
-	Now      func() time.Time
-	Log      func(string, map[string]any)
+	Name            string
+	Handle          string
+	Interval        time.Duration
+	Budget          int
+	DataDir         string
+	Fallback        string
+	ContextMessages int
+	Loop            LoopConfig
+	Now             func() time.Time
+	Log             func(string, map[string]any)
 }
 
 // failureReply is posted when the loop produced no answer (a failure, or an empty
 // answer), so a user who asked a question gets a response instead of silence.
 const failureReply = "Sorry — I ran into a problem and couldn't answer that."
+
+// defaultContextMessages is the conversation window seeded into each task when a
+// service does not set ContextMessages. A negative ContextMessages disables it.
+const defaultContextMessages = 20
 
 // NewService builds a service channel from its per-channel actions and config.
 func NewService(acts ServiceActions, cfg ServiceConfig) *Service {
@@ -125,10 +135,15 @@ func NewService(acts ServiceActions, cfg ServiceConfig) *Service {
 	if cfg.Log == nil {
 		cfg.Log = func(string, map[string]any) {}
 	}
+	window := cfg.ContextMessages
+	if window == 0 {
+		window = defaultContextMessages
+	}
 	s := &Service{
 		name: cfg.Name, acts: acts, handle: cfg.Handle, interval: cfg.Interval,
 		budget: cfg.Budget, fallback: cfg.Fallback, log: cfg.Log,
 		cursors: newCursorStore(filepath.Join(cfg.DataDir, cfg.Name+"-cursors.json")),
+		conv:    newConvStore(filepath.Join(cfg.DataDir, cfg.Name+"-conversations.json"), window),
 		stop:    make(chan struct{}),
 		pending: map[string]route{}, active: map[string]bool{},
 	}
@@ -207,12 +222,15 @@ func (s *Service) scan(ctx context.Context) {
 			continue
 		}
 		taskID := s.name + "-" + st.ID
+		prompt := renderMsgs(fresh)
+		// Seed the room's recent turns before the new message so the model has
+		// conversation context; seed is nil (single-message task) when disabled.
+		taskMsgs := append(s.conv.seed(key), agent.Message{Role: agent.RoleUser, Content: prompt})
 		s.mu.Lock()
 		s.active[key] = true
-		s.pending[taskID] = route{session: key, stepID: st.ID, maxSeq: maxSeq}
+		s.pending[taskID] = route{session: key, stepID: st.ID, maxSeq: maxSeq, userText: prompt}
 		s.mu.Unlock()
-		s.submit(agent.Task{ID: taskID, Channel: s.name, Budget: s.budget,
-			Messages: []agent.Message{{Role: agent.RoleUser, Content: renderMsgs(fresh)}}})
+		s.submit(agent.Task{ID: taskID, Channel: s.name, Budget: s.budget, Messages: taskMsgs})
 	}
 }
 
@@ -234,12 +252,18 @@ func (s *Service) Deliver(taskID string, out agent.Outcome) {
 		return
 	}
 	ctx := context.Background()
-	if err := s.acts.Post(ctx, r.session, s.replyText(out)); err != nil {
+	answer := s.replyText(out)
+	if err := s.acts.Post(ctx, r.session, answer); err != nil {
 		if s.acts.Transient(err) {
 			s.log("service_post_retry", map[string]any{"channel": s.name, "session": r.session, "error": err.Error()})
 			return // leave the step + cursor; the next poll re-reads and re-answers
 		}
+		// Permanent failure: give up. Nothing reached the room, so record nothing.
 		s.log("service_post_failed", map[string]any{"channel": s.name, "session": r.session, "error": err.Error()})
+	} else {
+		// Record the exchange exactly as it appeared in the room (the incoming
+		// message + the posted reply) — only the visible turns, no tool traces.
+		s.conv.append(r.session, r.userText, answer)
 	}
 	s.cursors.set(r.session, r.maxSeq)
 	_ = s.acts.Complete(ctx, r.stepID)

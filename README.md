@@ -187,14 +187,17 @@ Enable `channels.chat` and the agent answers messages in juice-ui `@chat` rooms:
 "chat": {
   "enabled": true,
   "poll_seconds": 2,
+  "context_messages": 20,
   "loop": { "enabled": true, "max_events": 20, "window_seconds": 60, "cooldown_seconds": 60 }
 }
 ```
 
 Add `@agent` to a room (as a room admin) and it handles its own access on first use — no other setup.
-The optional `loop` block keeps the agent from getting stuck replying back and forth with another bot:
-after `max_events` replies to the same sender within `window_seconds`, it goes quiet for
-`cooldown_seconds`. Omit a number for the default shown; omit the block to turn the limit off.
+It remembers the recent conversation: each reply sees the last `context_messages` messages in the room
+(default 20; set `-1` to answer each message with no memory of earlier ones). The optional `loop` block
+keeps the agent from getting stuck replying back and forth with another bot: after `max_events` replies
+to the same sender within `window_seconds`, it goes quiet for `cooldown_seconds`. Omit a number for the
+default shown; omit the block to turn the limit off.
 
 ## Outcomes
 

@@ -58,9 +58,12 @@ type HTTPChannelConfig struct {
 // default; the agent must be a room member (the @chat/msg grant is provisioned on
 // demand — see chatAdapter.ensureGrant).
 type ChatChannelConfig struct {
-	Enabled     bool              `json:"enabled"`
-	PollSeconds int               `json:"poll_seconds"`
-	Loop        LoopChannelConfig `json:"loop"`
+	Enabled     bool `json:"enabled"`
+	PollSeconds int  `json:"poll_seconds"`
+	// ContextMessages is how many recent conversation turns to seed as context for
+	// each reply (0 → default 20; -1 disables, answering each message in isolation).
+	ContextMessages int               `json:"context_messages"`
+	Loop            LoopChannelConfig `json:"loop"`
 }
 
 // LoopChannelConfig bounds the chat channel's reply rate to any one counterpart,

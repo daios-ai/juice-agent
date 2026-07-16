@@ -13,7 +13,6 @@ import (
 	"fmt"
 	"strings"
 	"sync"
-	"time"
 
 	"github.com/daios-ai/juice-agent/channels"
 )
@@ -28,14 +27,11 @@ const (
 )
 
 // New builds the chat channel: the generic Service driver configured with chat's
-// actions. cfg carries the poll interval, budget, data dir, loop-guard settings, and
-// logger; Name is forced to "chat".
-func New(k channels.Kernel, handle string, interval time.Duration, budget int, dataDir string,
-	loop channels.LoopConfig, log func(string, map[string]any)) *channels.Service {
-	return channels.NewService(&chatActions{k: k, handle: handle}, channels.ServiceConfig{
-		Name: "chat", Handle: handle, Interval: interval, Budget: budget,
-		DataDir: dataDir, Loop: loop, Log: log,
-	})
+// actions. cfg carries the poll interval, budget, data dir, context window,
+// loop-guard settings, and logger; Name is forced to "chat".
+func New(k channels.Kernel, cfg channels.ServiceConfig) *channels.Service {
+	cfg.Name = "chat"
+	return channels.NewService(&chatActions{k: k, handle: cfg.Handle}, cfg)
 }
 
 // chatActions implements channels.ServiceActions over @chat's kernel actions, and

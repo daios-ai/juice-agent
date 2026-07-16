@@ -272,14 +272,20 @@ func buildChannels(cfg Config, cl *juice.Client, log func(string, map[string]any
 	}
 	if chatOn {
 		cc := cfg.Channels.Chat
-		out = append(out, chat.New(k, cfg.Handle,
-			time.Duration(cc.PollSeconds)*time.Second, cfg.DefaultBudget, cfg.DataDir,
-			channels.LoopConfig{
+		out = append(out, chat.New(k, channels.ServiceConfig{
+			Handle:          cfg.Handle,
+			Interval:        time.Duration(cc.PollSeconds) * time.Second,
+			Budget:          cfg.DefaultBudget,
+			DataDir:         cfg.DataDir,
+			ContextMessages: cc.ContextMessages,
+			Loop: channels.LoopConfig{
 				Enabled:  cc.Loop.Enabled,
 				Max:      cc.Loop.MaxEvents,
 				Window:   time.Duration(cc.Loop.WindowSeconds) * time.Second,
 				Cooldown: time.Duration(cc.Loop.CooldownSeconds) * time.Second,
-			}, log))
+			},
+			Log: log,
+		}))
 	}
 	return out
 }
