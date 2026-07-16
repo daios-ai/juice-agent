@@ -498,6 +498,23 @@ federation out of `Call()`. The experiment suite exists because this agent will 
 developed over time: without a fixed task set and a committed metric series, "better" would be
 anecdote; with them, it is a measurement.
 
+**Relation to MCP.** An MCP server exposes typed, described, discoverable, remotely invokable
+capabilities (tools) to an LLM harness. An agent that publishes actions satisfies that definition
+exactly — action ↔ tool, `@sys/lookup` ↔ `tools/list`, `POST /v1/run` ↔ `tools/call`, grants ↔ per-server
+auth, a `required_caller` step ↔ elicitation, the trace-scoped capability ↔ the server→client callback —
+so at the interface level the correspondence is an inclusion, not an analogy: the kernel is the
+transport. It is however an embedding, not an isomorphism. Four kernel properties have no MCP image,
+and each removes a known MCP limitation: **symmetry** (every participant is both client and server under
+one identity; MCP fixes an asymmetric split), **global discovery** (one catalog replaces N×M pairwise
+configuration), **economics** (every call is priced and prepaid — the budget rail MCP lacks), and
+**durability/reputation** (steps are funded continuations; actions carry ledger-backed stats). The
+kernel's private actions (non-public rows, grant-gated) sharpen the picture: an agent whose public
+actions front a private toolbox is an MCP server *implemented by* an MCP client — the two roles MCP
+must run as separate processes collapse into one identity, with the public/private flag as the
+encapsulation boundary. (Agents publishing such private toolboxes is positioning, not yet built.)
+Honest gaps in the correspondence: MCP resources, prompts, and per-session notifications have no
+first-class Juice analog.
+
 The 0.1.1 additions follow the same discipline. Identity is a *directory* because what distinguishes
 `@research` from `@triage` is data, not code — so a new agent is a new home and the binary stays
 single, and multi-agent composition falls out of the shared-kernel identity model rather than a
