@@ -1,9 +1,14 @@
+Rules
+=====
+
 - Never implement anything that violates requirements.md
 - Never implement code if I don't ask you directly
-- Keep the number of files small because this codebase is critical and must be correct!
+- Keep the number of files small: this codebase is critical!
 - Every GO file must have a corresponding test file
+- Respect the codebase guidelines --- NEVER MONKEY PATCH!
 - Never commit before passing ALL unit tests and user flows!
-- Native actions should be encapsulated, never hardwired into the kernel.
+- Never commit before updating README.md: document operator
+  details, never internals.
 
 Answering questions
 ===================
