@@ -41,10 +41,10 @@ func (f *fakeStepSource) CompleteStep(_ context.Context, id string, args map[str
 
 func TestStepChannelSubmitsAndCompletes(t *testing.T) {
 	src := &fakeStepSource{steps: []channels.StepInfo{
-		{ID: "s1", OwnerHandle: "@chat", RequiredCaller: "@agent",
-			PartialArgs: map[string]any{"message": "please summarise X"}, CreatedBy: "@chat"},
+		{ID: "s1", OwnerHandle: "chat", RequiredCaller: "agent",
+			PartialArgs: map[string]any{"message": "please summarise X"}, CreatedBy: "chat"},
 	}}
-	ch := NewStep(src, 5*time.Millisecond, 20, "@agent")
+	ch := NewStep(src, 5*time.Millisecond, 20, "agent")
 
 	var got agent.Task
 	var wg sync.WaitGroup
@@ -81,8 +81,8 @@ func TestStepChannelSubmitsAndCompletes(t *testing.T) {
 }
 
 func TestStepChannelDoesNotResubmit(t *testing.T) {
-	src := &fakeStepSource{steps: []channels.StepInfo{{ID: "s1", RequiredCaller: "@agent", PartialArgs: map[string]any{"message": "x"}}}}
-	ch := NewStep(src, 2*time.Millisecond, 20, "@agent")
+	src := &fakeStepSource{steps: []channels.StepInfo{{ID: "s1", RequiredCaller: "agent", PartialArgs: map[string]any{"message": "x"}}}}
+	ch := NewStep(src, 2*time.Millisecond, 20, "agent")
 	var count int
 	var mu sync.Mutex
 	ch.Start(context.Background(), func(agent.Task) { mu.Lock(); count++; mu.Unlock() })
@@ -98,10 +98,10 @@ func TestStepChannelDoesNotResubmit(t *testing.T) {
 // A step the agent merely owns (addressed to someone else) is not its work.
 func TestStepChannelSkipsForeignRequiredCaller(t *testing.T) {
 	src := &fakeStepSource{steps: []channels.StepInfo{
-		{ID: "mine", OwnerHandle: "@alice", RequiredCaller: "@agent", PartialArgs: map[string]any{"message": "for me"}},
-		{ID: "theirs", OwnerHandle: "@agent", RequiredCaller: "@bob", PartialArgs: map[string]any{"message": "for bob"}},
+		{ID: "mine", OwnerHandle: "alice", RequiredCaller: "agent", PartialArgs: map[string]any{"message": "for me"}},
+		{ID: "theirs", OwnerHandle: "agent", RequiredCaller: "bob", PartialArgs: map[string]any{"message": "for bob"}},
 	}}
-	ch := NewStep(src, 2*time.Millisecond, 20, "@agent")
+	ch := NewStep(src, 2*time.Millisecond, 20, "agent")
 	var ids []string
 	var mu sync.Mutex
 	ch.Start(context.Background(), func(tk agent.Task) { mu.Lock(); ids = append(ids, tk.ID); mu.Unlock() })
@@ -118,10 +118,10 @@ func TestStepChannelSkipsForeignRequiredCaller(t *testing.T) {
 // that channel, even though it is addressed to the agent.
 func TestStepChannelExcludesClaimedSource(t *testing.T) {
 	src := &fakeStepSource{steps: []channels.StepInfo{
-		{ID: "generic", OwnerHandle: "@alice", RequiredCaller: "@agent", PartialArgs: map[string]any{"message": "hi"}},
-		{ID: "chat", OwnerHandle: "@chat", RequiredCaller: "@agent", PartialArgs: map[string]any{"room": "r1"}},
+		{ID: "generic", OwnerHandle: "alice", RequiredCaller: "agent", PartialArgs: map[string]any{"message": "hi"}},
+		{ID: "chat", OwnerHandle: "chat", RequiredCaller: "agent", PartialArgs: map[string]any{"room": "r1"}},
 	}}
-	ch := NewStep(src, 2*time.Millisecond, 20, "@agent", "@chat")
+	ch := NewStep(src, 2*time.Millisecond, 20, "agent", "chat")
 	var ids []string
 	var mu sync.Mutex
 	ch.Start(context.Background(), func(tk agent.Task) { mu.Lock(); ids = append(ids, tk.ID); mu.Unlock() })
@@ -130,17 +130,17 @@ func TestStepChannelExcludesClaimedSource(t *testing.T) {
 	mu.Lock()
 	defer mu.Unlock()
 	if len(ids) != 1 || ids[0] != "step-generic" {
-		t.Fatalf("submitted %v, want only [step-generic] (@chat step left for the chat channel)", ids)
+		t.Fatalf("submitted %v, want only [step-generic] (chat step left for the chat channel)", ids)
 	}
 }
 
 func TestSessionKey(t *testing.T) {
-	base := channels.StepInfo{OwnerHandle: "@sms", PartialArgs: map[string]any{"message": "hi"}}
-	if got := sessionKey(base); got != "@sms" {
-		t.Fatalf("no-thread session = %q, want @sms", got)
+	base := channels.StepInfo{OwnerHandle: "sms", PartialArgs: map[string]any{"message": "hi"}}
+	if got := sessionKey(base); got != "sms" {
+		t.Fatalf("no-thread session = %q, want sms", got)
 	}
-	threaded := channels.StepInfo{OwnerHandle: "@sms", PartialArgs: map[string]any{"thread": "+1555", "message": "hi"}}
-	if got := sessionKey(threaded); got != "@sms\x1f+1555" {
+	threaded := channels.StepInfo{OwnerHandle: "sms", PartialArgs: map[string]any{"thread": "+1555", "message": "hi"}}
+	if got := sessionKey(threaded); got != "sms\x1f+1555" {
 		t.Fatalf("threaded session = %q", got)
 	}
 	// distinct threads from one sender are distinct sessions
@@ -153,10 +153,10 @@ func TestSessionKey(t *testing.T) {
 // after the first is delivered.
 func TestStepChannelSerializesPerSession(t *testing.T) {
 	src := &fakeStepSource{steps: []channels.StepInfo{
-		{ID: "a", OwnerHandle: "@sms", RequiredCaller: "@agent", PartialArgs: map[string]any{"thread": "t1", "message": "1"}},
-		{ID: "b", OwnerHandle: "@sms", RequiredCaller: "@agent", PartialArgs: map[string]any{"thread": "t1", "message": "2"}},
+		{ID: "a", OwnerHandle: "sms", RequiredCaller: "agent", PartialArgs: map[string]any{"thread": "t1", "message": "1"}},
+		{ID: "b", OwnerHandle: "sms", RequiredCaller: "agent", PartialArgs: map[string]any{"thread": "t1", "message": "2"}},
 	}}
-	ch := NewStep(src, 2*time.Millisecond, 20, "@agent")
+	ch := NewStep(src, 2*time.Millisecond, 20, "agent")
 	var ids []string
 	var mu sync.Mutex
 	ch.Start(context.Background(), func(tk agent.Task) { mu.Lock(); ids = append(ids, tk.ID); mu.Unlock() })
@@ -211,12 +211,12 @@ func TestStepChannelDeliverShapesToDeliveryAction(t *testing.T) {
 	// A step whose onward action declares a "text" field: the agent's answer must be
 	// delivered as {text: ...} so the delivery action (e.g. a bridge) sends it.
 	src := &fakeStepSource{steps: []channels.StepInfo{{
-		ID: "s1", OwnerHandle: "@smsbridge", RequiredCaller: "@agent",
-		ActionRef:    "@smsbridge/deliver",
+		ID: "s1", OwnerHandle: "smsbridge", RequiredCaller: "agent",
+		ActionRef:    "smsbridge/deliver",
 		PartialArgs:  map[string]any{"to": "+1555", "incoming": "hi"},
 		AllowedInput: map[string]any{"properties": map[string]any{"text": map[string]any{"type": "string"}}},
 	}}}
-	ch := NewStep(src, 2*time.Millisecond, 20, "@agent")
+	ch := NewStep(src, 2*time.Millisecond, 20, "agent")
 	var got agent.Task
 	var wg sync.WaitGroup
 	wg.Add(1)
@@ -233,8 +233,8 @@ func TestStepChannelDeliverShapesToDeliveryAction(t *testing.T) {
 }
 
 func TestStepChannelDeliverFailedStillCompletes(t *testing.T) {
-	src := &fakeStepSource{steps: []channels.StepInfo{{ID: "s1", RequiredCaller: "@agent", PartialArgs: map[string]any{"message": "x"}}}}
-	ch := NewStep(src, 2*time.Millisecond, 20, "@agent")
+	src := &fakeStepSource{steps: []channels.StepInfo{{ID: "s1", RequiredCaller: "agent", PartialArgs: map[string]any{"message": "x"}}}}
+	ch := NewStep(src, 2*time.Millisecond, 20, "agent")
 	var got agent.Task
 	var wg sync.WaitGroup
 	wg.Add(1)

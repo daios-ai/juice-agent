@@ -1,874 +1,332 @@
-# Juice Kernel Requirements
+# Juice: user stories, product constraints, and design decisions
 
-Version: 0.7.0
-Status: implementation requirements
+Version: 0.12
 Codename: `juice`
 
-## 1. Execution, supervision, and role law
+INSTRUCTIONS FOR EDITING THIS FILE:
+- Four classes; **one owner per fact** — state each fact once at its owning entry, cross-reference by id (U/G/P/D), never restate.
+- The section structure and numbering are fixed; never restructure or split content into other files.
+- Every design fact carries a `[→U/G]` trace or a `[policy]`/`[convention]` marker; untraced facts are the simplification surface.
+- §10 is a lag ledger: a decision folds into the body as current contract, and §10 records only what still diverges in the source contract or the code, each line deleted as its lag closes. An empty ledger means document, contract, and system agree.
+- Be terse, measured in **characters** — except the user stories, which are complete, precise English sentences: they are the standard.
+- Timeless present tense; no changelog framing; measure the character delta after every edit.
+- Always attempt to **delete** or **change** the phrasing. Only **add** as a last resort.
 
-Juice is a Go production kernel and research platform for callable actions. Execution starts with:
+## 1. Taxonomy
 
-```text
-run(action, args)        // action is @owner/name
-```
+1. **User story** — actor, goal, observable outcome at the product boundary. A statement is a story only if it survives replacing the database, transport, process model, and internal APIs.
+2. **Product constraint** — a security, economic, durability, privacy, or interoperability property every implementation must preserve; acceptance criteria across stories. Stories and constraints are stable across implementation and protocol changes; they change only by explicit product-contract revision.
+3. **Wire protocol** — what a conforming kernel must speak to another kernel: payloads, signature domains, manifest and receipt fields, settlement equations, idempotency semantics. Normative for interoperability — nothing observable between independently administered kernels is private design, since neither party can change it unilaterally — but **versioned**: replaceable wholesale by coordinated migration without breaking any story (the discriminating test: a story survives a protocol v2; the protocol does not). Much of its content is forced by constraints (signed receipts by U36/G7, recipient binding by replay resistance, idempotency by U35, evidence omissions by U39); encodings, field names, and stream ids are convention. Today the network upgrades in lockstep, so the wire is de facto design; it hardens into this class the moment an independent implementation or non-lockstep operator exists — the standard is written for that moment.
+4. **Design decision** — the current mechanism one kernel implementation or operator may replace unilaterally while the stories, constraints, and current protocol version hold: database, store interface, wallet objects, package layout, and the server-authoritative user-facing surface. It may be observable at a kernel's own boundary but never determines federation interoperability.
 
-which atomically creates a process funded with exactly `action.price` (the subtree bound, §6), locked from the caller's available balance, creates and funds the root trace from that process, and issues the root call. Its sole dispatch primitive is:
+`API.md` is a derivative interface reference; `README.md`, `ROADMAP.md`, and `docs/` are context. None is a competing contract, and this document governs on conflict.
 
-```text
-Call(caller, trace, action, args)
-```
-
-The `trace` carries the funding wallet, process (`trace.process_id`), and causal parent — so no separate process argument is needed. Every `run` is a `Call` on a freshly created and funded root trace; the process closes automatically when the root call has returned and no Steps remain outstanding (§10).
+## 2. Actors
 
-For every call, define:
+**User** (account, balance, history), **caller** (buys a call), **provider** (owns and sells an action), **composer** (implements an action via other actions), **completer** (resumes a suspended computation), **API owner** (wraps an existing web API), **external system** (webhook client acting as a user), **operator** (`sys`; governs a kernel and its finances), **peer operator** (a remote kernel: financial counterparty, host of foreign principals), **agent** (software that discovers, selects, invokes), **auditor** (verifies history and economics). One party may hold several roles in a flow.
 
-```text
-P = process.owner_user_id      // process owner; payer
-C = caller                     // call caller; immediate requester
-A = action.owner_user_id       // action owner; payee on success
-```
+## 3. Basic user stories (one kernel)
 
-The transaction created by that call records:
+Identity and funds:
 
-```text
-owner_user_id  = P
-caller_user_id = C
-target_user_id = A
-```
+- **U1** A person can create an account with a memorable handle and a password; the handle is unique on that kernel.
+- **U2** A user who loses their password can recover the account by proving possession of a secret only they hold. No email exists in the system.
+- **U3** The operator can credit or debit a user's balance to reflect a payment made outside the system; repeating the same request never moves money twice. The kernel owns the ledger; external rails move the real money.
+- **U4** A user can send credits to another local user, directly and without fee. Funds move only on their owner's authority — a direct transfer, or the owner acting as the immediate caller of a value-bearing action (U49); foreign code a user merely funds can never move that user's balance.
+- **U5** A user can see their balance, locked funds, and complete personal ledger.
 
-These meanings are fixed: `owner_user_id` = process owner (not the caller); `caller_user_id` = immediate requester (not necessarily the process owner — for a root call they coincide, the `run` requester becoming the process owner); `target_user_id` = called action owner.
+Publishing:
 
-| Case                       | `P`                       | `C`                     | `A`                                 |
-| -------------------------- | ------------------------- | ----------------------- | ----------------------------------- |
-| Root call (`run`)          | process owner             | authenticated requester (= P) | called action owner           |
-| WASM subcall               | parent process owner      | parent action owner     | subcalled action owner              |
-| Step completion            | step's process owner      | required_caller_user_id | step's next action owner            |
-| Remote proxy call          | local process owner       | local call caller       | local remote-peer user owning proxy |
+- **U6** A provider can register a callable action with a name, a natural-language description, typed input and output, and a fixed price. It starts unpublished; a draft is never accidentally callable.
+- **U7** A provider chooses the audience deliberately, with two separate consents: available to this kernel's own users, and exported to everyone across federation.
+- **U8** A provider can change an action's terms freely, but no caller ever pays under terms they did not see: a changed contract is refused or re-quoted, never silently applied.
+- **U9** A provider can retire an action; all history survives.
 
-All execution paths use `Call()`: root calls (via `run`), native actions, WASM `juice.call`, step completion, OpenAPI-imported HTTP actions, and remote proxies. `Call()` dispatches by `action.kind`, not by action-owner identity.
+Buying:
 
-Supervision operations never route through `Call()`; they manage users, actions, processes, ratings, deposits, OpenAPI imports, and federation peering. Execution code must not rate outputs or propagate ratings.
+- **U10** A user can search for actions in natural language and see ranked results, each with description, interface, and one all-in price. Search never discloses actions the caller cannot access, and remains useful without a language model.
+- **U11** A user can run an action by name and receive a result. The advertised price bounds the total cost of the call **and everything it does internally**; the user is charged at most that one number.
+- **U12** Invalid input is rejected before any charge; malformed output is never paid for.
+- **U13** A failed call refunds what was not consumed; sub-work already delivered stays paid.
+- **U14** The payer — and only the payer — can rate a completed call, once, with an optional note. Ratings feed the provider's public track record, are immutable, and never change what was paid.
+- **U15** Every party can audit: the buyer sees exactly what they paid and why; the provider can reconstruct every credit received from records they may read.
+- **U48** A refused or re-quoted call never discloses a private action’s terms.
 
-Juice is meant to be a kernel like an OS kernel: only minimal but general and robust primitives, the rest lives on the application layer (actions).
-
-## 2. Packages and implementation constraints
-
-Use Go. `go build ./...` and `go test ./...` must pass. Replaceable modules use ordinary Go interfaces. `kernel` must not import CLI, HTTP, SQLite, wazero, Ollama, or libp2p implementations.
-
-Production packages:
-
-```text
-cmd/juice/   CLI and server entrypoint
-kernel/      core objects and operational semantics
-store/       persistence interface and SQLite implementation
-script/      WebAssembly execution
-llm/         local language and embedding interface
-fed/         federation transport interface and libp2p implementation
-log/         structured logging
-native/      native function implementations
-```
-
-Package names such as `sqlite`, `wazero`, `ollama`, and `libp2p` are forbidden. Implementation-specific names may appear in concrete types or filenames. Keep package and source-file counts small. Do not split files for size alone. Every production source file must have a corresponding `_test.go` file with independent tests for its logic.
-
-## 3. Data model
-
-All IDs are stable opaque identifiers. Action IDs are globally unique. Credit balances and prices are non-negative indivisible integers.
-
-| Object              | Fields                                                                                                                                                                                                                                                                           | Rules                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                  |
-| ------------------- | -------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------- | ---------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------|
-| `User`              | `id`, `handle`, `email`, `available`, `locked`, `suspended_at`, `denied_at`, `public_key`, `peer_last_seen`, `peer_credit`, `created_at`, `updated_at`                                                                                                                                         | `handle` unique, no `/`; `email` required, not unique. Suspended users are rejected at every authenticated request with `ErrUnauthenticated`. `public_key`, when set, is a unique base64url Ed25519 32-byte key. No user "kind": an account authenticates by the credentials it holds — a password (session: log in, hold tokens) and/or a `public_key` (federation signature, per request, §13). `user create` makes a password account, peer acceptance a key account (§13); neither credential ⇒ cannot authenticate. An account may also hold `Grant` rows (§8): consent records delegating its upstream OAuth identity to specific actions, not auth credentials. Location is never stored — the transport resolves a key to a live path at call time (§13). `denied_at` marks a key whose requests are rejected (§13). `peer_last_seen`/`peer_credit` are null except on peer rows: the friend-sync display cache (§13 peer sync), never execution semantics.                                                                                                                                                                                                                                          |
-| `Action`            | `id`, `owner_user_id`, `name`, `kind`, `active`, `public`, `price`, `description`, `input_schema`, `output_schema`, `source`, `auth_json`, `artifact_hash`, `remote_action_id`, `created_at`, `updated_at`                                                                       | `owner_user_id` is the action owner. `kind ∈ {http, wasm, native, remote_proxy}`. `(owner_user_id,name)` unique. `/` is allowed in `name`; handles cannot contain `/`, so `@owner/name` is unambiguous. Inactive actions are not callable. Listing visibility per §14 (`GET /v1/actions`): owners may list all their own regardless of `active`/`public` via `?owner=` self-match. Authorized users may inspect script source. `artifact_hash` content-addresses compiled artifacts. `auth_json` is the write-only upstream credential config, encrypted at rest, never returned by any read path (§8); reads expose only its non-secret summary — `auth_scheme` and a `requires_grant` flag. For `remote_proxy`, `remote_action_id` is the action ID on the remote kernel and `artifact_hash` the signed manifest hash; the peer is the proxy owner's `public_key`, transport-resolved to a live path (§13), so no URL is stored in `source`. Active actions require non-empty natural-language `description`, valid schemas, and field descriptions sufficient for lookup and LLM function calling. |
-| `Process`           | `id`, `owner_user_id`, `available`, `locked`, `status`, `created_at`, `ended_at`                                                                                                                                                                                                 | `owner_user_id` is the process owner and payer. `status ∈ {open,closed}`. Created by `run`, funded with exactly the root action's price parked from the owner's `available` into `locked` (§6); the process holds it as `available`. Bijective with its root trace; it is a longer-lived wallet only because traces settle eagerly (§6): it absorbs refunds destined for already-settled traces and holds parked steps. Enforcement is per call, on the call's trace (§6); `available + locked` is the total held across its calls' wallets and parked steps. Closes automatically when the root call has returned and no Steps are outstanding, returning remaining funds to the owner and releasing the owner's lock. Closed processes cannot call.                                                                                                                                                                              |
-| `Trace`             | `id`, `process_id`, `parent_trace_id`, `action_owner_id`, `available`, `locked`, `idempotency_key`, `dispatch_json`, `created_at`                                                                                                                                  | `action_owner_id` is the owner of the action executing in the trace, used for trace-scoped process authority. `process_id` is denormalized (derivable by walking `parent_trace_id` to the root). Root traces have null parent. Every `Call()` creates exactly one child trace. A trace is the call's wallet: `available` starts as the action's price at entry (the call's remaining allocation); `locked` is what the call has committed to direct subcalls and steps. Calling price `q` requires `available ≥ q` and moves `q` from `available` into `locked`, becoming the callee's `available` (§6). Settlement pays out the trace's remaining `available` (§6). Own latency is `transaction.ended_at − transaction.started_at`; no cached latency field (§11). `idempotency_key`/`dispatch_json` are null except on a remote-proxy trace, where the outbound key and request payload are recorded atomically with dispatch; while set and unsettled, the call is awaiting its receipt and restart resumes its retry (§5, §13). |
-| `Transaction`       | `id`, `process_id`, `trace_id`, `parent_trace_id`, `owner_user_id`, `caller_user_id`, `target_user_id`, `action_id`, `action_name`, `args_json`, `reply_json`, `status`, `gross`, `net`, `fee`, `reason`, `remote_receipt_hash`, `remote_receipt_json`, `started_at`, `ended_at` | `status ∈ {success,failure}`. Every attempted call creates one immutable transaction. Fields obey the role law. `action_name` is captured at creation so history remains self-contained after action deletion. Local calls have null remote receipt fields. Remote-proxy commits atomically store full remote receipt JSON and `SHA-256(remote_receipt_json)`.                                                                                                                                                                                                                                                                                                                                                                                                                                                         |
-| `Stats`             | `uses`, `successes`, `failures`, `rating_count`, `latency_estimate`, `rating_estimate`, `last_used_at`                                                                                                                                                                           | Missing stats have defined defaults. `uses = successes + failures`.                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                    |
-| `StatTag`           | `action_id`, `key`, `value`, `source`, `updated_at`                                                                                                                                                                                                                              | Optional lookup-experiment data, namespaced by source, never execution semantics.                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                      |
-| `Step`              | `id`, `parent_trace_id`, `required_caller_user_id`, `action_id`, `price`, `partial_args`, `status`, `tx_id`, `created_at`                                                       | `status ∈ {waiting, running, done, cancelled}`. `parent_trace_id` is the creating/funding trace, derives the process (`Trace(parent_trace_id).process_id`), and is inherited by the completion trace. `required_caller_user_id` is mandatory; open completion is unsupported. `partial_args` is pre-bound input merged with caller input at completion (`input` overwrites `partial_args` on key collision). The completer's allowed input is derived `action.input_schema \ keys(partial_args)`, not stored (§10) — safe because a schema change deactivates the action and completing against a changed/deactivated action resets the step to `waiting` (§10). `tx_id` is recorded atomically at `done`. `price` is `action.price` snapshotted at creation: the amount parked in the process's `locked`, the completion call's allocation and `gross`, spent on completion and refunded on cancellation. `EndProcess` atomically cancels all `waiting` steps of the process in the same transaction as closure; `cancelled` is terminal with no `tx_id`. An outstanding (`waiting`/`running`) step keeps its process open, allocation parked (§10). |
-| `Adjustment`        | `id`, `operator_user_id`, `target_user_id`, `direction`, `amount`, `reason`, `external_key`, `created_at`                                                                                                                                                                                                     | Immutable audit record for a superuser balance change. `direction ∈ {credit, debit}`: credit = positive out-of-band grant; debit = redemption obliging an out-of-band payout (§12). `amount` is positive. `external_key` is an optional opaque idempotency token from the out-of-band system; when present it is globally unique, and a create with an existing `external_key` returns the existing record without reapplying the balance change. Juice never interprets it, keeping the kernel payment-rail agnostic.                                                                                                                                                                                                                                                                                                                                                              |
-| `Grant`             | `id`, `grantor_user_id`, `action_id`, `connection_id`, `created_at` | A user's per-action delegated consent (§8): a pointer binding one action to the upstream account (`connection_id`, a `Connection`) whose credential it may wield. Holds no token. Unique per `(grantor_user_id, action_id)`; re-consent overwrites in place. Deleted on revoke, on `Connection` deletion (cascade), on provider `invalid_grant` (which deletes the `Connection` and cascades), and when a deactivating update / auth replacement / delete invalidates the action (§8) — invalidation deletes grants only, never the `Connection` (the upstream account outlives any one action's consent). A consent record, not an authentication credential. |
-| `Connection`        | `id`, `user_id`, `provider_key`, `sealed_secret`, `scopes_json`, `created_at`, `updated_at` | A user's upstream account credential, stored once and shared by every `Grant` pointing at it (§8). Unique per `(user_id, provider_key)`. `provider_key` is derived from verified facts, never names: `bearer:<host>` from a `delegated_bearer` action's pinned `source` base-URL host; `oauth:<token_url>|<client_id>|<source-domain>` from an `oauth_delegated` action's auth config, `source-domain` being the registrable domain (eTLD+1) of the action's `source` host — binding the token to its resource server (§8 confused-deputy defense). `sealed_secret` (the OAuth refresh token or static bearer/API-key token) is AES-256-GCM encrypted with AAD `user_id|connection_id`, write-only, never returned by any read path. `scopes_json` is the requested-scope union consented so far (providers need not echo granted scopes, so requested scope is authoritative for coverage). Provider refresh-token rotation updates this one row, leaving dependent grants unaffected; provider `invalid_grant` deletes it and cascades its grants. A zero-grant `Connection` is kept (re-consent reuses it), surfaced `unused` in read paths (§14), never auto-expired. |
-| `Receipt`           | `id`, `issuer_user_id`, `tx_id`, `trace_id`, `action_id`, `caller_user_id`, `process_id`, `args_hash`, `reply_hash`, `status`, `gross`, `net`, `fee`, `charge`, `reason`, `started_at`, `created_at`, `signature`                                                                | Immutable signed record for exactly one committed call. `caller_user_id` is the call caller. `started_at` is call start; `created_at` is settlement. `charge` is the amount actually drawn from the caller's funds: `= gross` on success, `≤ gross` on failure (settled descendants stay paid, §6), `0` on rejection.                                                                                                                                                                                                                                                                  |
-| `Rating`            | `id`, `rated_tx_id`, `rated_receipt_id`, `rater_user_id`, `rating`, `note`, `created_at`, `signature`                                                                                                                                                                            | Immutable signed feedback record. `rating ∈ {0,1}`. At most one rating exists per transaction. `rated_receipt_id` may be null only for pre-receipt transactions. `note` is optional, nullable, human-readable, and included in the single Ed25519 rating signature payload.                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                            |
-| `IdempotencyRecord` | `id`, `idempotency_key`, `counterparty_user_id`, `receipt_id`, `status`, `result_json`, `created_at`, `expires_at`                                                                                                                                                               | Cross-kernel only. `status ∈ {pending,complete}`. Insert pending before execution; complete atomically with transaction and receipt. Completion stores `result_json`.                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                  |
-| `DiscoveredKernel`  | `public_key`, `handle`, `introduced_by`, `stats_json`, `first_seen`, `updated_at`                                                                                                                                                                                    | One row per (kernel, introducer); accumulated from gossip (§13). Information only — never execution semantics, callability, pricing, or settlement. Location is not stored; the transport resolves a key when needed (§13).                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                    |
-
-OpenAPI registration and federation create or update ordinary `Action` rows. They create no durable object parallel to `Action`.
-
-## 4. Authorization, call validity, and traces
-
-```text
-CanCall(P, a) := active(a) ∧ ¬suspended(a.owner_user_id) ∧ (public(a) ∨ P = a.owner_user_id)
-```
-
-`CanCall` is about the process owner `P`, not the call caller `C`. Public actions are callable by any process owner. Private actions are callable only when the process owner is the action owner. The call caller may differ from both only if process-use authority permits it. An action whose owner is suspended fails `CanCall` regardless of `active`/`public` state: a suspended owner's actions are not callable and are excluded from action listings (§14); unsuspending restores them, since suspension preserves data (§12).
-
-Check call preconditions in this exact order and return the typed error for the first failure:
-
-```text
-1. C is authenticated and not suspended
-2. process exists and is open
-3. supplied parent_trace_id, if any, exists and belongs to the process
-4. C may use process:
-   C = P, or
-   supplied parent trace has action_owner_id = C, or
-   for a step completion, C = step.required_caller_user_id (§10)
-5. action exists
-6. CanCall(P, action)
-7. args satisfy action.input_schema
-8. funds: the passed trace's `available` >= action.price (§6) — for a root call this is the root trace `run` funded from the process; a step completion is funded by its parked price instead (§10)
-```
-
-Precondition 4 controls spending authority over the process. Precondition 6 controls action access by the process owner.
-
-Trace relation:
-
-| Case                  | `parent_trace_id`      | `process_id`               |
-| --------------------- | ---------------------- | -------------------------- |
-| Root trace            | null                   | owning process             |
-| Subcall trace         | executing action trace | same as parent             |
-| Step-completion trace | step.parent_trace_id   | Trace(step.parent_trace_id).process_id |
-
-`process_id` determines payment. `parent_trace_id` records causality only. There is no cached per-trace latency; a call's own latency is its transaction's elapsed time and subtree latency is a query over descendant transactions (§11).
-
-## 5. Persistence and atomicity
-
-Use file-backed SQLite with WAL by default. Migrations are deterministic and stored in the repository. Tests use temporary SQLite databases. No production feature may depend on an in-memory-only store. `kernel` depends on a store interface, never SQLite.
-
-Store interface. Each monetary transition commits together with its audit record (transaction, receipt, stats, step/idempotency state) inside one store call, so the atomic write-sets below are atomic at the store boundary rather than coordinated above it. The money-path methods are therefore **compound atomic operations**, not fine-grained primitives; reads and supervision are ordinary methods. The listing is representative, not exhaustive:
-
-```text
-Money paths (each commits a monetary transition + its audit record atomically):
-  BeginRun            user-wallet park + process creation/funding + root trace funded
-  BeginSubcall        parent-trace move (available → locked) + child trace funded
-  BeginStepCall       unpark step.price + completion trace funded + step waiting → running
-  CommitCall          success transaction + receipt + payout + lock release + stats (+ step/idempotency)
-  CommitFailedCall    failure transaction + receipt + subtree refund/cancellation + stats (+ step/idempotency)
-  CommitRemoteSettlement  remote-proxy settlement on a signed receipt (charge/duty/refund) + transaction + receipt
-  EndProcess          cancel waiting steps + return funds + close process
-  CreateStep          step record + park step.price from the creating trace
-  CreateAdjustment    out-of-band credit grant / redemption with its audit record
-  CreateRatingAndUpdateStats  rating record + rating stats
-Reads / supervision (no monetary mutation):
-  CreateUser ReadUser ReadUserByHandle ReadUserByPublicKey ListUsers SuspendUser UnsuspendUser UpdateUser RenameUser
-  CreateAction ReadAction ReadActionByOwnerName UpdateAction UpdateActionAndResetStats DeleteAction ListAllActions
-  ReadProcess ListProcesses ListAllProcesses
-  ReadTrace ReadRootTrace ListTraces
-  ReadTransaction ListTransactions ListAllTransactions
-  ReadStats UpsertStats
-  ReadStep ListSteps ResetStepAndRepark ResetRunningSteps
-  ReadReceipt ReadReceiptByTxID
-  ReadRatingByTxID ListRatings
-  InsertPendingIdempotencyRecord ReadIdempotencyRecord CompleteIdempotencyRecordIfPending DeleteIdempotencyRecord
-  GetConfig SetConfig InitFirstBoot
-  CreateOrUpdateDiscoveredKernel ListDiscoveredKernels DenyPeerCascade CreateProxyUser
-  CreateOrReplaceGrant ReadGrant ListGrantsByUser DeleteGrant DeleteGrantsForAction
-  CreateOrUpdateConnection ReadConnection ReadConnectionByUserProvider ListConnectionsByUser UpdateConnectionSecret DeleteConnectionCascade
-  ListLegacyTokenGrants LinkGrantConnection  (backfill-only; retired with the legacy column)
-```
-
-`UpdateTransaction` is forbidden. Transactions are immutable after creation.
-
-Atomic write sets:
-
-| Operation       | Atomic writes                                                                                    |
-| --------------- | ------------------------------------------------------------------------------------------------ |
-| run             | user-wallet park (available → locked), process creation and funding, root trace creation funded from the process; the root `Call` then dispatches on it (§6) |
-| Call entry      | caller-wallet move (available → locked), child trace creation with its allocation                |
-| Successful call | transaction, receipt, payout of the trace's available (target net, platform fee), caller lock release, metrics, stats |
-| Failed call     | transaction, receipt, subtree rollup (refund to caller's available, cancellation of outstanding steps beneath), caller lock release, metrics, stats |
-| Process closure | process closed, remaining funds returned to process owner                                        |
-| Deposit         | user credit, adjustment record (credit)                                                          |
-| Withdrawal      | user debit, adjustment record (debit)                                                            |
-| Rating          | rating record                                                                                    |
-| User update     | user email and/or password hash                                                                  |
-| Step creation   | creator-trace move (available → locked), step record                                             |
-| Step completion | step status→done, tx_id recorded, price unparked, call transaction, receipt, settlement, metrics, stats |
-| Step cancellation | step status→cancelled, parked price returned                                                   |
+Economics:
 
-A monetary transition and its audit record must commit or fail together.
+- **U16** On success the buyer pays the fixed price, not a metered cost: unused budget is the provider's margin, never a refund.
+- **U17** The operator's fee taxes each layer's margin (value added), never gross flows.
+- **U18** Zero-price actions run without any funds.
 
-Recovery is atomicity's crash-side guarantee. At startup, every trace without a transaction was mid-execution at shutdown and can never return: it is settled as a failure with `reason = interrupted`, deepest first, applying the normal refund rollup (§6) — settled descendants stay settled, refunds flow up the chain, and processes then close by the automatic rule (§3). Exception: a remote-proxy trace with a recorded dispatch is not interrupted — it resumes retrying with its stored `idempotency_key` until a signed receipt settles it (§13); its allocation stays locked and its process stays open. Steps with `status = running AND tx_id IS NULL` are reset to `status = waiting`, their interrupted completion call's allocation returned to the step's parking; `waiting` steps are untouched — their parked prices and open processes survive restarts. Recovery is idempotent.
+## 4. Advanced user stories
 
-## 6. Call transition and settlement
+Composition:
 
-`action.price` is a **subtree bound**: the maximum total cost of the call and everything it calls, advertised worst-case by the provider. The caller pays at most `price` for the whole tree under the call.
+- **U19** A provider can compose other providers' actions inside their own at one advertised price. Sub-providers are paid from the provider's budget; the caller sees one price, one result, one party to rate.
+- **U20** A provider's public action may use that provider's own private helpers inside anyone's process — but foreign code a user merely funds can never reach that user's private actions. Encapsulation without confused deputy.
+- **U21** A service reachable only as an HTTP endpoint can compose — call actions, suspend — with the same price bound and attribution as in-kernel code.
 
-Every wallet in the chain — user, process, trace — has `available` and `locked`, and money moves the same way at every level: `run` parks the price in the user's `locked`, the process holds it as `available`, and the root trace is funded from the process — the same caller/child move as every call; process closure releases the user's lock, returning remaining funds to `available`. Thereafter a subcall moves the price from the parent trace into the child trace. Every `Call` is funded from the trace it is handed.
+Asynchrony:
 
-For `q = action.price`, every `Call` runs:
+- **U22** An action can suspend awaiting one named party's input, with the money already reserved. That party sees the pending work addressed to them, supplies only what is missing, and the computation resumes and settles. Nobody else can resume it; it cannot resume twice.
+- **U23** Suspended work survives restarts. An owner can force-close an abandoned process; all parked funds return.
+- **U24** An external system delivers events by acting as an ordinary authenticated user — running an action or completing a step pre-created for it. No special webhook machinery.
 
-```text
-require trace.available >= q                  // the trace handed to Call (root trace pre-funded by run)
-trace.available -= q;  trace.locked += q
-create child trace with action_owner_id = A, available = q, locked = 0
-execute action by dispatching on action.kind
-validate output against action.output_schema
-on success: commit transaction + receipt + settlement + metrics + stats
-on failure: commit transaction + receipt + refund + metrics + stats
-return result, tx_id, trace_id
-```
+Value:
 
-A child's resolution always releases the caller's lock — `locked` holds only outstanding commitments:
+- **U49** A user can move value through an action: an explicitly value-bearing action delivers an exact amount from its **immediate caller** to a named local beneficiary — all-or-nothing, the value itself untaxed and separate from the execution charge. Under composition the value comes from the composing action's owner, never from the funding user. There is no cross-kernel extension: value between kernels moves as settlement on the external rail.
 
-```text
-child succeeds:   pay out child.available;              caller.locked -= q
-child fails:      caller.available += refunded amount;  caller.locked -= q
-step created (price p):   creator.available -= p;  creator.locked += p     // parked
-step resolved:            creator.locked -= p     // complete or cancelled (§10)
-```
+Web-standard integration:
 
-Zero-credit processes may execute zero-price actions.
+- **U25** An API owner can import an OpenAPI document and get one action per representable operation. Re-import reconciles changes without losing identity or history; unimport deactivates; public exposure requires proof of ownership.
+- **U26** A provider can attach upstream credentials that never surface anywhere — not in inputs, outputs, logs, receipts, or any read path.
+- **U27** A user can delegate their **own** upstream account (OAuth consent or a pasted personal token) to specific actions, one consent covering a coherent group. The credential is applied only for the exact consented action and only when that user is paying; consent is revocable; the credential is never visible to anyone.
+- **U28** A call needing an absent consent is refused before any money moves or reputation is dented, with a machine-actionable signal naming the consent to request.
 
-**Settlement (success).** The call's remaining `available` — what it did not commit to subcalls and steps — is its value added, and is paid out:
+Selection by agents:
 
-```text
-taxable = trace.available
-fee     = (taxable * fee_bps + 9_999) / 10_000
-net     = taxable - fee
-```
+- **U46** An agent can ask a configured model to select one action from typed candidates and propose valid arguments **without executing anything** — planning and spending are separate decisions. Selection uses the kernel's canonical contracts, never caller-supplied imitations; proposed arguments are schema-valid; one dead remote candidate never blocks selection among live ones; an absent model degrades explicitly, never changing money semantics.
 
-`target_user_id` is credited `net`; `@sys` is credited `fee`. Unused budget is the provider's margin, not a refund: `price` is a price, not a metered estimate. Negative value added is structurally impossible (`available ≥ 0`). Default `fee_bps = 2000`. Fee recipient is fixed as `@sys`. Each kernel taxes only its own layer; remote subcalls are subject to the remote kernel's fee policy independently. Exception: `kind = remote_proxy` settles per §13's receipt rule; all other kinds settle as above.
+Federation:
 
-**Refund (failure).** A failed call is rolled up entirely: its remaining `available`, plus the parked prices of all its outstanding steps — and, recursively, everything outstanding beneath them — is cancelled and returned to the caller's `available` (for a root call, to the process, and from there to the owner at closure). A refund whose destination trace has already settled goes to the process instead, and from there to the owner at closure: settlement is final, a trace never regains `available`. The failed call charges zero fee and net, records `status=failure`, and exposes the failure class in `reason`. Already-settled subcalls inside the failed call stay settled — their providers were paid from money the call had already spent.
+- **U29** A user can call an action on another kernel from their **local** balance at a deterministic, pre-advertised, all-in price — no remote account, prefunding, registration, or approval.
+- **U30** A provider gains outside demand by doing nothing beyond marking an action public.
+- **U31** Both operators are compensated: the serving side earns a markup for serving and financing the call; the origin side retains an import fee. Every component is advertised before execution; nobody can move the price after it is authorized.
+- **U32** Serving strangers is bounded-risk: an operator caps total unsecured credit across **all** peers at once, and minting additional identities cannot multiply that exposure. Sybil-proof by construction.
+- **U33** Kernels settle obligations over any external rail the operators choose; the kernel meters who owes whom and records the payment. Debts too small to pay economically still settle fairly, with zero expected loss to either side.
+- **U34** A home kernel behind NAT federates identically to one on a public host: no advertised address, port forwarding, or hosted document.
+- **U35** Intermittent connectivity is safe: a call to an unreachable peer either fails fast (provably never sent, full refund) or stays parked until signed proof of the outcome arrives — never double-charged, never silently dropped, visible with its age.
+- **U36** Any remote charge can be verified locally, offline, against signed evidence.
+- **U37** Moderation is one uniform lever: the operator can suspend or unsuspend any account — human or kernel — reversibly, preserving all data.
+- **U38** The operator can give peers memorable local names, securely: a remote party's self-chosen name can never seize a local name; an unnamed peer is fully usable by key.
+- **U39** Reputation crosses kernels as independently verifiable evidence of real trade, never opaque scores. A consumer can distinguish trade-backed ratings from unverified claims and detect a party that tells two stories. Evidence names the subject (kernel, action) and at most the counterparty **kernel**; it never carries the rater's identity, any payer or caller user identity, transaction, trace, or process ids, payload hashes, amounts, or beneficiaries. Public evidence by design, privacy-preserving by design.
+- **U40** A user can discover actions and users across the network through local search; anything discovered is verified with its home kernel before money moves. A stale directory affects only search.
+- **U41** Work can park across kernels: a step addressed to a remote party is visible to and completable by exactly that party. The peer is served the request, never the requester — no local identities cross the boundary.
+- **U47** Federation is non-transitive: an imported remote action is never re-served to a further kernel; reaching a provider requires resolving from its home kernel. No chains of unverifiable intermediaries.
 
-Schemas exist for every action. Unsupported JSON Schema subset forms fail action creation or update. A schema node without `type` is unconstrained; this is intentional and not an error. Validate input before locking and output before successful settlement.
-
-Subcall law:
-
-```text
-juice.call(target_action,args) from parent_action in parent_trace
-= Call(parent_action.owner_user_id, parent_trace, target_action, args)
-```
-
-Subcall transaction:
-
-```text
-owner_user_id  = parent_trace.process.owner_user_id
-caller_user_id = parent_action.owner_user_id
-target_user_id = target_action.owner_user_id
-```
-
-No ephemeral process is created. All subcalls spend from their parent call's trace within the same process. Trace-scoped process authority requires `Trace(parent_trace_id).action_owner_id = caller_user_id`. Settled subcall costs persist even if an ancestor later fails. A subcall whose price exceeds the parent's `available` fails with `ErrInsufficientFunds`; the parent decides whether to propagate failure.
-
-## 7. Action lifecycle
-
-`CreateAction`: inactive by default. Validate action owner, name, kind, non-negative price. `description`, schemas, and source are required at activation. WASM creation validates or compiles only when an executor is configured. HTTP creation validates endpoint configuration without calling it unless requested; every `kind=http` action — manual or imported — stores one structured source (verb, base URL, path, parameter bindings), with an optional verb (default POST) and explicit or implicit field routing (§8). Reject non-HTTP(S), loopback, RFC 1918 private, and link-local `169.254.x.x` source URLs at creation and activation. Normal `CreateAction` rejects `kind=native`.
-
-`RegisterNativeAction`: bootstrap-only; caller is responsible for `@sys` ownership.
-
-`Activate`: action-owner authority; initialize stats if absent; reject invalid schema, missing source, invalid artifact, unsafe URL, or invalid runtime.
-
-`Update`: action-owner authority; changing source, schema, kind, price, or endpoint deactivates unless explicitly safe; recompute WASM `artifact_hash`; reject unsafe HTTP source URLs; preserve historical transaction source/hash.
-
-`Delete`: action-owner authority; disable discovery and preserve history; soft deletion permitted.
-
-Native actions are bootstrap-registered, owned by `@sys`, not user-creatable/updatable/deletable, and callable only through `Call()`.
-
-## 8. Imported actions
-
-Imported actions are ordinary `Action` rows. Import is supervision. Execution remains through `Call()`.
-
-Shared reconciliation: import is idempotent over its match key. Reimport compares contract fields. Unchanged contracts preserve active state and local stats. Changed contracts update, deactivate, refresh lookup data, reset current stats, and preserve `Action.id`. Removed or no-longer-callable imported operations deactivate and reset stats. Unimport deactivates. Import and unimport are scoped by import provenance and match key. They must not affect manual actions, actions imported from another server, or actions imported through another mechanism. They never delete transaction, receipt, rating, or trace history. Stat reset writes missing-stat defaults only; it does not alter transactions, receipts, ratings, or trace history.
-
-### OpenAPI
-
-`juice action import --openapi <spec-url>` imports representable HTTP operations as inactive `kind=http`, `source.type=openapi` actions owned by the importer:
-
-```text
-Call(args: JSON object) -> JSON object
-```
-
-Allowed methods: GET, POST, PUT, PATCH, DELETE. Method is stored in `Action.source`, not `Call()` semantics. Imports and manual `kind=http` actions share one source representation, distinguished only by `source.type` (`openapi` vs `http`); import reconciliation (§8 match key) is scoped to `source.type=openapi` rows and never touches manual actions.
-
-Required or rejected/kept inactive with validation messages: `operationId` or `x-juice-name`; `description` or `summary`; parameters and/or requestBody schema; 2xx JSON response schema; optional `x-juice-price` defaulting to 0. Path, query, and JSON body fields compile into one canonical `input_schema`; selected 2xx JSON response schema becomes `output_schema`.
-
-Never active: non-JSON responses, streaming responses, multipart uploads, ambiguous success schemas, unsupported authentication, unsafe URLs, and invalid schemas. Invalid schemas and unsafe source URLs are rejected at import time, reported in the rejection list, and not stored inactive. Ratings and stats are never imported.
-
-Draft import needs no API ownership proof. Public activation requires proof by well-known challenge, challenge in the OpenAPI document, or verified credential.
-
-Authentication to upstream APIs is per-action: the importer stores an auth config in a dedicated write-only `auth_json` column — `{scheme, config, secrets}` — stored AES-256-GCM encrypted at rest; applied by a replaceable authenticator adapter at HTTP dispatch (§9). Secrets are write-only: never returned by any read path, never visible to scripts, never present in args, replies, logs, receipts, hashes, or manifests, and excluded from contract comparison. Implemented schemes: `header` (static header), `query` (query parameter), `bearer` (Authorization: Bearer), `basic` (HTTP Basic Auth), `oauth_client_credentials` (client id/secret exchanged at the token endpoint for a bearer), `oauth_jwt_bearer` (RFC 7523: a stored RSA private key signs a JWT assertion exchanged at the token endpoint), `oauth_delegated` (per-caller authorization-code+PKCE or device flow), and `delegated_bearer` (per-caller static token: a personal access token / per-user API key the caller supplies once, applied into a configured header — no token exchange). The scheme and its required config/secret keys are validated at action create/update, and dispatch fails closed on an unknown scheme — a request is never sent unauthenticated because its scheme was unrecognized. HMAC request signing is unsupported; operations requiring it stay never-active.
-
-Owner-held schemes live entirely in `auth_json`. The two **delegated** schemes instead keep the per-caller credential on a `Connection` row (§3) — one per `(user, upstream account)` — while the `Grant` binds only *consent* `(grantor, action, connection_id)` and holds no secret; no per-caller secret lives in `auth_json`. `oauth_delegated` stores provider config only — `auth_url`, `token_url`, optional `device_auth_url`, `client_id`, `scopes`, optional `client_secret` — and the caller's `Connection` holds an OAuth refresh token from the browser consent flow (§12). `delegated_bearer` stores no provider config and no owner-side secret — only an optional `{header, template}` naming where the token goes (default `Authorization: Bearer {token}`, so GitHub `token`, GitLab `Private-Token`, and `X-Api-Key` styles are expressible) — and the caller's `Connection` holds a static token (personal access token / per-user API key) supplied once via `POST /v1/grants` (§12); no token exchange, refresh, or `invalid_grant` handling, so a rejected token surfaces as an ordinary execution failure. **Binding rule (confused-deputy defense):** at dispatch a delegated token is applied iff `grant.grantor_user_id = process.owner_user_id` (the paying human) and `grant.action_id` = the executing action's id (the exact code trusted); the token is then fetched through `grant.connection_id`, so moving the credential onto a shared `Connection` leaves the check unchanged. Delegation therefore never transfers to another action's subcall, never crosses federation (a `remote_proxy` executes the proxy, not the http action, so the token never leaves the kernel), and WASM scripts never see tokens. Consent is a lazy precondition: a call to a delegated action whose process owner holds no matching grant is rejected with the typed `ErrGrantRequired` (§12), carrying the action reference as structured metadata so clients detect it by code, before any funds are locked and before any transaction exists — so an unconsented call never charges the caller nor dents the provider's failure stats (§9). Access tokens are cached in memory only (keyed by connection, so actions sharing an account share the cache), refreshed from the connection's stored refresh token, dropped on an upstream 401; refresh-token rotation persists the new token onto the one `Connection`, leaving sharing grants unaffected; `invalid_grant` deletes the `Connection` and cascades its grants so the next call re-consents. A deactivating update (§7), auth replacement, or deletion revokes the action's grants — consent binds to the contract, not the enabled bit — but never deletes the `Connection`, which outlives any one action. Token-endpoint fetches obey the same SSRF discipline as action sources (§7).
-
-**Connections, selectors, and reconcile.** `provider_key` is derived from the action's pinned, SSRF-validated facts (§3, §7), never from action names or descriptions, so no action can name its way into another's credential. The `oauth_delegated` key includes the resource-server domain because an OAuth `client_id` is public: without it a hostile action reusing a legitimate `token_url|client_id` under an attacker-controlled `source` could ride a victim's existing connection and have the minted access token delivered to the attacker (confused deputy); a different resource-server domain is therefore a distinct connection requiring its own consent, and the consent plan surfaces each group's destination host(s) (§14) so the recipient of a delegated credential is never hidden. Consent is planned per upstream account. A **selector** — `@owner` or `@owner/path`, matched by path segment (`@tom/brief` matches an action named `brief` or `brief/…`, never `briefing`; a full `@owner/name` is the degenerate one-action selector; a trailing `/*` is stripped) — expands to the delegated actions the caller may call (`CanCall`, §4), grouped by `provider_key`. One `delegated_bearer` token paste or one browser consent requesting the **union** of a group's `scopes` covers the whole group at once, minting one `Grant` per action against the single `Connection`; connecting an action whose provider `Connection` already covers the scopes grants instantly, no browser round-trip. Re-consent for a wider group stores the union of the stored and newly requested scopes, so earlier grants never lose coverage. Every connect is thus a **reconcile**: it compares the selection to existing coverage and acts only on the delta (the client must display that delta — the actions to be connected — as the consent act, §14). The first-run migration re-homes each legacy per-grant token onto its derived `Connection` (on a `(user, provider_key)` collision the latest `created_at` wins the secret) and reseals it under the new AAD; an unrecoverable legacy token deletes its grant.
-
-This maps OAuth's own trust model onto Juice's principals: the grant is consent to an identified client — the granted action — while services composed above consume its output unseen. A grant, like every resource of the process owner, is exercisable by the call trees the grantor funds, and each use is price-bounded, ledger-attributed (the role law records whose code requested it), and ratings-disciplined. The confinement line is *data at the run boundary, tokens absolutely*: a granted action's return flows to its caller like any result; the token itself never leaves dispatch.
-
-OpenAPI provenance:
-
-```json
-{
-  "type": "openapi",
-  "spec_url": "...",
-  "base_url": "...",
-  "method": "...",
-  "path": "...",
-  "operation_key": "...",
-  "operation_hash": "..."
-}
-```
-
-`operation_key = x-juice-name || operationId || canonical(method,path)`. Match key:
-
-```text
-action.owner_user_id + source.type + source.spec_url + source.operation_key
-```
-
-Contract fields: description, method, path, parameter bindings, input schema, output schema, selected response, price, execution source. `operation_hash` excludes stats, ratings, timestamps, and formatting. Manual name collision rejects import. OpenAPI unimport matches `owner_user_id + source.type=openapi + source.spec_url`, and optionally `Action.name` or `source.operation_key`.
-
-Inbound webhook payloads enter through the standard authenticated call path: external systems authenticate as registered users with bearer tokens and call `POST /v1/run` directly, or complete a pre-created step via `POST /v1/steps/{id}/complete`. No special webhook-registration endpoint exists in the kernel.
-
-### Remote
-
-`admin friend` fetches the remote's active public actions, verifies each signed manifest, and creates or updates local `kind=remote_proxy` actions owned by the local remote-peer user row. Imported actions are immediately enabled and public. It does not copy implementation.
-
-Manifest required fields:
-
-```text
-action_id owner_handle name description input_schema output_schema price kind
-artifact_hash stats updated_at signature
-```
-
-Only active public remote actions have manifests; an action using a delegated auth scheme (`oauth_delegated` or `delegated_bearer`, §8) is never served as a manifest and never gossiped, because a remote peer's single proxy user can never complete a browser consent nor hold a per-caller token. A kernel serves manifests and gossips (as its own exposed actions) only actions it owns — `kind ∈ {http, wasm, native}`; an imported `kind=remote_proxy` action is never re-served, so friendship stays non-transitive: reaching a peer's imported action requires friending its true owner directly. Manifest descriptions and schemas are the canonical interface used by importing kernels for lookup and LLM function calling. `signature` is the remote platform Ed25519 signature over canonical JSON excluding `signature`, verified against the remote peer's `public_key`. Match key:
-
-```text
-proxy.owner_user_id + proxy.remote_action_id
-```
-
-Remote contract fields:
-
-```text
-action_id artifact_hash description input_schema kind name output_schema owner_handle price
-```
-
-Manifest stats and `updated_at` do not affect contract comparison; manifest stats never overwrite local `Stats` and are not stored as `StatTag`. Invalid signatures skip that action. A second `admin friend` re-syncs: new actions are imported, changed-contract actions are updated (re-enabled), and actions no longer active/public on the remote are deactivated and their stats reset. `admin unfriend` deactivates all proxies from that peer and preserves all history.
-
-The proxy's local `price` is `manifest.price` plus the worst-case import duty: `price = mp + ceil(mp * import_bps / 10000)` (§13). The local caller sees one price bounding the whole remote call, duty included; settlement charges duty on the actual remote charge and refunds the difference (§13). A change of the local `import_bps` recomputes proxy prices but is not a manifest contract change and does not deactivate.
-
-## 9. Adapters, native actions, and stats
-
-WASM uses wazero. Scripts receive no ambient filesystem, network, environment, process access, or raw user tokens. They receive only explicit host functions, each execution having memory limit, timeout, deterministic context cancellation, and artifact-hash compiled-module cache. The network is reachable only mediated, never ambient: a script holds no sockets and reaches the web solely by calling the read-only, SSRF-restricted `@sys/web` action (or a provider's pinned `kind=http` action) through `Call()`, charged like any other call. Store source and artifact; authorized users may inspect source; activation should precompile; compilation failures are typed.
-
-Host surface:
-
-```text
-juice.call          subcall under §6
-juice.step_create   create a waiting step under §10; returns step_id
-juice.step_complete complete a waiting step under §10; returns {result, tx_id, trace_id}
-juice.log           structured trace log
-```
-
-Script authority:
-
-```text
-ScriptAuthority ⊆ KernelAuthority(trace, process, subject)
-```
-
-**Out-of-kernel composition.** Composition — subcalls and steps, funded by the caller's subtree price (§6), attributed by the role law (§1/§4) — is available in-process to WASM and native actions through the host surface above. A `kind=http` action executes outside the kernel and would otherwise be a leaf: callable but unable to subcall or suspend into a step, because composition needs a live trace and an HTTP endpoint has none. To let a service reachable *as* a `kind=http` action compose with the same guarantees, the kernel hands every dispatched HTTP call a **trace-scoped capability**: the call's `trace_id` signed with the platform key over a disjoint JCS object `{"cap": trace_id}` (§12). It is delivered as an HTTP header alongside a callback base-URL header, and never enters the payload, `args_json`, `reply_json`, receipts, receipt hashes, or logs (R9). Presented back as a bearer header on a callback, it authorizes composition **as the executing action's owner within its trace** — the WASM subcall law (§6): the callback runs with `caller_user_id = action.owner_user_id`, funded from the trace, `CanCall` evaluated against the process owner (§4). It grants nothing else — no user wallet, no other trace or process, no supervision — so its blast radius equals what the owner's WASM code could do in the same trace.
-
-Callbacks reuse the execution API, mirroring the host surface: `juice.call` ≡ `POST /v1/call` (a subcall on the trace — the HTTP twin of `Call`, capability-only, with no `run`/wallet path); `juice.step_create` ≡ `POST /v1/steps` (the capability *is* the trace, so no `trace_id` is sent); `juice.step_complete` ≡ `POST /v1/steps/{id}/complete` (completes iff `required_caller = action owner`, §10). Each reuses `BeginSubcall`/`CreateStep` — no new money path; a callback exceeding the trace's remaining `available` fails `ErrInsufficientFunds`, so the advertised `price` bounds the whole subtree. The capability is valid only while its trace is **unsettled** (no `transactions` row, the settled-once invariant §11); settlement or process closure invalidates it by committing that row, and a callback presented afterward is rejected. A spend under a capability and its trace's settlement are mutually exclusive, so concurrent callbacks neither exceed the subtree bound nor race the payout. An in-flight capability trace is swept to `interrupted` by ordinary recovery (§5); a dispatch retry never mints a fresh trace or capability. The callback base URL is the kernel's own reachable HTTP address (`http_callback_url`, §14, else derived from the listen address); a loopback callback (the co-located case, gated by `allow_local_sources`, §7) is plain HTTP, a public one requires TLS, and the header is stripped across a host-changing redirect. Issuance is ambient — a leaf endpoint simply ignores the headers. The capability is **local to the executing kernel and never crosses federation**: a composing HTTP action is served and gossiped as an ordinary `kind=http` action (§13), its composition invisible to importers and bounded by the manifest price it advertises.
-
-`llm` exposes replaceable `Embed(ctx,text)->vector` and `Chat(ctx,messages)->message`; concrete adapters call Ollama, but `kernel` must not import them. Defaults (configurable in `config.json` under `native.llm`, §14): URL `http://localhost:11434`, chat `gemma4:26b`, embedding `nomic-embed-text`. Tests use fakes.
-
-Upstream authentication is a replaceable adapter: `Authenticator.Apply(request, auth) -> request` transforms an outbound HTTP request using the action's stored auth config (§8); schemes are implementations behind this interface, including the OAuth token exchange and in-memory token cache (§8), and `kernel` must not import them. Tests use fakes.
-
-Native actions are standard actions shipped alongside the kernel as a platform stdlib. They have no special kernel privileges — any provider could have supplied equivalent actions as HTTP or WASM actions. They are registered at bootstrap under `@sys`, interact with the platform only through injected dependencies and the same `Call()` / `CreateStep()` entry points available to all actions, and never extend the kernel's internal interfaces on their own behalf.
-
-| Action          | Rules                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                     |
-| --------------- | ---------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------- |
-| `@sys/lookup`   | Public; action owner `@sys`; price 0 (configurable, `native.lookup`, §14); callable only through `Call()`. Rank active actions by a tested formula combining lexical (BM25) and semantic (cosine) relevance — fused by reciprocal-rank fusion. **Stats-based quality weighting is UNDER REVISION and temporarily removed** (the multiplier could bury an exact match beneath weakly-relevant ones); ranking is by fused relevance alone until the redesign lands (see `ranking.md`). The embedder is optional: with none configured, ranking degrades to the lexical leg alone, so lookup still works on a kernel with no LLM. Replaceable ranking storage; brute-force cosine acceptable. Input: required `query`, optional `limit=10`. Output: `results[]` with `action_id`, `action` (`@owner/name`), `description`, `score`, `input_schema`, `output_schema`. Direct lookup only for diagnostics, not user-facing APIs or WASM hosts.                                                                                                                                                                                                                                                                                                       |
-| `@sys/llm/chat` | Public; action owner `@sys`; price 0 (configurable, `native.llm`, §14); callable through `Call()`. Input: `messages[]` of `{role,content}` plus optional `system`. Output: `message{role,content}`. `ErrInvalidState` if chat unconfigured.                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                          |
-| `@sys/llm/embed` | Public; action owner `@sys`; price 0 (configurable, `native.llm`, §14); callable through `Call()`. Input: required `text` (string). Output: `embedding` (array of numbers). `ErrInvalidInput` if `text` is empty. `ErrInvalidState` if embedder unconfigured. |
-| `@sys/llm/json` | Public; action owner `@sys`; price 0 (configurable, `native.llm`, §14); callable through `Call()`. Input: `messages[]` of `{role,content}`, optional `system`, required `output_schema`. Output: `value` (JSON value). Validates model output locally against `output_schema`. `ErrSchemaViolation` for unsupported schema. `ErrInvalidState` if structured output unavailable. `ErrExecutionFailed` if no valid JSON produced. |
-| `@sys/llm/decide` | Public; action owner `@sys`; price 0 (configurable, `native.llm`, §14); callable through `Call()`. Given a conversation and a set of Juice actions, asks the LLM to select one and propose args — does not execute the call. Input: `messages[]` of `{role, content?, tool?}` where `role` is one of `system`, `user`, `assistant`, `tool` and `tool` is an optional object `{action?, args?, result?}`; required `actions[]` (list of `@owner/name`). Kernel fetches each action's canonical description, `input_schema`, and price from the DB. Output: `action` (`@owner/name`), `args` (validated against that action's `input_schema`), optional `message`. `ErrNotFound` if any action reference is unknown. `ErrInvalidState` if LLM tool calling unavailable. `ErrExecutionFailed` if no valid selection produced. |
-| `@sys/time`     | Public; action owner `@sys`; price 0 (configurable, `native.time`, §14); callable through `Call()`. No input required. Output: `unix` (integer seconds since UTC epoch), `iso` (RFC 3339 string). |
-| `@sys/sink`     | Public; action owner `@sys`; price 0 (configurable, `native.sink`, §14); callable through `Call()`. Accepts any input, returns `{}`. Universal no-op sink for steps that require an onward action but no further computation. |
-| `@sys/message`  | Public; action owner `@sys`; price 0 (configurable, `native.message`, §14); callable through `Call()`. Sends a message to another platform user by creating a Step they must acknowledge. Input: required `to` (`@handle` of recipient), required `message`. Output: `step_id`. The Step sets `required_caller_user_id` to the resolved target user and `partial_args` to `{"message":"..."}` so the recipient can read it via `step list`. Uses `@sys/sink` as the step's `action`. `ErrInvalidInput` if `to` cannot be resolved. |
-| `@sys/random`   | Public; action owner `@sys`; price 0 (configurable, `native.random`, §14); callable through `Call()`. No input required. Output: `value` (float in `[0, 1)`). Exists to provide randomness to WASM scripts, which have no ambient access to the OS random source. |
-| `@sys/web`      | Public; action owner `@sys`; price 0 (configurable, `native.web`, §14); callable through `Call()`. Read-only fetch of a public web page. Input: required `url` (string); a scheme-less `url` defaults to `https` (HTTPS-first, like a browser), and an explicit `http`/`https` scheme is respected and never silently downgraded. Output: `status` (HTTP status integer), `body` (response body string), `content_type` (response `Content-Type` string), `final_url` (the URL actually fetched, after scheme defaulting and redirects). GET only; no caller-supplied headers or auth, so nothing sensitive enters args/receipts/logs. A fixed, configurable descriptive `User-Agent` is set by the action itself. Same SSRF discipline as `kind=http` (§7): loopback, RFC 1918 private, and link-local `169.254.x.x` hosts are rejected with `ErrInvalidInput` unless `allow_local_sources` is set. Non-2xx statuses are returned in `status`, not raised as errors, so crawlers can react to them; 10 MiB response cap. `ErrInvalidInput` for empty `url`; `ErrInvalidState` if the fetcher is unconfigured; `ErrExecutionFailed` on transport failure. The mediated path by which WASM scripts read the network: scripts still receive no ambient sockets — they reach the web only by calling this action through `Call()`, charged and SSRF-restricted to public hosts (§9). |
-| `@sys/tinygo/compile` | Public; action owner `@sys`; price 5 (configurable, `native.tinygo`, §14); callable through `Call()`. Compiles author-supplied TinyGo to a WASM artifact using the platform TinyGo compiler, prepending the Juice WASM SDK so the author writes only `func Handle(in map[string]any) (map[string]any, error)` (the SDK owns `package`, imports, `alloc`, `run`, `main`). Input: required `source`. Output: `status` (`success`/`failure`), `artifact` (base64 WASM, on success), `artifact_hash` (SHA-256 hex, on success), `diagnostics` (array). Empty `source` gives `ErrInvalidInput`; an unavailable compiler toolchain gives `ErrInvalidState` (platform misconfiguration — the call fails and is not charged). Author compile errors and import/export-validation failures use output failure status, not kernel errors (so the attempt is charged). Registration is separate supervision: pass the returned artifact to `action create --kind wasm --artifact` (§14). |
-
-Stats use:
-
-```text
-mean_(n+1) = mean_n + (x_(n+1)-mean_n)/(n+1)
-```
-
-`latency_estimate` is the arithmetic mean over completed calls, with denominator `uses`; each sample is the call's own elapsed time, `transaction.ended_at − transaction.started_at`. Buyer-experienced subtree latency (including step dormancy) is not a stat — it is a query over descendant transactions (§11).
-`rating_estimate` is the arithmetic mean over rated calls only, with denominator `rating_count`.
-There is no cost estimate: an action's all-in cost is its advertised `price` (§6), known in advance; lookup ranks on it directly.
-
-## 10. Steps
-
-A Step is a partially applied future Call: a suspended computation boundary that records enough context to resume when a caller later supplies the remaining input.
-
-```text
-Step {
-  id
-  parent_trace_id          // creating/funding trace; derives process; inherited by completion trace
-  required_caller_user_id
-  action_id
-  price
-  partial_args
-  status           // waiting | running | done | cancelled
-  tx_id
-  created_at
-}
-```
-
-Core invariant:
-
-```text
-CompleteStep(caller, id, input) = Call(caller, step.parent_trace_id, action_id, partial_args ⊕ input)
-```
-
-A step is funded at creation: `action.price` is snapshotted as `step.price` and moved from the creating trace's `available` into its `locked` (§6). The parked price is the completion call's allocation — completion never checks funds, because the money is already reserved. Cancellation returns the parked price (§6: with the creator's failure rollup, or at process closure to the process owner).
-
-`partial_args ⊕ input` is a shallow object merge. Keys in `input` overwrite keys in `partial_args`. The completer's allowed input is `action.input_schema \ keys(partial_args)` — the action's input keys not already bound — derived live rather than stored; only those keys may appear in `input`. Final arguments are validated against `action.input_schema` by the underlying `Call`. Live derivation is safe because an action's schema cannot change under an active step: a schema change deactivates the action (§7), and a completion against a deactivated or contract-changed action resets the step to `waiting` (below).
-
-`required_caller_user_id` is mandatory. Open completion is not supported.
-
-Status states:
-
-| State     | Meaning                                                                                            |
-| --------- | -------------------------------------------------------------------------------------------------- |
-| `waiting`   | Completable if its process is open. The only state from which `CompleteStep` may begin. Holds its parked price; keeps the process open.            |
-| `running`   | Claimed; the resumed `Call` is executing. Prevents concurrent double-execution.                    |
-| `done`      | The resumed `Call` finished. Success, failure, receipts, and settlement belong to the transaction. |
-| `cancelled` | The process closed or the creating call failed before completion. Terminal; no `tx_id`; parked price returned. Not completable.           |
-
-A step does not duplicate transaction state. Completion timing, result, and failure reason are obtained from the transaction referenced by `tx_id`.
-
-A process closes automatically when its root call has returned and no steps are outstanding (§3). Forced closure (`EndProcess`) atomically cancels all `waiting` steps in the same transaction as closure, returning their parked prices to the process owner; a call's failure cancels its outstanding subtree (§6).
-
-Startup recovery: `ResetRunningSteps` sets all steps with `status=running` and `tx_id=null` back to `status=waiting`. `cancelled` steps are never reset.
-
-### Operations
-
-`CreateStep(required_caller, trace, action, partial_args) -> step_id`: the creating authority is the trace's action owner (`Trace(trace).action_owner_id`), so in-execution creation is implicit. For external creation (`POST /v1/steps`) the service layer requires that the authenticated, non-suspended user be permitted to use `trace` (precondition 4 of §4) before invoking the primitive. The process is `Trace(trace).process_id` and must be open; `CanCall(process.owner_user_id, action)` must hold. Requires `Trace(trace).available ≥ action.price`; creation parks that amount from `trace` (§6), so the parked price is always the recorded payer's money. The completer's allowed input is derived (above), not supplied. Returns a `waiting` step.
-
-`ReadStep(caller, id)`: requires `CanReadStep`.
-
-`ListSteps(caller)`: returns steps visible to the caller per `CanListStep`, ordered by `created_at` descending. Optional filters: `process_id`, `status`.
-
-`CompleteStep(caller, id, input)`:
-
-```text
-1. step exists
-2. status = waiting
-3. process exists and is open
-4. caller = required_caller_user_id  (no superuser exception; IsSuperuser does not permit completing another user's step)
-5. input satisfies the step's allowed input (`action.input_schema \ keys(partial_args)`)  (a violation rejects the completion and leaves the step waiting; it is never recorded as a failure of the action)
-```
-
-`ClaimStep` atomically transitions `waiting→running`. Then executes:
-
-```text
-Call(caller, step.parent_trace_id, action_id, partial_args ⊕ input)
-```
-
-The resumed `Call` takes the step's parked price as its allocation — `creator.locked -= p`, new trace `available = p` — in place of §6's trace-entry move; no availability check occurs. The completion call's allocation and transaction `gross` are `step.price`, not the action's current price. On `Call` completion (success or failure), atomically records `status=done` and `tx_id`. If `Call` rejects before creating a transaction (action deactivated, `CanCall` lost, malformed input), the step is reset to `waiting` — its parked price stays parked. Funds exhaustion cannot occur.
-
-Completion transaction role law:
-
-```text
-owner_user_id  = step's process owner
-caller_user_id = required_caller_user_id
-target_user_id = action.owner_user_id
-```
-
-### Access rules
-
-```text
-CanListStep(u, k) :=
-  u = Process(Trace(k.parent_trace_id).process_id).owner_user_id
-  ∨ u = k.required_caller_user_id
-  ∨ IsSuperuser(u)
-
-CanReadStep(u, k) := CanListStep(u, k)
-```
-
-### WASM host functions
-
-```text
-juice.step_create(partial_args, required_caller_user_id, action_id) -> step_id
-```
-
-Creates a waiting step bound to the current process and current trace (as `parent_trace_id`). Arguments are JSON-encoded strings.
-
-```text
-juice.step_complete(step_id, input) -> {result, tx_id, trace_id}
-```
-
-Completes a waiting step. The executing action owner is used as the caller, matching `juice.call` subcall semantics. `input` is a JSON-encoded object.
-
-### Webhook integration
-
-External systems deliver inbound payloads through the standard authenticated call path. They register as users, obtain bearer tokens, and either:
-
-- Call `POST /v1/run` directly with the webhook payload as `args`.
-- Complete a pre-created step via `POST /v1/steps/{id}/complete` with the payload as `input`.
-
-No special webhook-registration endpoint exists in the kernel.
-
-## 11. Receipts, ratings, signatures, transaction access
-
-Every transaction references a trace. Trace lookup by process returns the execution tree. Trace deletion must not remove transaction history. Latency is derived from transaction timestamps, not cached on the trace:
-
-```text
-own-call latency    = transaction.ended_at − transaction.started_at
-buyer-experienced   = max(descendant.ended_at) − root.started_at   // a query over the subtree
-```
-
-Buyer-experienced (subtree) latency is wall time: it includes step dormancy (e.g. human approvals) and is always current — a query reflects late descendants the moment they complete, with no retroactive write. Ranking must treat it accordingly (§9); it is not a measure of compute time.
-
-Only `tx.owner_user_id` may rate the transaction. Rating is supervision, immutable, non-cascading, duplicate-rejected with `ErrInvalidInput`, and never routed through `Call()`.
-
-Every committed success or failure has exactly one receipt. `issuer_user_id=@sys`. `args_hash` and `reply_hash` are SHA-256 over RFC 8785 JCS canonical `args_json` and `reply_json`. Receipt economics match the transaction. `gross` is the call's price — its full allocation (§6). `fee` and `net` are the settlement amounts: `fee + net = taxable`, the allocation remaining at settlement; `gross − fee − net` is what the call committed downstream. On failure `fee = net = 0`, and the refunded amount equals `gross` minus the `fee + net` totals of the call's settled descendants. Signature is Ed25519 over canonical receipt JSON excluding `signature`. Transaction and receipt creation are atomic.
-
-Receipts, ratings, and manifests use RFC 8785 JCS:
-
-```text
-CanonicalJSON(v any) ([]byte,error)
-```
-
-Sign and verify only canonical JSON. Receipt signatures and rating signatures are Ed25519 signatures made with the platform key. Rating signatures cover all fields except `signature`. ASCII property names make UTF-8 ordering equivalent to RFC 8785 UTF-16 ordering.
-
-Transaction access uses historical transaction fields:
-
-```text
-CanReadTransaction(u,t) :=
-  u = t.owner_user_id ∨ u = t.caller_user_id ∨ u = t.target_user_id ∨ IsSuperuser(u)
-```
-
-All three transaction parties are identified by captured fields: `owner_user_id` (payer), `caller_user_id` (call caller), `target_user_id` (payee). These remain valid after action deletion because all parties were captured at transaction creation. Receipts remain internal settlement/federation artifacts; there is no provider-receipt endpoint. Every credit to an action owner must be reconstructible from transactions readable by that action owner.
-
-## 12. Authentication, bootstrap, and supervision
-
-Authentication uses OAuth/OIDC-style browser authorization code with PKCE, CLI device authorization or loopback login, short-lived bearer access tokens, rotatable refresh tokens if used, and server-side logout revocation. Scripts never receive access or refresh tokens.
-
-The same PKCE/device machinery serves upstream OAuth consent for `oauth_delegated` actions (§8): the client hosts the redirect target — a local client (CLI/desktop) catches it on a loopback listener reachable by the operator's own browser even behind NAT; a hosted client uses its own provider-registered callback URL — and drives `POST /v1/grants/start` / `POST /v1/grants/complete` authenticated as the grantor. Consent is planned per upstream account (§8): a `grants/start` names a `(selector, provider)` group, its authorize request carries the union of the group's `scopes`, and `grants/complete` stores one `Connection` and mints one `Grant` per action in the group. The kernel holds only short-lived in-memory PKCE/device state (~10 min TTL) and performs the code→token exchange itself, so no unauthenticated callback route exists on the kernel and the refresh token never passes through the client. The kernel never dials `redirect_uri`; it only embeds it in the authorize URL, and the OAuth provider's registered-redirect allowlist (exact match) is what binds an issued code to a legitimate client, so any http(s) redirect is accepted and the consent-phishing vector is closed at the provider. In-memory consent state is single-use, TTL-bound, and completable only by the grantor who started it.
-
-Errors:
-
-```text
-ErrUnauthenticated ErrUnauthorized ErrNotFound ErrInvalidInput ErrInvalidState
-ErrInsufficientFunds ErrExecutionFailed ErrSchemaViolation ErrTimeout ErrInternal
-ErrGrantRequired ErrPeerUnreachable ErrPeerUnfunded
-```
-
-`ErrGrantRequired` is a precondition failure, the twin of `ErrInsufficientFunds` — the process owner must delegate an upstream OAuth grant before the action can run (§8). It carries the action reference as structured metadata so clients act on a code, not a message.
-
-`ErrPeerUnreachable` and `ErrPeerUnfunded` attribute a remote-proxy failure to the federation relationship, not to the caller. `ErrPeerUnreachable` means the first dispatch provably never reached the peer (§13, never-dispatched settlement); the call is settled locally as an ordinary failure with a full refund. `ErrPeerUnfunded` means the remote peer signed a zero-charge rejection because *this kernel's* prepaid credit there is exhausted — an operator condition remedied by an out-of-band payment and `admin deposit` on the peer, never the caller's own balance. Both carry the peer handle as structured metadata (`Meta["peer"]`), like `ErrGrantRequired` carries its action, so clients act on a code and fields, not on message text.
-
-Errors map to stable CLI exit codes and HTTP statuses. Messages are concise; logs may include diagnostics.
-
-The fixed superuser handle is `@sys`. CLI admin authority compares authenticated handle to `config.superuser_handle`.
-
-First boot prompts only for a password and atomically creates:
-
-```text
-@sys user
-config.superuser_handle = @sys
-config.signing_public_key  = base64url Ed25519 public key
-config.signing_private_key = base64url Ed25519 private key
-config.jwt_secret          = 32 random bytes, hex
-```
-
-A chosen password must be at least 8 characters, enforced server-side at user creation, first boot, and password update (no composition rules); a shorter one returns `ErrInvalidInput`. Private signing key and JWT secret are never logged or returned. Partial first boot is rerunnable. `JUICE_SECRET_KEY` overrides stored JWT secret at runtime only. First boot also **requires a `kernel_handle`** — the name this kernel presents to the network (§13): from config, else `JUICE_BOOTSTRAP_KERNEL_HANDLE`, else an interactive prompt that repeats until a non-empty name is given; a headless first boot with none set fails rather than name the kernel silently.
-
-The kernel's federation network identity is derived deterministically from this same Ed25519 signing key; there is no second identity or network key. The `public_key` is simultaneously the kernel's Juice identity (§13) and its address on the federation transport. The signature domains of the transport handshake and of Juice payloads (receipts, ratings, manifests, federation requests) must be disjoint: no byte string signed in one domain may verify as a valid message in the other. This disjointness is verified by test (§15). *Open item:* disjointness is today emergent (distinct JCS key-sets + libp2p's handshake prefix), not constructive; adding explicit per-domain signing prefixes changes every signed payload, so it is deferred to a federation-protocol version bump.
-
-Every startup reads `config.superuser_handle` to confirm first boot and identify `@sys`; it verifies signing keys and aborts if either is absent. It then registers, enables, and makes public `@sys/lookup`, `@sys/llm/chat`, `@sys/llm/embed`, `@sys/llm/json`, `@sys/llm/decide`, `@sys/time`, `@sys/sink`, `@sys/message`, `@sys/random`, `@sys/web`, and `@sys/tinygo/compile` if absent, and reconciles their configurable fields (price and action-specific settings) from config on every startup. It also **soft-deletes any `kind=native` action whose handler is not registered in the running build** (disabling discovery, preserving history, §7): a native action removed from the platform stdlib stops being listed and callable on an existing database, self-healingly and for any native. It then runs recovery (§5).
-
-Bootstrap is idempotent. Supervision operations are not native actions.
-
-The superuser may suspend or unsuspend users. Suspension preserves data and makes every authenticated request return `ErrUnauthenticated`. It also excludes the suspended user's actions from action listings and makes them uncallable (`CanCall` fails on a suspended owner, §4); their data survives and unsuspending restores listing and callability.
-
-`Kernel.Deposit(operator_user_id,target_user_id,amount,reason)` is admin-CLI-only supervision. It requires configured superuser and positive amount, then atomically credits `user.available` with a credit adjustment record. `reason` is optional and stored when provided. The operation is idempotent over `external_key` when supplied. It is served on the public TCP API (§14) as a superuser-gated route: authority is the `@sys` bearer token, not filesystem access.
-
-`Kernel.Withdraw(operator_user_id,target_user_id,amount,reason)` is admin-CLI-only supervision: the mirror of `Deposit`. It requires configured superuser, positive amount, and `target.available ≥ amount`, then atomically debits `user.available` with an immutable debit adjustment record — the user's credits are redeemed and the operator owes the out-of-band payout. The operation is idempotent over `external_key` when supplied: a replay returns the existing adjustment record before the `target.available ≥ amount` check runs, so a replayed withdrawal never fails on a balance that has since dropped. Served on the public TCP API as a superuser-gated route (§14), like `Deposit`.
-
-`Kernel.UpdateUser(callerUserID, email, currentPassword, newPassword)` is user self-service: only the authenticated, non-suspended local user may update their own account. `email` and `newPassword` are both optional; at least one must be provided. When `newPassword` is non-empty, `currentPassword` must match the stored hash; mismatch returns `ErrUnauthenticated`. An account with no password credential (a key-only account) cannot use this operation (`ErrInvalidState`). `handle` is immutable except by superuser rename. The update is atomic.
-
-`Kernel.RenameUser(operatorID, targetID, newHandle)` is superuser-only supervision, the sole path that changes a `handle`: it validates `newHandle` (unique, no `/`) and writes it atomically, vacating the old handle for reuse. The superuser's own account cannot be renamed (`ErrInvalidInput`), as its handle is bound to `config.superuser_handle`. Served on the public TCP API (§14) as a superuser-gated route.
-
-## 13. Federation
-
-### Transport
-
-Federation has exactly one carrier: a peer-to-peer transport (libp2p) behind the replaceable `fed` interface (§2), which `kernel` never imports. The kernel addresses a peer only by its `public_key`; the transport resolves that key to a live connection — direct when the peer is publicly reachable, hole-punched through NAT when possible, relayed through a public helper node as a last resort. Streams are mutually authenticated by peer key, so a connection is itself proof of the counterparty's network identity; the per-request Juice signatures below are nonetheless retained deliberately, because receipts, rejections, and dispatch records must be storable and verifiable offline (§11) — channel authentication cannot replace a signed artifact. The transport-handshake and Juice-payload signature domains are disjoint (§12).
-
-On startup the kernel announces its key to the discovery network (DHT / rendezvous), bootstrapped from `bootstrap_peers` in `config.json` (§14). A bootstrap peer is just a publicly-reachable kernel (every kernel runs the DHT and a relay); the shipped default points at the project's public node, so a fresh `juice serve` joins out of the box. An empty list disables the DHT directory engine (the kernel neither announces nor discovers), but friend sync still runs (§13 peer sync), so a kernel with imported proxies keeps its peers' cached state fresh. `bootstrap_peers` is also the **seed of the known network** (§13 Gossip): on a timer (`discovery_interval_seconds`, §14) the kernel advertises itself as a provider under a fixed discovery key, enumerates that key to learn other online kernels, and pulls gossip from the seeds plus enumerated providers into `DiscoveredKernel` — so a fresh box has a directory to friend from. This directory pull is separate from gossip's reputation role and from friending: learning a kernel this way grants nothing (calling still requires friendship and a deposit, §13). Because a libp2p peer ID inlines its Ed25519 key, a bootstrap peer supplied only as a multiaddr is addressable and inspectable by the same base64url key every federation command takes. Publicly-addressed and NAT-bound kernels federate identically — a home kernel behind a router needs no advertised address, port-forwarding, or `.well-known` document of any kind (the local `server_url` in §14 is only the loopback URL the CLI dials to drive your own kernel, never a federation address).
-
-Federation protocols are versioned libp2p streams: `/juice/fed/call/1` (inbound proxy call), `/juice/fed/friend/1` (friend handshake), `/juice/fed/manifest/1` (manifest serving, chunked per action so a large-catalog sync survives bandwidth-capped relayed connections), `/juice/fed/gossip/1`, and `/juice/fed/inspect/1`. Payloads and verification are exactly the settlement rules below; only the carrier is libp2p.
-
-Inbound federation traffic is resource-limited at the transport: per-source-address limits where an address is visible, per-peer stream and byte budgets, a global inbound cap, and stricter budgets for relayed (address-less) traffic. Peer identities are self-issued and free to mint, so per-key limits alone are never sufficient against Sybil flooding. These transport limits replace §14's per-IP peer-request rate limit.
-
-### Peers and proxy users
-
-There is no user "kind" — every user is one account model distinguished only by the credentials it holds. A **password account** (from `user create`) logs in and holds tokens; a **key account** (`public_key` set, created only by peer acceptance) is a peer kernel's account here and authenticates by federation signature, per request. An account can't get a token without a password, and can't be a federation counterparty without a key. Because a peer is just a user, federation adds no new money model: a key account holds credits, pays, and is paid like anyone else.
-
-A `@handle` names an account in one kernel's namespace; a `public_key` names it in the global (inter-kernel) namespace. The `@` prefix vs a base64url key tells them apart, so any command naming an account accepts either. Friending a peer mounts its namespace under a local alias: peer B's action owned by `alice` is imported owner-qualified as `@B/alice/greet` (`@B` names the mount, `alice/greet` the action), so two owners on B with the same action name never collide. The relation is not transitive, so the graph flattens into each observer's root rather than nesting. Key rotation is unsupported — a lost key is a lost identity and reachability at once; a peer's self-reported handle is only a default alias, each importer binding its own (auto-suffixed on collision). Settlement rolls up to the mount: every one of B's owners settles into the single proxy user for B (the bilateral account), so `@B/alice/…` and `@B/bob/…` name and attribute but do not fragment the wallet.
-
-### Friending — the ACT relation
-
-Two kernels transact only as **friends**: a reciprocal relation with the proxy-user pair (`@B` on A, `@A` on B).
-
-```text
-juice admin friend <key>      register peer by public key + bulk-import all their active public actions
-juice admin unfriend <user>   end the relation; deny future requests; deactivate all proxies (user is @handle or key)
-juice admin peers             friended peers and balances (--all also shows denied/unfriended)
-juice admin inspect <key|user>  view remote identity, public actions, transacted friends, and reachability (key, or @handle if already friended; no DB write)
-```
-
-Federation trust is superuser supervision, so these live under `admin`, served on the public TCP API as superuser-gated routes (§14). The inbound friend handshake is the `/juice/fed/friend/1` protocol, authenticated by federation signature — not a local API. `admin inspect <key>` is the operator's window into a remote kernel (there is no browser-reachable federation endpoint): it reports the peer's identity, public actions, and transacted friends, plus reachability diagnostics (direct / hole-punched / relayed, latency, protocol versions).
-
-Federation commands are defined for an offline peer and bounded so they fail promptly: `admin friend` fails as unreachable, `admin inspect` degrades to the last-known local data with reachability `unreachable`, and `admin unfriend`/`peers`/`identity` are local and always work.
-
-`admin identity` prints this kernel's own federation identity — its public key (the value peers friend it by, since there is no `.well-known`), handle, and libp2p listen addresses. Because every kernel runs a circuit-relay service and joins the discovery DHT, a **publicly-reachable `juice serve` automatically is the network's bootstrap + relay** — the meeting point NAT-bound kernels announce to and are reached through; there is no separate seed process. A public node binds the standard federation port `31313` for a stable address (a NAT-bound node uses an OS-assigned port and is found by key). `friend` opens an authenticated stream to `<key>` and sends a signed request; the peer's self-reported handle arrives over the protocol. By default kernels **auto-accept** (`peer_auto_accept = true`): the proxy user is created with balance 0 and a reciprocal request completes the pair; in manual mode requests sit pending until the operator friends back. Friend requests are subject to the §13 transport resource limits.
-
-Friendship by itself grants nothing: a zero-balance friend's calls are all rejected. The trust decision is the **deposit** — an operator credits a friend's proxy user only after real money moved out of band (§12). Friendship exchanges keys; funding expresses trust.
-
-`unfriend` ends the relation and puts the peer's key on the deny list (`denied_at`): future requests from that key are rejected, not auto-accepted. Their imported proxies here deactivate; manifests stop being served to them; new inbound calls get signed rejections; waiting steps with the peer as `required_caller` are cancelled and their parked prices refunded (§10). The balance and all history survive — the operator settles the net by `Withdraw` (§12). In-flight outbound calls still settle on their receipts: the receipt path stays open for pending idempotency keys. Notification is best-effort; a peer that missed it learns from its next rejection. Your own `friend` on a denied key clears the denial and restarts the handshake — only you can unblock, by choosing to re-friend.
-
-The relation is **not transitive** and is the only path to calling: invoking `@B`'s actions requires direct friendship with B. Exposure is each side's lever: a kernel may stop serving manifests to a friend whose balance cannot cover its cheapest exposed action; funding restores them.
-
-### Gossip — discovery and reputation
-
-Gossip is information, never authority. The `/juice/fed/gossip/1` protocol (open, read-only) returns the kernel's identity, its own exposed actions with manifests and local stats, and its **transacted friends** — friends it has settled calls with — each with key, handle, and the kernel's earned local stats for that friend's actions. Gossiped actions are named owner-qualified (`@owner/name`) in the originating kernel's namespace, never bare. No URLs appear: a friend is identified by key, resolved through the transport. Friends without settled traffic are not gossiped: endorsement is earned by trade, never granted by friending.
-
-Two engines feed the known network, matched to its growth goal. The **directory** — *which* kernels exist — grows fast and broad from DHT provider-record enumeration (the announce/discover pass above): every kernel provides a fixed discovery key and enumerates it, so the roster fills at the rate kernels come online. **Gossip** is the reputation overlay on top: it is deliberately trade-gated (transacted friends only), so it can never be the directory — it supplies earned stats for entries the directory surfaces. A kernel accumulates both into `DiscoveredKernel`, one row per (kernel, introducer); the introducer is the kernel itself for a first-party self-report (directory/self gossip) and the telling friend for hearsay. Supervision surfaces this as a grouped roster (kernel → introducer → action), with the operator's own earned stats shown distinctly from gossiped opinion, since own stats dominate the priors as they accumulate (§9).
-
-Gossip results accumulate in the local discovery table, one row per (kernel, introducer):
-
-```text
-DiscoveredKernel { public_key, handle, introduced_by, stats_json, first_seen, updated_at }
-```
-
-Third-party stats are stored namespaced by source (`StatTag`, `source = <introducer>`) and affect **ranking only** — priors weighted by introducer count and local experience with the introducer, dominated by own `Stats` as they accumulate (§9). They never affect callability, pricing, or settlement. Knowing a kernel through gossip permits nothing: calling requires your own friendship, and manifests are always fetched and verified from the owner, never trusted from an introducer.
-
-Importing an action initializes its local `Stats` to the defaults (§3): ground truth starts empty and is earned by settled calls. Priors are consulted at ranking time from the stored manifest (the owner's claim) and `StatTag` (introducers' earned stats), never copied into `Stats`. How priors combine is the ranking layer's tested, replaceable formula (§9); the kernel mandates only the signals and the discipline above.
-
-The gossip response additionally carries `counterparty_balance`, populated only when the requesting peer authenticates as a friended, non-denied key: the requester's proxy-user `available` on the serving kernel — "your credit here". It is absent for strangers, denied keys, and anonymous pulls. Like all gossip it is information, never authority: the money path is driven solely by authoritative signals (signed receipts and rejections, connection outcomes), never by this cached figure.
-
-**Peer sync.** The same discovery timer (`discovery_interval_seconds`, §14) also pulls gossip directly from every friended, non-denied peer, independent of the DHT directory: friend sync is bilateral maintenance addressed by key, not discovery, so it runs even when `bootstrap_peers` is empty (the empty-list rule — neither announce nor discover — governs only the DHT directory engine). A successful pull persists `peer_last_seen = now` and `peer_credit = counterparty_balance` on the peer's user row (§3). Both are a display-only cache (§14): they never gate a call, price, or settlement, and they do not count as peer activity for retention (§13 Retention) — answering gossip is free liveness and would otherwise immortalize a zombie peer; retention stays trade- and value-based.
-
-### Money — prepaid credits
-
-Federation is prepaid. For A's users to call B's actions, A must hold credits on B: A's operator pays B's operator out of band; B's superuser `Deposit`s the `@A` proxy user (§12). Redemption is the mirror, by `Withdraw` (§12). Credits cross the bank boundary only by supervision; execution never mints or burns.
-
-The proxy user's balance is the bilateral account: `@B`'s balance on A rises when A's users import from B (settlement pays it as `target_user_id`, §6) and falls when B's users import from A (inbound calls spend it). Operators settle only the net, out of band, at their own cadence. Netting needs no kernel machinery — it falls out of the peer being a user. The depositor bears counterparty risk, bounded by the deposit: keep deposits small and settle often.
-
-### Calls, receipts, settlement
-
-Outbound: a remote-proxy call follows normal role law (`owner` = local process owner, `caller` = local call caller, `target` = the proxy user) and normal wallet mechanics, funded with the proxy's local price `mp + maxduty` (§8). The handler records the UUID v4 `idempotency_key` and the outbound request payload (`dispatch_json`) on the proxy trace atomically with dispatch (§3, §5) — the stored payload is what makes retry after restart possible. On the remote kernel it arrives over the `/juice/fed/call/1` protocol, authenticated by the per-request federation signature (not a bearer token), and is then an ordinary inbound call by this kernel's proxy user there, paid from the prepaid balance, executed wholly under that kernel's §6.
-
-A proxy call settles **only on a signed remote receipt** — never on a network timeout:
-
-```text
-remote success:   charge = receipt.charge (= receipt.gross = mp)
-                  duty   = ceil(charge * import_bps / 10000)
-                  pay charge to the proxy user; duty to @sys
-                  refund (mp + maxduty) − charge − duty to the caller's trace
-                  local transaction: success; receipt JSON + SHA-256 stored atomically
-remote failure (charge = receipt.charge ≤ mp; the remote draw — settled remote descendants stay paid, §6):
-                  pay charge to the proxy user; duty = 0 (fee is zero on failure, so is duty)
-                  refund (mp + maxduty) − charge to the caller's trace
-                  local transaction: failure
-signed rejection (charge = 0):
-                  full refund; local transaction: failure
-                  a rejection whose transport status is 402 (the remote's ErrInsufficientFunds:
-                  this kernel's credit there is exhausted) settles as ErrPeerUnfunded — an
-                  operator condition, never rendered as the caller's own insufficient funds
-never dispatched (first dispatch only):
-                  the transport provably never established a connection (resolve/connect
-                  failed before any request byte was written); settle immediately as an
-                  ordinary local failure (ErrPeerUnreachable), full refund — the normal
-                  failed-call path, not receipt settlement. The background retry of an
-                  already-parked trace NEVER uses this rule: once a dispatch may have reached
-                  the peer, only a signed receipt or the max-pending-age bound settles it.
-no receipt (timeout, but a dispatch may have reached the peer):
-                  no settlement — the call stays running, the process stays open;
-                  retry with the same idempotency_key until a signed receipt arrives
-```
-
-This is the §6 local failure rule across the wire: a failed call refunds its remaining allocation, and the receipt's `charge` is how the local kernel learns what remained. A failure counts against the proxy's stats regardless of charge — a provider gains nothing by failing-with-charge over succeeding, and farming failures collapses its rank (§9, §16).
-
-Duty taxes the actual import, to the local `@sys`; the remote kernel never sees it. Default `import_bps = 500`, per peer. Forced closure (`EndProcess`) fails an in-flight proxy call like any running call (§6) and refunds the caller; if the remote side did commit, its charge stands there and is absorbed by the bilateral account, surfacing at reconciliation.
-
-The no-receipt state is the expected steady state of a network of intermittently-online home kernels, not an error: a dispatched call holds its allocation locked and its process open until a signed receipt settles it or the owner forces closure, while a peer unreachable at the very first dispatch instead fails fast with a full refund (the never-dispatched rule above) — so only a call that may already be executing remotely is parked. Process listings must surface this awaiting-receipt state with its age (the earliest parked call's start), so an operator sees funds parked on an unreachable peer and for how long; step listings likewise flag a waiting step whose required caller is a peer. Both are factual (age, peer-ness), never a liveness claim.
-
-Inbound: calls sign `JCS({action, counterparty, idempotency_key, timestamp, args_hash})`; `counterparty` is the caller's base64url public key; `args_hash = SHA-256(raw body)`. Receiver verifies signature, raw hash, friendship, timestamp age ≤ 5 minutes; non-friends and denied keys are rejected. A valid signature authenticates the proxy user for that request; the call is `run` as that user, paying from its balance. Any inbound call the receiver can determine will not execute — insufficient balance, or a known-but-non-executable action (inactive, non-public, suspended owner) — returns a **signed rejection receipt** (`status = failure`, zero charge) carrying the action's id, so the caller always has something to settle on rather than pinning funds until the pending bound. Only a genuinely absent or unverifiable action stays a plain error (no receipt whose `action_id` could match the caller's stored `remote_action_id`), leaving the caller pending. Idempotency: insert pending before execution, unique `(idempotency_key, counterparty_user_id)`; completed replay returns the stored receipt, pending replay 409, expiry 24h.
-
-`VerifyRemoteReceipt(caller_id, tx_id)` requires `CanReadTransaction` and verifies entirely locally, in two parts. **Receipt integrity:** signature against the peer's `public_key`, stored JSON against its stored SHA-256, `receipt.action_id == proxy.remote_action_id`. **Settlement consistency:** the local transaction's outcome matches `receipt.status`; the amount paid to the proxy user equals `receipt.charge`; the local refund equals `(mp + maxduty) − receipt.charge − duty` with duty per this section (zero on failure); `args_hash` and `reply_hash` match the local record. The receipt's own `gross/net/fee` are the remote kernel's economics and are reported, not compared. Returns per-check results and top-level `valid`; non-proxy transactions give `ErrInvalidState`.
-
-### Retention
-
-A peer is kept only while it holds value or has been used recently. Its activity is the most recent settled call (either direction), gossip mention, or deposit/withdrawal; a nonzero balance or funds locked in flight always count as live. A peer idle past `peer_retention_days` (§14) — reachable only at zero balance with nothing locked — has its accumulated data purged: its proxy actions, their stats, its `StatTag` rows, and its `DiscoveredKernel` rows, and its identity is forgotten (its `public_key` is cleared, so re-friending starts fresh). The immutable transaction and receipt ledger is preserved — its party ids carry no foreign key, so a now-dangling peer id is harmless and every local counterparty's credits stay reconstructible (§11); the anonymized user row remains as a legible ledger anchor. Purge is reachable only through zero value, so it never deletes funds or a still-reconstructible credit.
-
-## 14. CLI, HTTP, logging, config
-
-HTTP API is primary. Every exposed endpoint has a CLI command. CLI uses the same service layer, supports human-readable and JSON output, and each command has at least one test. All commands — user-facing and admin/peer alike — are HTTP clients of the server (base URL from `--server`/`JUICE_SERVER`/`server_url`); admin and peer commands hit the same public TCP API, on routes gated by an `IsSuperuser` check, authenticated by the `@sys` bearer token (no separate socket or filesystem authority — keep the bearer secret and run `serve` behind TLS or on loopback). `juice serve` is the sole process that opens SQLite; the CLI never touches the database directly. A command's primary identifier is a positional argument by its natural key — a user is `@handle` (a public key or raw id is also accepted), an action is `@owner/name` (an id is also accepted), and processes, steps, and transactions are ids; a second mandatory value (amount, rating) is the second positional. CLI human-readable output exposes the same fields as the corresponding HTTP response; `--json` selects the canonical JSON form (the HTTP shape).
-
-CLI handlers and HTTP handlers are thin wires: parse input, call the public TCP HTTP API (admin/peer commands hit superuser-gated routes on that same API), and format output. All kernel calls, enrichment, validation, and transformation live server-side in the service layer. No kernel calls outside the service layer.
-
-Required commands:
-
-```text
-juice serve
-juice user create <user> <email>          juice user me
-juice user update                          juice user connect <selector>
-juice user disconnect <selector>
-juice auth login <user>                    juice auth logout
-juice action create <name>                 juice action update <action>
-juice action delete <action>              juice action enable <action>
-juice action disable <action>             juice action list
-juice action import <spec-url>            juice action unimport <spec-url>
-juice action stats <action>
-juice process list                        juice process show <id>
-juice process end <id>                    juice run <action> [json]
-juice step create <action>                juice step list
-juice step show <id>                      juice step complete <id> [json]
-juice tx list                             juice tx show <id>
-juice tx rate <id> <0|1>                  juice tx verify <id>
-juice health
-juice admin users                         juice admin show <user>
-juice admin suspend <user>                juice admin unsuspend <user>
-juice admin rename <user> <new-handle>
-juice admin deposit <user> <amount>       juice admin withdraw <user> <amount>
-juice admin friend <key>                  juice admin unfriend <user>
-juice admin peers                         juice admin inspect <key>
-juice admin identity
-```
-
-`admin` holds only the operator verbs no ordinary user performs — money, access, federation trust, and the global roster (`users`/`show`). Supervision over everything else is **scope on the normal commands**: a superuser sees all owners' rows on `action list`, `process list`, `tx list`, and `step list`, and may `action disable`/`enable` any action, all over the public TCP API. As for everyone, `action list` is active-only by default; inactive/private rows appear only with `--all` (`?all=1`), so a deactivated action — e.g. an unfriended peer's proxies — drops out of the default list. There is no `admin actions/disable/processes/txs/steps` — those were duplicates of the base commands with wider reach.
-
-OpenAPI commands (the OpenAPI spec URL is the positional argument):
-
-```text
-juice action import <spec-url>
-juice action unimport <spec-url>
-juice action unimport <spec-url> --name <action-name>
-```
-
-`juice serve` handles `SIGTERM`/`SIGINT`, stops accepting new requests, drains in-flight calls, exits cleanly. No `juice stop`.
-
-Server logs request, caller, process, trace, action, and transaction IDs where available; maps distinct auth, authorization, invalid input, insufficient funds, missing resource, and internal failures to distinct statuses; rate-limits auth and account creation per IP with 429 (inbound federation traffic is limited at the transport instead, §13). Action read/list responses include computed `action=@owner/name`, plus the non-secret auth summary `requires_grant` (always) and `auth_scheme` (when the action has upstream auth) — the scheme name and flag only, never `auth_json`'s config or secrets (§8). A `kind=remote_proxy` action additionally carries `peer_state ∈ {offline, unfunded}` from the peer-sync cache (§13): `offline` when the owner peer's `peer_last_seen` is null or older than 3× `discovery_interval_seconds`, `unfunded` when cached `peer_credit` is below the action's remote manifest price; omitted when healthy. It is display-only — lookup, callability, and settlement are untouched — and derives its staleness threshold from `discovery_interval_seconds`, adding no config key. `admin peers` likewise surfaces the cache: our credit on each peer (`peer_credit`) and `last_seen` beside the bilateral balance held here. Outputs render user identities as `@handle`, never as raw user ids: a returned id must be a consumable input to some command. A command accepts a user by `@handle`, public key, or raw user id — the three shapes are disjoint and self-identifying, so a single resolver disambiguates (symmetric with the action argument, which accepts `@owner/name` or an id); outputs still never render a raw user id. So transaction responses carry `owner_handle`/`caller_handle`/`target_handle` (not the stored `*_user_id`), step responses `required_caller_handle`, process responses `owner_handle`, deposit/withdraw responses `operator_handle`/`target_handle`, and the peer list carries no internal id — while the underlying immutable records keep their captured `*_user_id` fields (§3). A handle unresolvable at read time (a purged party, §13) falls back to the raw id. `GET /v1/me` is the sole exception: it returns the caller's own `id`.
-
-Endpoint rules (notable rules only; the complete HTTP endpoint list is in `API.md`):
-
-| Endpoint                                         | Rule                                                                                                            |
-| ------------------------------------------------ | --------------------------------------------------------------------------------------------------------------- |
-| `GET /health`                                    | unauthenticated → `{status, handle, public_key}`: liveness plus the kernel's advertised federation identity (§13), so a client sees which kernel it's on before logging in |
-| `GET /v1/actions[?owner=&name=&all=]`             | unauthenticated → active public actions; authenticated → active public actions plus caller's own active actions (union, deduplicated); superuser → all owners' active actions; a suspended owner's actions are excluded (§12); `?all=1` includes inactive/private rows in the caller's scope; `?owner=` further filters by that owner's handle; `?name=` filters by name |
-| `GET /v1/me`                                     | authenticated `id`, `handle`, `email`, `available`, `locked`, `connectors`, and `connections`; suspended rejected before handler. `connectors` is the directory-grouped consent tree (§8): one node per folder (`directory` = the granted actions' shared folder, the ref up to its last `/`, e.g. `@chat` or `@chat/inbox`), each with the `connections` (backing upstream account(s), usually one) and the token-free `actions` under it (each: action `@owner/name`, requested scopes, `provider_key` of its backing connection, `created_at`). `connections` is the full account inventory (each: `provider`, action count, `unused` flag, `provider_key`, `created_at`), so a zero-grant connection still surfaces as `unused`. The `directory` is a display grouping only — it never gates a credential (the token binding stays per-action and fact-derived, §8 confused-deputy defense); `provider_key` is the opaque account key that also addresses `DELETE /v1/grants?account=`, and is omitted on an unbackfilled legacy grant with no connection |
-| `GET /v1/grants/plan?selector=`                  | authenticated; expands the selector (§8) over delegated actions the caller may call and returns the consent plan `user connect` walks: groups by `provider_key` — `provider`, scheme, requested scope union, destination host(s), connected/covered status, and per-action `granted` flag — plus counts of skipped actions (loginless or not-callable) |
-| `POST /v1/grants/start`                          | authenticated; `{selector, provider, [redirect_uri], [flow]}` begins delegated-OAuth consent for one provider group (§8); when the caller's existing `Connection` already covers the group's scope union, returns `{status:"granted", actions}` immediately with no browser; else `redirect_uri` is any http(s) target the client receives the code at, and code flow returns `{state, authorize_url}`, device flow `{state, verification_uri, user_code, interval, expires_in}` |
-| `POST /v1/grants/complete`                       | authenticated as the grantor; `{state, [code]}`; exchanges the code (or reports device-poll `pending`), stores one `Connection`, and mints the group's grants; foreign/expired state rejected |
-| `POST /v1/grants`                                | authenticated; `{selector, [provider], token}` stores a static token for a `delegated_bearer` group (§8) — the non-OAuth direct twin of start/complete — minting one grant per action against one `Connection`; `provider` optional when the selector resolves to exactly one bearer group; rejects a non-`delegated_bearer` group and actions the caller may not call |
-| `DELETE /v1/grants?selector=` / `?account=`      | authenticated; `selector` revokes the caller's grants matching the selector (grants only; a bare `@owner/name` is the degenerate single-action case, and legacy `?action=` is accepted as its alias); `account=<provider_key>` deletes the caller's `Connection` for that provider and cascades its grants |
-| `PUT /v1/me`                                     | authenticated password account only; `{[email], [current_password, password]}`; `password` requires `current_password`; at least one field required; returns updated `id`, `handle`, `email`, `available`, `locked`; a key-only account (no password) returns `ErrInvalidState` |
-| `PUT /v1/actions/{id}`                           | action-owner update; `public` updatable; deactivation rules apply                                               |
-| `DELETE /v1/actions/{id}`                        | action-owner delete preserving history                                                                          |
-| `POST /v1/actions/import`                        | authenticated OpenAPI supervision import                                                                        |
-| `POST /v1/actions/unimport`                      | action-owner import-provenance deactivation                                                                     |
-| `GET /v1/processes`                              | process owner's processes, descending `created_at`; each carries `awaiting_receipt` and, when set, `awaiting_receipt_since` (§13) |
-| `GET /v1/steps`                                  | authenticated; returns steps visible to caller per `CanListStep`; optional `?process_id=` and `?status=` filters; each step carries `created_by` (the creating action `@owner/name`, from its parent trace) beside `action` (the completion target) and `owner_handle` (the process owner / payer, mirroring a transaction's `owner_handle` — the step is the continuation that settles into that owner's transaction, §10); a waiting step also carries `allowed_input` (the derived completion schema `action.input_schema \ keys(partial_args)`, §10) so its required caller can complete it without separately reading a private target action; a waiting step whose required caller is a peer carries `waiting_on_peer` (§13) |
-| `POST /v1/steps`                                 | JWT: creates a waiting step; requires `trace_id` (funding trace), `action_id`, `required_caller`, `partial_args`; the authenticated user must be authorized to use `trace_id` (§4 precondition 4). Capability (§9): `trace_id` comes from the capability and is rejected in the body; the creating authority is the trace's action owner |
-| `GET /v1/steps/{id}`                             | `CanReadStep`; returns step fields                                                                              |
-| `POST /v1/steps/{id}/complete`                   | JWT or capability (§9); `CanReadStep`; `args` required (`{}` valid); absent gives `ErrInvalidInput`; under a capability the caller is the action owner; returns `result`, `tx_id`, `trace_id`, `step_id` |
-| `POST /v1/call`                                  | capability only (§9); the HTTP twin of `juice.call`: a subcall on the capability's trace; body `{action, args}`; no `run`/wallet path; returns `result`, `tx_id`, `trace_id`. Not a user-invocable command (no CLI), like inbound federation |
-| `POST /v1/run`                                   | requires `args`; `{}` valid; absent gives `ErrInvalidInput`; action is `@owner/name`; never accepts a capability |
-| `POST /v1/auth/authorize`                        | unauthenticated; `{handle, password, code_challenge, [redirect_uri]}`; if `redirect_uri` provided → `302` redirect; if omitted → `200 {"redirect": "?code=CODE"}` for programmatic clients |
-| `POST /v1/auth/token`                            | unauthenticated; exchanges auth code + `code_verifier` for `access_token` and `refresh_token`                   |
-| `POST /v1/auth/logout`                           | refresh token body; missing/revoked gives `ErrUnauthenticated`                                                  |
-| `GET /v1/transactions`                           | transactions visible to the authenticated user under `CanReadTransaction`                                       |
-| `GET /v1/transactions/{id}`                      | full detail to parties; `ErrNotFound` to non-parties                                                            |
-| `GET /v1/transactions/{id}/receipt-verification` | parties; remote verification; local tx gives `ErrInvalidState`                                                  |
-
-Transaction list/detail include `rating: {"value":0|1,"note":string|null}` or `null`, visible to all transaction parties.
-
-Admin commands require configured `@sys`, reject non-superusers with `ErrUnauthorized`, and stay outside `Call()`. The operator verbs (money, access, federation trust, roster reads) are served on the public TCP API as dedicated routes gated by an `IsSuperuser` check — not a separate surface. Superuser *scope* on the normal read/toggle endpoints (seeing all rows, disabling any action) is enforced the same way, mirroring the existing transaction/step widening. Admin authority is therefore the `@sys` bearer token alone; operators keep it secret and expose `serve` only behind TLS or on loopback.
-
-Logs go to stderr and optionally file; stdout is resource payloads only. Configurable format, level, file. Every kernel transition logs start/end; errors include stable codes; script logs include trace ID.
-
-Required log fields:
-
-```text
-time level event request_id caller_user_id process_id trace_id action_id tx_id
-status duration_ms error
-```
-
-Config lives in `config.json` under the kernel's home directory. Juice-family binaries share one root, `$JUICE_HOME` (default `~/.juice`), with one subdirectory per component; the kernel uses `$JUICE_HOME/kernel/`, so the config defaults to `$JUICE_HOME/kernel/config.json` and the database to `$JUICE_HOME/kernel/juice.db` (override either with `--config` / `--db`). This root is fixed and absolute — never cwd-relative — so the kernel attaches to the same identity and signing key wherever it is launched. `$JUICE_HOME/kernel/cache/` is reserved for regenerable data and is safe to delete. Top-level kernel keys: `db_path`, `fee_bps`, `import_bps`, `peer_auto_accept`, `server_url` (the local base URL the CLI dials for user-facing commands — loopback for driving your own kernel, not a federation identity), `http_callback_url` (the base URL the kernel advertises to dispatched `kind=http` endpoints for capability callbacks, §9; default empty ⇒ derived from the listen address, `http://127.0.0.1:<port>`, which suffices for the co-located case), auth issuer/audience/token TTL, log file/format/level, script timeout and memory limits, plus the federation identity and discovery keys this kernel needs to satisfy §8 and §13: `kernel_handle` (the handle this kernel presents to the network in friend handshakes and gossip), `bootstrap_peers` (the peer multiaddrs the transport dials to join the discovery network; defaults to the project's public node so `juice serve` works out of the box, empty means the kernel neither announces nor discovers), `credentials_key` (the §8 base64url AES-256-GCM key for `auth_json` and sealed OAuth grant refresh tokens, auto-generated at first boot; each action's OAuth provider config lives in its `auth_json`, so there are no OAuth keys in `config.json`), `allow_local_sources` (dev-only escape hatch over §7's loopback/private/link-local URL rejection for action source URLs, default `false`), and `remote_retry_interval_seconds` (seconds between passes of the running server's retry loop that re-drives pending remote-proxy calls so a returning peer settles parked calls — and the §13 max-age refund fires — without a restart; default 60, non-positive falls back to the default), `discovery_interval_seconds` (seconds between passes of the known-network discovery loop that advertises this kernel, enumerates providers, and pulls gossip from bootstrap + discovered peers into `DiscoveredKernel`, §13; default 300, non-positive falls back to the default; an empty `bootstrap_peers` disables the directory engine but not friend sync, §13 peer sync), and `peer_retention_days` (days a peer may stay idle at zero balance before it and everything derived from it are purged, §13; default 90, non-positive disables purging). All native-action configuration lives under `native.<action>`; no deeper nesting:
-
-```json
-{
-  "db_path": "./juice.db",
-  "fee_bps": 2000,
-  "import_bps": 500,
-  "peer_auto_accept": true,
-  "server_url": "",
-  "http_callback_url": "",
-  "kernel_handle": "",
-  "bootstrap_peers": ["/dns4/daios.ai/tcp/31313/p2p/12D3KooWJ5ZwPSAV17q2hv6ttZ8J3hHsTMNaSC61kbVbvxvtArjK"],
-  "credentials_key": "",
-  "allow_local_sources": false,
-  "remote_retry_interval_seconds": 60,
-  "discovery_interval_seconds": 300,
-  "peer_retention_days": 90,
-  "native": {
-    "llm":     { "url": "http://localhost:11434", "chat_model": "gemma4:26b", "embed_model": "nomic-embed-text", "price": 0 },
-    "lookup":  { "default_limit": 10, "price": 0 },
-    "time":    { "price": 0 },
-    "sink":    { "price": 0 },
-    "message": { "price": 0 },
-    "random":  { "price": 0 },
-    "web":     { "price": 0, "user_agent": "juice-kernel/0.4 (+https://github.com/daios-ai/juice)" },
-    "tinygo":  { "price": 5 }
-  }
-}
-```
-
-Safe local defaults apply when the file or a key is absent; invalid startup config is rejected; no committed production secrets.
-
-Environment variables are bootstrap and overrides only:
-
-```text
-JUICE_HOME                 root for all juice state (default ~/.juice); kernel uses $JUICE_HOME/kernel/
-JUICE_SECRET_KEY           JWT secret override, runtime only (§12)
-JUICE_LOG_LEVEL            log level override
-JUICE_CREDENTIALS_KEY      AES credentials key override, runtime only (§8)
-JUICE_BOOTSTRAP_PASSWORD   superuser password for unattended first boot (§12)
-JUICE_BOOTSTRAP_KERNEL_HANDLE  kernel name, required for an unattended first boot (§12, §13)
-JUICE_ALLOW_LOCAL_SOURCES  dev-only: permit loopback/private/link-local action source URLs (§7)
-```
-
-All other settings are configured through `config.json` only; there are no further environment overrides.
-
-## 15. Required automated tests
-
-`go test ./...` must pass without external network access. Tests use temporary SQLite databases, fake Ollama, fake script, and fake `fed`-transport adapters unless explicitly integration tests, no global state, and no order dependence.
-
-Federation is tested in three tiers. **Unit** (`go test ./...`, offline): kernel federation logic runs against a fake `fed` transport, exercising every §13 settlement rule without a real network. **Flows** (offline, real transport on loopback): the multi-kernel flow suite runs the actual libp2p transport over `127.0.0.1`, with one kernel serving as the bootstrap + relay for the others (every kernel runs the DHT and relay, so no separate seed process) — discovery-by-key, relayed carriage, and restart-retry are exercised on one machine with no internet. **Real-network check** (release gate for any federation-touching change, not part of `go test ./...`): a scripted flow run from a machine behind a real NAT against one remote peer, asserting hole-punch and relay-fallback paths that loopback cannot reproduce.
+Operations:
+
+- **U43** First boot yields a working, network-joined kernel after supplying only a password and a kernel name; without a name it fails before writing anything. The operator recovers the superuser password like any user.
+- **U44** The operator can observe everything material — parked remote calls with age, peers with balances, evidence about any subject, and unsettled bilateral obligations — and intervenes with the same commands users have, widened in scope, plus the money-and-trust verbs only an operator performs.
+- **U45** Every user and operator workflow exists as both CLI and HTTP with machine-readable output; the CLI is a pure client of the server.
+
+## 5. Cross-cutting guarantees
+
+- **G1** Conservation: funds move only by enumerated operations; every monetary transition commits atomically with its immutable audit record; a call settles exactly once — no path spends the same allocation twice; ordinary balances never go negative.
+- **G2** Attribution: every call durably records payer, immediate requester, and payee.
+- **G3** Immutability: transactions, receipts, and ratings never change after commit; no purge deletes the ledger.
+- **G4** Crash safety: restart loses no funds and never duplicates a committed effect; interrupted work refunds; work possibly executing remotely is never presumed dead — it is re-driven under its original identity until signed evidence settles it.
+- **G5** Secrecy: credentials, tokens, and capabilities never appear in any readable surface.
+- **G6** No unfunded work anywhere in a call tree; input validation precedes locking, output validation precedes payment.
+- **G7** Offline verifiability: signed artifacts are storable and verifiable without the channel that carried them.
+- **G8** Execution/supervision separation: execution code can never rate outputs or propagate ratings; supervision never routes through `Call()`. Reputation cannot be manufactured by the thing it judges.
+- **G9** Egress confinement: kernel-mediated outbound HTTP — action sources, token endpoints, `sys/web` — cannot reach private, link-local, or reserved networks unless the operator opts in; loopback is permitted. The kernel is not a proxy into anyone’s LAN.
+
+## 6. Wire protocol [P]
+
+Normative for interoperability; versioned; today upgraded in lockstep.
+
+### P1 Identity and signatures
+- One Ed25519 keypair per kernel; the federation network identity derives deterministically from it; no second key. Keys render as 43-char base64url (32 bytes). [→U34, U36]
+- Every Juice payload signs `"juice/v1/" + domain + "\n" ‖ CanonicalJSON(v)` (RFC 8785 JCS), one fixed domain per kind: `receipt, rating, manifest, evidence_receipt, fed_call, step_complete, step_list, step_auth, settle_open, settle_finish, settle_reconcile, settlement_record, capability, recovery`. A signature valid in one domain never verifies in another; the transport-handshake domain (libp2p's) is disjoint from all. ASCII property names make UTF-8 ordering equal RFC 8785 UTF-16 ordering. [→G7]
+
+### P2 Contract digest
+`quote_hash = SHA-256(JCS({action_id, effect, description, input_schema, output_schema, price}))` over the **stable** id, so a discovered hit and the proxy it resolves to hash identically. Served on action reads, listings, and lookup; a pinned run mismatching is refused with `ErrTermsChanged` carrying current hash and price in meta. `effect` is included because it alone decides value-channel engagement. Binds the execution quote, not the implementation or live-read value fees. [→U8]
+
+### P3 Streams
+Versioned libp2p streams: `/juice/fed/call/1` (inbound call), `/juice/fed/step/1` (step list + completion), `/juice/fed/resolve/1` (open read-only single-action manifest or handle→PrincipalID resolution — the sole cache-fill path), `/juice/fed/gossip/1` (cursored catalog + evidence), `/juice/fed/settle/1` (residual settlement). No inspect protocol — inspect is served by gossip. A payload change keeps its stream id and surfaces as a signature failure; the network upgrades in lockstep. Timestamp windows: request age ≤ 5 min (call, step). For every signed request carrying `counterparty`, the transport-authenticated peer key must equal it. [carrier: D12]
+
+### P4 Inbound call
+- Request signs `JCS({action, args_hash, counterparty, expected_contract_hash, idempotency_key, recipient, timestamp})`; `action` is the stable id, never a handle-bearing ref (rename-proof); `recipient` is the serving key (a captured request cannot replay to a third kernel); `args_hash = SHA-256(raw body)`. Receiver verifies signature, recipient = own key, body hash, timestamp. A valid unknown key is provisioned a zero-balance account (handshake-free peering); a suspended key is refused. An inbound call naming a cached `remote_proxy` id is refused. [→U29, U37, U47]
+- **Signed rejection receipt** (status failure, charge 0) when the receiver can determine non-execution, carrying the action id so the caller settles at once. `refresh_proxy` is set **only** on contract-hash mismatch; a non-executable action (inactive, non-public, suspended owner) or a funding/exposure rejection omits it; a genuinely absent action stays a plain error (caller stays pending). A rejection receipt's `tx_id` = the call's `idempotency_key`, distinguishing it from a 0-price execution. [→U8, U35]
+- Idempotency: insert pending before resolution and hash check; unique `(idempotency_key, counterparty)`; completed replay returns the stored receipt; pending replay 409; expiry 24 h. [→U35, G4]
+
+### P5 Receipt
+Fields: `id, issuer_user_id, tx_id, trace_id, action_id, caller_user_id, process_id, args_hash, reply_hash, status, gross, net, fee, charge, premium, value, value_to, reason, started_at, created_at, signature`. `args_hash`/`reply_hash` = SHA-256 over JCS args/reply. `gross` = full allocation; `fee + net` = amount remaining at settlement; `gross − fee − net` = committed downstream; failure has `fee = net = 0`. `charge` = actually drawn: `= gross` success, `≤ gross` failure (settled descendants stay paid), `0` rejection. `premium = ceil(charge·remote_bps/10000)`. `value ∈ {0, amount}` (all-or-nothing), local and untaxed, so no premium rides it; JCS omitempty keeps pre-transfer receipts verifying. Signature Ed25519 over canonical JSON minus `signature`. Exactly one receipt per committed call; `started_at` call start, `created_at` settlement. [→U36, G1, G7]
+
+### P6 Manifest
+Required fields: `action_id, owner_id, owner_handle, name, description, input_schema, output_schema, price, remote_bps, kind, artifact_hash, stats, updated_at, signature` (Ed25519 over canonical JSON minus signature, against the serving key). Contract fields (drift detection): `action_id, artifact_hash, description, input_schema, kind, name, output_schema, owner_id, price, remote_bps`; `owner_handle` is display, never contract — a rename never deactivates a proxy. A manifest declares no `effect`, and it is not a contract field: no remote action is ever value-bearing. The key survives in the hash payload at its empty value, so no cached proxy is re-keyed. Served only for own, active, `public`, non-delegated-auth actions, `kind ∈ {http, wasm, native}` — never `remote_proxy` [→U47], never delegated-auth actions (a peer's single account can neither consent nor hold a per-caller token). Invalid signature, negative price, or `remote_bps ∉ [0,10000]` skips the action. Manifest stats and `updated_at` affect neither contract comparison nor local Stats. Descriptions and schemas are the canonical interface for importer lookup and LLM function calling.
+
+### P7 Cross-kernel pricing and settlement
+`sr = mp + ceil(mp·remote_bps/10000)` is the quoted cross-kernel maximum; the origin adds locally `q = sr + ceil(sr·import_bps/10000)` (import fee retained, never on the wire). The actual obligation derives from the signed receipt's `charge` below. `remote_bps` prices the serving side's credit, default, and settlement variance; the caller can never be charged more than the authenticated `q`. Settlement occurs **only** on a signed remote receipt — never on timeout:
+- success: `paid = charge + premium` → peer row; `importfee = ceil(paid·import_bps/10000)` → origin sys; refund `q − paid − importfee`.
+- failure: `paid = charge + premium` (premium on actual charge, 0 at charge 0); importfee 0; refund `q − paid`; counts against proxy stats regardless of charge.
+- signed rejection: full refund; a non-402 rejection deactivates the proxy iff the row still holds the dispatched hash (a stale dispatch spares a refreshed row). A rejection is identified by `tx_id` = the dispatched `idempotency_key` (P4) — never by charge or transport status, both of which an executed failure shares — and classifies: 402 → `ErrPeerUnfunded` (operator condition); `refresh_proxy` → ordinary failure with `Meta["retry"]="refresh"`, never `ErrTermsChanged`; otherwise → `ErrUnauthorized`, the peer refuses us. An executed failure stays `ErrExecutionFailed` at any charge and keeps the row.
+- never dispatched (first dispatch only; transport provably never connected): ordinary local failure `ErrPeerUnreachable`, full refund; never applied to a retry.
+- no receipt: no settlement; allocation stays locked, process open; retry with the same `idempotency_key` until a receipt arrives, bounded by the fixed 24-hour max pending age (not configurable — it is a property of the protocol's record lifetime), past which the call settles locally as a failure with full refund. [→U29, U31, U35]
+Local verification (offline): receipt signature against peer key; stored JSON against stored SHA-256; `receipt.action_id = proxy.remote_action_id`; outcome matches; peer-row credit `= charge + premium`; premium formula at the dispatch-recorded `remote_bps`; `charge + premium ≤ q`; import-fee formula at dispatch-recorded `import_bps` (0 on failure); refund equality; args/reply hashes match. Receipt's own `gross/net/fee` are reported, not compared. [→U36]
+
+### P8 Steps across kernels
+- `list` signs `JCS({counterparty, recipient, scope: "step_list", timestamp})` → the serving kernel's waiting steps whose required caller is the requester, oldest first, bounded with a `truncated` flag, scoped **in the query** (the peer's own processes must not crowd out completable steps). Per step: `id, partial_args, allowed_input, price, created_at` — withholding the creating action, process owner's handle, target ref, and every local id [→U41]. Pure read: an unknown key gets an empty list and is not provisioned.
+- `complete` signs `JCS({counterparty, idempotency_key, input_hash, recipient, step_id, timestamp})`; `input_hash` = SHA-256 of the exact bytes carried (sender normalizes input to the transported bytes); key **derived** = `SHA-256("juice/fed/step/1|" ‖ recipient ‖ "|" ‖ step_id ‖ "|" ‖ input_hash ‖ "|")` so a retry recovers the stored outcome; different input or step derives a different key. Unknown key refused outright. Executes as the peer's account (role law: caller = kernel account); settles wholly on the serving kernel; the requester parks nothing, creates no trace or transaction — failures are typed errors, not rejection receipts. Reuses the P4 idempotency record; a replay is rebuilt from stored result + receipt and discriminates on the **receipt's** status (a result containing an `error` key still replays as success); a stored failure replays as failure with a typed code. Recipient binding prevents cross-kernel replay of list and complete alike. Outbound distinguishes never-dispatched (`ErrPeerUnreachable`) from possibly-executed (`ErrTimeout`, retry under the derived key).
+- No payment descriptor rides the step listing, and a step whose action bears the transfer effect is not completable by a peer: value is local to a kernel. The trailing component of the completion key is reserved and empty, so keys stayed stable across that removal.
+- `step_auth`: a home-kernel attestation naming `required_caller_remote_id`, demanded when a step is addressed to a remote principal rather than the peer kernel itself — a remote handle rename never mis-addresses a parked step (D4, D15).
+
+### P9 Gossip and evidence
+- Every reply carries the full first-party catalog — identity (key, handle, about = `sys`'s description), searchable users (`sys` + owners of active public actions, each `{user_id, handle, description}`), own signed public manifests — plus **one page** of evidence after the request cursor, plus `counterparty_balance` (only for an authenticated known non-suspended key; display-only, never authority). No membership lists, no URLs, no third-party relay: evidence is first-party only; learned evidence is never re-gossiped. [→U39, U40]
+- `EvidenceReceipt` projection: `{receipt_hash, subject_kernel, subject_action, counterparty_kernel?, status, started_at, created_at, remote_receipt_hash?}` — no transaction/trace/process/caller/payer identity, no arg/reply hashes, no amounts, no `value_to` [→U39]. Optional rating projection `{rating, note, rated_receipt_hash, created_at}` — no rater or transaction identity. `receipt_hash = SHA-256(JCS(stored receipt))`, the single definition on both sides of the join.
+- Two legs of a kernel's **own** receipts: (a) execution evidence for its own manifest-eligible actions (P6, so delegated-auth is excluded here too) (`issuer = subject`; `counterparty_kernel` set only when the caller was a peer kernel), excluding value-transfer receipts; (b) proxy receipts settled from a signed remote receipt for an **admitted execution** — success or failure, rated or not, price 0 included. Excluded from (b): locally-manufactured settlements (never-dispatched, max-age, forced closure, `interrupted`, missing adapter), signed zero-charge rejections (identified by `tx_id = idempotency_key`), quarantined receipts.
+- Ordering: ascending `(effective_at, receipt_hash)`, `effective_at` = the rating's `created_at` when rated else the receipt's — a late rating re-surfaces its bundle. Cursor = exclusive high-watermark of the last committed item, advanced only after verified commit; one page per peer per pass; sender eviction may gap, never endlessly replay. A rating without a `rated_receipt_hash` is never gossip-eligible; ingress requires a non-empty hash.
+
+### P10 Residual settlement
+- Exact (`d ≥ Q` or `Q = 0`): pay `d` on the rail, recorded via the idempotent `external_key = settlement_id` deposit/withdraw.
+- Probabilistic (`0 < d < Q`): debtor-driven commit/reveal. Creditor is stateless: `s = SHA-256(signing_seed ‖ "juice-settle-v1" ‖ settlement_id)`; the debtor carries the creditor-signed *open* record to *finish*. Outcome: pay iff `SHA-256(settlement_id ‖ s ‖ n) mod Q < d` (`n` = debtor nonce; modulo bias negligible for `Q ≪ 2⁶⁴`). The lottery moves no money; the debt stays on both rows until cash. `E[payment] = d`. [→U33]
+- `SettlementRecord` binds both keys, `d`, `Q`, mode, commitment `H(s)`, nonce, revealed `s`, outcome, expiry, `settlement_id`; its key-set is disjoint from every other signed payload. Exactly one outcome per `settlement_id` per kernel, ever; a replayed finish (including a ground nonce) is re-served the stored record, never a second signature. Creditor non-reveal past expiry ⇒ debtor applies clear-for-zero with the signed open record as evidence and re-presents it via `reconcile`; the creditor must apply the same (idempotent) or be in provable default. Debtor refusal leaves the debt outstanding consistently, consuming exposure.
+- Ledger identity per kernel: `Δrow + Δsys = external_cash`. finish→clear: creditor `row +d / sys −d`, debtor `row −d / sys +d`, cash 0 (immediate, internal). finish→pay: no balance change (records the pending obligation). `--cash`: creditor `row +d, sys +(Q−d)`, cash in `Q`; debtor `row −d, sys −(Q−d)`, cash out `Q`; the debtor leg requires `sys ≥ Q−d` else full rollback. Residual variance is operator variance on `sys`: the creditor gains `Q−d` on pay and loses `d` on clear, the debtor the mirror, so `E[Δsys] = (d/Q)(Q−d) + (1−d/Q)(−d) = 0`; kernels hold reserves against it.
+
+## 7. Design decisions [D]
+
+`[→…]` names the constraint served; an untraced fact is `[policy]` (operator-changeable number) or `[convention]` (arbitrary but frozen) — together the enumerated simplification surface. Wire-visible content lives in §6.
+
+### D1 Implementation frame
+Go; `go build ./...` and `go test ./...` must pass. Packages: `cmd/juice` (CLI + server entrypoint), `kernel` (core objects and operational semantics), `store` (persistence interface + SQLite), `script` (WASM execution), `llm` (language/embedding interface), `fed` (federation transport interface + libp2p), `log` (structured logging), `native` (native actions); `kernel` imports no CLI/HTTP/SQLite/wazero/Ollama/libp2p; package names `sqlite, wazero, ollama, libp2p` forbidden (concrete types/filenames may carry them); small package and file counts, no size-only splits; every production file has a `_test.go` with independent tests. [maintainability; no story]
+
+### D2 Execution model
+- `run(action, args)` atomically parks exactly `action.price` from the caller's `available` into `locked`, creates the process (holding it as `available`), funds the root trace from it, issues the root call. The process closes automatically when the root call has returned and no steps remain outstanding; closure returns remaining funds and releases the owner's lock. Closed processes cannot call.
+- `Call(caller, trace, action, args)` is the sole dispatch primitive, dispatching on `action.kind`, never owner identity; every execution path uses it (run, native, WASM subcall, step completion, imported HTTP, remote proxy). The trace carries wallet, process, and causal parent. [→U11, G2]
+- Role law: `owner_user_id = P` (process owner, payer), `caller_user_id = C` (immediate requester), `target_user_id = A` (action owner); cases: root `C = P`; WASM subcall `C` = parent action owner; step completion `C` = required caller; remote proxy `A` = the peer's kernel account. [→G2]
+- Preconditions, exact order: (1) `C` authenticated, not suspended; (2) process open; (3) supplied parent trace exists in the process; (4) `C` may use the process — `C = P`, or parent trace's action owner = `C`, or step completion by required caller; (5) action exists; (6) `CanCall(C, action)`; (7) quote pin matches; (8) args satisfy input schema; (9) trace `available ≥ price` (step completion funded by its parked price instead). Precondition 4 governs spending authority, 6 governs access — distinct questions; the 6-before-7 order is why a pin mismatch never leaks a private action's terms [→U48] and terms-invalidating-args still reports `ErrTermsChanged`.
+- Transition: require `trace.available ≥ q`; move `q` available→locked; child trace `available = q`, `action_owner = A`; execute; validate output against output schema; commit (success: transaction + receipt + payout + lock release + stats; failure: + refund rollup). A child's resolution always releases the caller's lock — `locked` holds only outstanding commitments.
+- Subcall law: `juice.call(target, args) = Call(parent_action.owner, parent_trace, target, args)`; no ephemeral process; same-process spending from the parent trace; trace-scoped authority requires the parent trace's action owner = caller; an over-budget subcall fails `ErrInsufficientFunds` and the parent decides propagation. [→U19]
+- Settlement (success): `taxable = trace.available`; `fee = ceil(taxable·fee_bps/10000)`; `net = taxable − fee`; `A` credited net, `sys` fee; unused budget is margin, never refund [→U16, U17]; each kernel taxes only its own layer. Exception: `remote_proxy` settles per P7.
+- Refund (failure): remaining `available` plus parked prices of outstanding steps, recursively, cancelled and returned to the caller (root → process → owner at closure); a refund to an already-settled trace reroutes to the process — settlement is final, a trace never regains `available`; failed call charges zero fee/net, exposes the failure class in `reason`; settled descendants stay settled. [→U13, G1]
+- Zero-credit processes run zero-price actions [→U18]. Trace relation: root parent null; subcall parent = executing trace, same process; step completion parent = `step.parent_trace_id`. `process_id` determines payment; `parent_trace_id` records causality only. Schema validation: input before locking, output before settlement [→G6]; unsupported JSON Schema forms fail creation/update; a node without `type` is unconstrained by intent.
+
+- Conformance invariants: `user.locked` equals the sum of funds held in the user's open processes; wallet totals (user, process, trace) change only by run, call entry, settlement, refund, step park/unpark, deposit, withdrawal, transfer, closure.
+
+### D3 Persistence and recovery
+File-backed SQLite, WAL, behind a store interface `kernel` depends on (never SQLite directly); modernc `_pragma=` DSN forms; deterministic in-repo migrations; tests on temp DBs; no production dependence on in-memory stores. Money paths are compound atomic operations — each monetary transition commits with its audit record in one store call, so atomicity lives at the store boundary, not above it: `BeginRun` (user-wallet park + process creation/funding + funded root trace), `BeginSubcall` (parent-trace move + funded child trace), `BeginStepCall` (unpark step price + completion trace + step waiting→running), `CommitCall` (success transaction + receipt + payout + lock release + stats, + step/idempotency, + delivered-value ledger entry), `CommitFailedCall` (failure transaction + receipt + subtree refund/cancellation + stats, + step/idempotency), `CommitRemoteSettlement` (signed-receipt settlement: charge/premium/refund + transaction + receipt, + step/idempotency), `EndProcess` (cancel waiting steps + return funds + close), `CreateStep` (step record + park), `CreateLedgerEntry` (debit + credit + ledger record), `CreateRatingAndUpdateStats` (rating + rating stats). Reads/supervision are ordinary methods; the inventory is representative, not exhaustive: CreateUser, ReadUser, ReadUserByHandle, ReadAccountByKernelKey, ListUsers, SuspendUser, UnsuspendUser, UpdateUser, RenameUser; CreateAction, ReadAction, ReadActionByOwnerName, UpdateAction, UpdateActionAndResetStats, DeleteAction, ListAllActions; ReadProcess, ListProcesses, ListAllProcesses; ReadTrace, ReadRootTrace, ListTraces; ReadTransaction, ListTransactions; ReadStats, UpsertStats; ReadStep, ListSteps, ResetStepAndRepark, ResetRunningSteps; ReadReceipt, ReadReceiptByTxID; ReadRatingByTxID, ListRatings; ListLedgerByUser; InsertPendingIdempotencyRecord, ReadIdempotencyRecord, CompleteIdempotencyRecordIfPending, DeleteIdempotencyRecord; GetConfig, SetConfig, InitFirstBoot; UpsertKernel, BindPetname, ListKernels, ReadKernel, ReadKernelByPetname, SuspendKernelAccount; DeactivateActionsOwnedBy; CreateOrReplaceGrant, ReadGrant, ListGrantsByUser, DeleteGrant, DeleteGrantsForAction; CreateOrUpdateConnection, ReadConnection, ReadConnectionByUserProvider, ListConnectionsByUser, UpdateConnectionSecret, DeleteConnectionCascade. `UpdateTransaction` is forbidden. Atomic write sets, in full: run = wallet park (available→locked) + process creation/funding + root trace funded from the process; call entry = caller-wallet move + child trace with its allocation; success = transaction + receipt + payout of trace available (net, fee) + caller lock release + metrics + stats + a ledger entry for any delivered value; failure = transaction + receipt + subtree rollup (refund to caller available + cancellation of outstanding steps beneath) + caller lock release + metrics + stats; process closure = close + remaining funds returned to owner; deposit = user credit + ledger (null→user); withdrawal = user debit + ledger (user→null); transfer = sender debit + recipient credit + ledger (sender→recipient), one commit; rating = rating record; user update = description and/or password hash; step creation = creator-trace move + step record; step completion = status done + tx_id + price unpark + call transaction + receipt + settlement + metrics + stats; step cancellation = status cancelled + parked price returned. A settled failure always reports its committed transaction to the caller even if post-settlement bookkeeping fails. [→G1, G3, G4]
+Recovery at startup: every trace without a transaction settles as failure `reason = interrupted`, deepest first, normal rollup — except a remote-proxy trace with a recorded dispatch, which resumes retrying (allocation locked, process open); steps `running` with null `tx_id` reset to `waiting` with allocation re-parked; `waiting` steps untouched; recovery idempotent. [→G4]
+DB checks: `kernel_public_key IS NOT NULL OR available ≥ 0` (ordinary accounts non-negative; peer rows row-unbounded, globally bounded at admission); `locked ≥ 0`; visibility column rejects values outside the enum. [→G1]
+
+### D4 Domain model and action lifecycle
+Wire shapes live in P5/P6; local rows and rules here. IDs stable and opaque; action IDs globally unique; prices non-negative indivisible integers; balances indivisible integers.
+- **Account**: `id, handle, description, available, locked, suspended_at, kernel_public_key, recovery_public_key, created_at, updated_at`. User accounts hold handle + password and/or recovery key; kernel accounts hold only `kernel_public_key` (FK to Kernel) — disjoint by CHECK (no handle/password/recovery on a peer, so a peer never holds a session credential); `peer(C) := kernel_public_key ≠ null`. `suspended_at` is the single moderation axis, rejected with `ErrUnauthenticated` at every authenticated request [→U37]. Recovery key never authenticates and never makes a peer. `description` is the about text; `sys`'s is the kernel's advertised about. A kernel account is financial counterparty only, never semantic owner/caller [→U41].
+- **Action**: `id, owner_user_id, name, kind ∈ {http, wasm, native, remote_proxy}, active, visibility, price, effect, description, input_schema, output_schema, source, auth_json, artifact_hash, remote_action_id, remote_owner_id, remote_bps, base_price, created_at, updated_at`. `(owner, name)` unique; `/` allowed in names, not handles, so `owner/name` is unambiguous. Default private, widened only by update. `effect` is the privileged value-bearing declaration (D18): never accepted from a client, written only by bootstrap registration, so no caller mints a transfer action [→G1]. `auth_json` write-only, encrypted; reads expose only `auth_scheme` + `requires_grant` [→G5]. Active requires non-empty description, valid schemas, field descriptions sufficient for lookup and LLM calling. Inactive ⇒ uncallable.
+- Lifecycle: create inactive; validate owner/name/kind/price; WASM validates/compiles only with executor configured; HTTP stores one structured source (verb — default POST — base URL, path, bindings) shared by manual and imported rows, its configuration validated without dialing the endpoint; field routing is explicit when bindings are present, else implicit (path placeholders bound by name, the remainder the body). Source-URL safety per G9: reject non-HTTP(S), RFC 1918, link-local, unspecified, CGNAT at create and activate; loopback permitted by default; `allow_local_sources` widens; a loopback source redirecting to a private address is still blocked. Activate: owner authority, init stats, reject invalid schema/source/artifact/runtime. Update: owner authority; changing source, schema, kind, price, or endpoint deactivates unless explicitly safe; recompute artifact hash; preserve historical source/hash. Delete: owner authority, soft, history preserved [→U9]. `RegisterNativeAction` bootstrap-only, `sys`-owned; normal create rejects `kind=native` (D17).
+- **Process**: `id, owner_user_id, available, locked, status ∈ {open, closed}, created_at, ended_at`; bijective with root trace; a longer-lived wallet only because traces settle eagerly — absorbs refunds to settled traces, holds parked steps; `available + locked` = total held across the computation.
+- **Trace**: `id, process_id, parent_trace_id, action_owner_id, available, locked, idempotency_key, dispatch_json, premium_bps, premium_parked, value, value_to, idempotency_record_id, created_at`. The call's wallet. `premium_*` snapshot the inbound serving markup (D14); `value`/`value_to` snapshot a transfer effect (D18) — the amount locked from the caller and its beneficiary, riding the trace so every settlement path releases the lock from the snapshot and rates are pinned against config changes [→G4]; all 0 on a non-transfer call. `idempotency_key/dispatch_json` null except on a dispatched proxy trace (D19); `idempotency_record_id` = the inbound record this call answers, set for any kind, so whichever settlement resolves the trace completes the record. `process_id` denormalized. Latency never cached (D22).
+- **Transaction**: immutable; `id, process_id, trace_id, parent_trace_id`, the role triple, `action_id, action_name` (captured at creation — history self-contained after deletion), `args_json, reply_json, status ∈ {success, failure}, gross, net, fee, refund, reason, remote_receipt_hash/json, started_at, ended_at`. One per attempted call [→G1, G2]. `refund` is what returned to the caller: on local failure the unspent allocation plus the cancelled steps' parked prices — not `gross − net − fee`, since settled descendants stay paid; on a remote settlement per P7; 0 on local success [→U13, U15]. Remote-receipt fields are null on a local call; a proxy settlement stores the full receipt JSON and its SHA-256 atomically with the transaction [→G7]. `reason` is the failure class only — never an upstream URL, body, or SQL, and a peer's reason is never adopted locally [→G5].
+- **Stats**: `uses, successes, failures, rating_count, latency_estimate, rating_estimate, last_used_at`; `uses = successes + failures`; missing stats have defined defaults; no cost estimate (the advertised price is the cost); estimators in D22.
+- **Step**: `id, parent_trace_id` (creating/funding trace; derives process; inherited by completion), `required_caller_user_id` (mandatory), `required_caller_remote_id` (nullable: remote principal, completion demands `step_auth`, P8), `action_id, price` (snapshot, parked), `import_bps` (nullable origin-fee freeze), `partial_args, status, tx_id, created_at`. Semantics in D6.
+- **LedgerEntry**: `id, operator_user_id, from_user_id, to_user_id, amount, reason, external_key, created_at`; deposit from-null, withdrawal to-null, transfer and delivered value both set; at least one side non-null; `operator_user_id` is the authorizer — `sys` for a deposit or withdrawal, the sender for a transfer, `C` for delivered value (D18); amount positive; debit requires funds; `external_key` globally-unique opaque idempotency token, never interpreted — kernel stays rail-agnostic [→U3].
+- **Rating**: `id, rated_tx_id, rated_receipt_id` (null only pre-receipt), `rated_receipt_hash` (P9's `receipt_hash` taken over the rated receipt — the portable evidence link; empty ⇒ local-stats-only, never gossiped), `rater_user_id, rating ∈ {0,1}` [convention], `note ≤ 1024 B` (nullable, inside the single signature), `created_at, signature`. One per transaction.
+- **Kernel**: `public_key, petname, nickname, about, gossip_cursor, last_seen, last_contact_failed_at, peer_credit, first_seen, updated_at`. Owns naming state (D15); cursor advanced only after verified commit (P9); the two contact timestamps and `peer_credit` are display cache only (D16); location never stored; discovery creates no account.
+- **Grant / Connection**: D10. **DiscoveryDoc / EvidenceRow**: D16. **IdempotencyRecord**: `id, idempotency_key, counterparty_user_id, receipt_id, status ∈ {pending, complete}, result_json, created_at, expires_at`; cross-kernel only; semantics P4/P8.
+- Ledger operations: `Deposit`/`Withdraw` superuser-only, positive amount, atomic credit/debit + entry, idempotent over `external_key` — the withdrawal replay returns the existing entry **before** the balance check, so replays never fail on a dropped balance [→U3]. `Transfer` is user self-service: atomic debit+credit+entry; rejects non-positive, self, missing/suspended recipient, and any peer/proxy recipient (would corrupt the bilateral account); never routed through `Call()` — no composition surface moves user funds [→U4]; not superuser-gated. `UpdateUser`: self-service description/password; password change demands current password (`ErrUnauthenticated` on mismatch); key-only accounts `ErrInvalidState`; atomic. `RenameUser`: superuser-only, sole handle-change path, validates uniqueness, vacates old handle; `sys` and kernel accounts refused. `RenameKernel`: the exact petname bind (D15). All served as public-API routes; money/rename superuser-gated. [→U44]
+
+### D5 Visibility and authorization
+`Live(a) := active ∧ ¬suspended(owner)`; `Visible(C,a) := public ∨ (local ∧ ¬peer(C)) ∨ C = owner`; `CanCall := Live ∧ Visible`. Visibility checked where the reference is **bound** — a call site against the immediate caller, a step's target at creation against the creating trace's action owner; liveness checked at every dispatch; completion re-checks liveness only, so a visibility change never bricks a parked step [→U22]. Caller-scoping is lexical-visibility semantics: a provider's public composite reaches its own private helpers in anyone's process; foreign funded code cannot reach the funder's private actions [→U20]. `peer(C)` holds for kernel accounts, so inbound federation reaches `public` only — what keeps a `local` proxy unreachable at the second hop [→U47]. Suspended owner ⇒ uncallable and unlisted; unsuspend restores [→U37]. A local caller may always wrap a private/local action in a public one — encapsulation bounds the dependency surface, not effect reachability.
+
+### D6 Steps
+A Step is a funded, partially applied future `Call`. `CompleteStep(caller, id, input) = Call(caller, step.parent_trace_id, action, partial_args ⊕ input)` — shallow merge, `input` overwrites. Funded at creation: price snapshotted and parked from the creating trace; completion never checks funds; the completion's allocation and `gross` are the snapshot, not the current price. Allowed input = `input_schema \ keys(partial_args)`, derived live, never stored — safe because a schema change deactivates the action and completion against a changed/deactivated action resets the step to `waiting`. `required_caller` mandatory — no open completion, no superuser exception; may be a peer account (P8 the only completion path — a keyless account has no session token, and without the protocol the step would strand: the process owner is that same account and `EndProcess` is owner-only). `CreateStep` requires the required caller to resolve to an existing account, so the step is completable. A step never duplicates transaction state: completion timing, result, and failure reason come from the transaction at `tx_id`.
+States: `waiting` (completable, price parked, holds process open) → `running` (`ClaimStep` atomic, prevents double execution) → `done` (`tx_id` recorded atomically) | `cancelled` (terminal, no `tx_id`, price returned — on process closure or creating call's failure). Completion preconditions, in order: step exists; status = waiting; process open; caller = required_caller; for **in-execution** completion (D7 host, D8 capability) the step's `parent_trace_id` = the authorizing trace; input satisfies the derived allowed input (a violation rejects, leaves the step waiting, and records no action failure). Any rejection before a transaction resets to `waiting`, price parked. Completion reports its own outcome: a never-taken claim is distinguishable (`ErrStepNotClaimed` marker under code invalid_state/409, only for the two genuine claim races); a post-transaction failure returns the transaction; awaiting-receipt leaves `running` for retry. Startup: `running` + null tx → `waiting`; `cancelled` never reset. Completion role law: owner = step's process owner, caller = required caller, target = action owner. Access: `CanListStep(u) := process owner ∨ required caller ∨ superuser`; `CanReadStep` identical; list ordered `created_at` desc, filters `process_id`/`status`. Richer coordination (first-of-N, quorum, deadline) is user-land; the kernel ships no coordination natives [→minimality]. WASM hosts (arguments JSON-encoded strings): `juice.step_create(partial_args, required_caller, action) → step_id` binds current process/trace; `juice.step_complete(step_id, input) → {result, tx_id, trace_id}` completes as the executing action's owner, trace-confined per the preconditions above. External creation (`POST /v1/steps`) requires precondition-4 authority over the funding trace. [→U22–U24, U41]
+
+### D7 Scripting
+wazero; scripts get no ambient filesystem, network, environment, process access, or tokens — only host functions `juice.call, juice.step_create, juice.step_complete, juice.log`; per-execution memory limit, timeout, deterministic cancellation; artifact-hash compiled-module cache; `ScriptAuthority ⊆ KernelAuthority(trace, process, subject)`; store source + artifact; authorized source inspection; activation precompiles; typed compile failures. Network only via `sys/web` (or a pinned http action) through `Call()`, charged and SSRF-bound [→G9]. [→U19, G5, G6]
+
+### D8 HTTP composition capability
+Every dispatched HTTP call receives a trace-scoped capability: the platform key signs `{"cap": trace_id}` (JCS, domain `capability`, P1), delivered as a header beside a callback base-URL header; never in payloads, `args_json`, `reply_json`, receipts, hashes, or logs [→G5]. Presented as a bearer on a callback it authorizes composition **as the executing action's owner within its trace** — the WASM subcall law exactly; nothing else (no wallet, no other trace, no supervision). Routes mirror the host surface: `POST /v1/call` ≡ `juice.call` (capability-only, no run/wallet path), `POST /v1/steps` (trace from the capability, rejected in body), `POST /v1/steps/{id}/complete` (iff required caller = owner, trace-confined per D6); each reuses `BeginSubcall`/`CreateStep` — no new money path; over-budget fails `ErrInsufficientFunds`, so the advertised price bounds the subtree [→U11]. Valid only while the trace is unsettled (the settled-once transaction row invalidates it; spend and settlement are mutually exclusive, so concurrent callbacks cannot exceed the bound or race the payout). In-flight capability traces sweep to `interrupted` by ordinary recovery; a retry never mints a fresh trace or capability. Callback URL: `http_callback_url` else derived from the listen address, and when none can be derived neither header is injected (an ordinary leaf dispatch); loopback callback plain HTTP, public requires TLS; headers stripped across host-changing redirects; issuance ambient (leaf endpoints ignore it). Local to the executing kernel; never crosses federation — a composing HTTP action is served abroad as an ordinary `kind=http` action bounded by its manifest price. [→U21]
+
+### D9 Sessions, recovery, first boot
+OAuth-style authorization code + PKCE; CLI device or loopback login; short-lived bearer tokens; rotatable refresh tokens; server-side logout revocation; scripts never receive tokens [→G5]. Recovery: client generates a 12-word BIP-39 mnemonic at `user create`/first boot, derives Ed25519, sends the public half only; `recover/start {handle}` issues a single-use TTL nonce; `recover/complete {handle, nonce, signature, password}` verifies over `{recovery_challenge: nonce}` (domain `recovery`), consumes the nonce, sets the password; under the auth rate limiter [→U2]. Password ≥ 8 chars server-side at create/first-boot/update, no composition rules [policy]. First boot: prompts for password and kernel name; atomically creates `sys`, `superuser_handle = sys`, Ed25519 signing keypair, 32-byte JWT secret; enrolls `sys` recovery and prints the phrase once; partial boot rerunnable; requires `kernel_handle` (config → `JUICE_BOOTSTRAP_KERNEL_HANDLE` → repeating prompt; a headless boot without one **fails**, resolved before anything is written so a nameless boot leaves no half-created kernel, and no name is ever derived). Secrets never logged or returned; `JUICE_SECRET_KEY` runtime-only override. Every startup: confirm first boot via `superuser_handle`, verify keys (abort if absent), register/enable natives + reconcile config, soft-delete unregistered natives, run recovery; bootstrap idempotent. [→U1–U2, U43]
+
+### D10 Upstream and delegated auth
+Owner-held schemes in `auth_json` `{scheme, config, secrets}`, AES-256-GCM at rest, applied by a replaceable `Authenticator.Apply` adapter at dispatch (kernel imports no scheme): `header, query, bearer, basic, oauth_client_credentials, oauth_jwt_bearer` (RFC 7523 RS256). Scheme + keys validated at create/update; dispatch fails closed on unknown scheme; HMAC signing unsupported (never-active). Secrets excluded from contract comparison [→G5, U26].
+Delegated schemes hold the per-caller credential on a `Connection` (`id, user_id, provider_key, sealed_secret, scopes_json, created_at, updated_at`; unique per `(user, provider_key)`; `sealed_secret` AES-256-GCM with AAD `user_id|connection_id`, write-only; `scopes_json` = requested union, authoritative for coverage; rotation updates the one row; `invalid_grant` deletes it and cascades; zero-grant kept, listed `unused`, never auto-expired), the `Grant` holding consent only (`id, grantor_user_id, action_id, connection_id, created_at`; unique per `(grantor, action)`; a pointer to the connection, no secret; re-consent overwrites; deleted on revoke, cascade, invalid_grant, and deactivating update / auth replacement / delete — invalidation never deletes the Connection). `provider_key` fact-derived, never from names: `bearer:<pinned source host>`; `oauth:<token_url>|<client_id>|<source eTLD+1>` — the domain term prevents a hostile action riding a victim's connection with a public client id (confused deputy); the plan surfaces destination hosts. `oauth_delegated` stores provider config only (`auth_url, token_url, device_auth_url?, client_id, scopes, client_secret?`); consent via `grants/start` + `grants/complete` authenticated as the grantor; the kernel performs the code→token exchange, holds ~10-min single-use in-memory PKCE/device state, has no unauthenticated callback route, never dials `redirect_uri` (any http(s) accepted — the provider's registered-redirect allowlist closes phishing). `delegated_bearer` stores only optional `{header, template}` (default `Authorization: Bearer {token}`); token pasted once via `POST /v1/grants`; no exchange/refresh/invalid_grant — a rejected token is an ordinary execution failure.
+Binding at dispatch: token applied iff `grant.grantor = process.owner` ∧ `grant.action = executing action`, fetched through `grant.connection_id`; never inherited by subcalls, never across federation (a proxy executes the proxy), never visible to WASM [→U27, G5]. Missing consent → `ErrGrantRequired` pre-lock, structured, before any transaction — no charge, no failure stat [→U28]. Selector: `owner` or `owner/path`, path-segment match (`tom/brief` matches `brief`, `brief/x`, never `briefing`; `/*` stripped; full `owner/name` degenerate), expanded over `CanCall`, grouped by `provider_key`; one consent covers a group with the union of scopes; covering connections grant instantly; re-consent widens the stored union; every connect is a reconcile acting on the delta, which the client must display as the consent act. Token cache in memory, keyed by connection; an upstream 401 drops it, refreshes once, and retries once, the resulting failure returned as-is; token-endpoint fetches under G9. `credentials_key` (D20) is the base64url AES-256-GCM key sealing both `auth_json` and every `sealed_secret`. Delegated actions never in manifests or gossip (P6). Confinement line: data at the run boundary, tokens absolutely.
+
+### D11 Local audit artifacts
+Every committed call: one immutable transaction + one signed receipt (`issuer = sys`), atomic (shape P5). Every transaction references a trace; listing a process's traces yields its execution tree, and deleting a trace never removes transaction history [→G3]. Ratings: platform-key Ed25519 over all fields minus signature; only `tx.owner_user_id` rates; once; duplicate `ErrInvalidInput`; non-cascading; supervision, never through `Call()` [→G8]; `rated_receipt_hash` links into evidence (P9). `CanReadTransaction(u,t) := u ∈ {owner, caller, target} ∨ superuser` — captured fields, valid after action deletion; every credit to an owner reconstructible from transactions that owner can read [→U15]. Latency derived, never cached: own = `ended − started`; buyer-experienced = subtree query (D22). Receipts are internal settlement/federation artifacts — no provider-receipt endpoint. Public ratings projection `{value, note, created_at}` readable wherever the action is visible, anonymous for public, independent of `active` [→U14, U39].
+
+### D12 Federation transport
+libp2p is the sole carrier behind the replaceable `fed` interface (`kernel` never imports it). Terminology: a **peer** is any known remote kernel; a **counterparty** is a peer with a bilateral account; discovery finds identities/addresses, gossip exchanges catalogs/evidence. Peers addressed by key only — direct, hole-punched, or relayed; streams mutually authenticated by key, yet per-request signatures retained deliberately (offline artifacts, G7). Startup joins via `bootstrap_peers` (default: the project's public node; should list two independent nodes when they exist); routing discovery over a fixed namespace — advertise + enumerate providers each `discovery_interval_seconds`; provider addresses are ephemeral peerstore data, never identity or authority; empty bootstrap ⇒ no advertise/enumeration, counterparty sync only. Every kernel runs the DHT and a circuit relay — a public `juice serve` **is** the network's bootstrap + relay; public nodes bind port 31313 [convention], NAT nodes use OS-assigned ports and are found by key. Discovery grants nothing: execution requires authoritative resolve + admission [→U40]. Inbound limits at the transport: per-source-address where visible, per-peer stream/byte budgets, global cap, stricter for relayed traffic — per-key limits alone are Sybil-insufficient (replaces the HTTP per-IP peer limit). A bootstrap multiaddr inlines its Ed25519 key, so it is inspectable by the same base64url key. The CLI's `--server` is a local base URL, never a federation address. Federation commands are defined for offline peers and fail promptly. [→U29, U34, U35]
+
+### D13 Remote action cache
+No subscription: naming `owner@B/name` with an absent **or inactive** proxy row resolves that one action's signed manifest over `/juice/fed/resolve/1`, verifies, and creates/refreshes the `kind=remote_proxy` cache row — the sole cache-fill path, a purely local read B makes no decision on [→U29]. Row: owned by the local peer user; `visibility = local` (a second hop fails `CanCall` [→U47]); wholly kernel-managed — manual enable/disable/update/delete rejected `ErrInvalidState`; the durable peer lever is suspend; `active` is cache state (set by resolve, cleared by any non-402 signed rejection or receipt quarantine, removed only by retention). Reconstructible from `(peer key, owner id, remote action id, contract)`; semantic identity is `PrincipalID = (kernel key, owner id)`, never the kernel account. The row stores no source URL and no peer location: the peer is a key the transport resolves (D12). Match key `proxy.owner + remote_owner_id + remote_action_id` — a remote handle rename never re-keys. Reconcile preserves `Action.id`; unchanged contract preserves row and stats; changed updates in place and resets stats; every successful resolve re-enables. `base_price` stores the seller's manifest price so an `import_bps` change reprices at read with no re-resolve (older rows heal by re-resolving). Local price `q = sr + ceil(sr·import_bps/10000)` (P7). Healing is per-call via `refresh_proxy`, not bulk sync. First verified outbound resolve also binds the petname (D15), best-effort, never delaying the call. The legacy mount form does not resolve. Imports never touch manual actions or other provenance; never delete history; stat reset writes defaults only [→U25's reconciliation discipline, shared]. [→U29–U31, U8]
+
+### D14 Exposure engine
+Gross receivables `G = Σ_peers max(0, −available)`. Admission of an inbound paid call reserves the worst case `W = mp + ceil(mp·remote_bps/10000)` and admits iff post-reservation `G ≤ X`, atomic with the wallet move (concurrent calls cannot jointly breach) [→U32]. `X` is global — additional identities cannot multiply exposure [→U32]; default 1000, `Y` 500 [policy]; config validation requires `0 < Y < X` whenever `X > 0`; at `X = 0`, `Y` is ignored; `X = 0` ⇒ prepaid-only; a free call adds no exposure and always runs [→U18]. At `G ≥ Y`: `settlement_due` flagged on peers/gossip/identity — signal only, never stops execution; settlement moves external money, hence operator-initiated (`admin settle`) [→U33]. Only reaching `X` refuses, with the signed 402 (P4) surfaced as `ErrPeerUnfunded`. `Q = F/r` from rail fee and acceptable fee ratio [policy]; `Q = 0` disables the probabilistic path. A `pending_cash` outcome blocks the debtor's further credit-drawing calls until `--cash`; prepaid calls unaffected (P10). The inbound premium reserve is parked in the owner's `locked` at admission and snapshotted on the trace (`premium_bps/premium_parked`) so every settlement path — commit, failure, recovery, forced closure, max-age — releases it from the snapshot [→G4]. Only current exposure is bounded; cumulative historical losses require operator reserves. The bilateral position nets as the one peer-account row (positive = prepaid, negative = owed).
+
+### D15 Naming
+Petname system (Stiegler 2005; Zooko's triangle: no registry, no ledger). Name classes: **key** (self-certifying, always resolves), **nickname** (self-asserted, never resolves), **petname** (local, unique, resolves in kernel position), **handle** (local, unique, resolves in user position). `PrincipalID = (kernel key, user id)` is stable under renames; resolution captures it beneath friendly names (proxy `remote_owner_id`, step `required_caller_remote_id`, receipts). References: `owner/name` local, `owner@kernel/name` remote (petname or raw key). A petname is local addressing only — never signed, never transmitted, never learned from a peer. Handles and petnames are separate uniqueness scopes sharing one validator: bare, no `@` or `/`, never key- or id-shaped; sigils rejected, never stripped. Lifecycle: gossip/discovery binds nothing and creates no account; a verified outbound resolve binds petname + account; an inbound call or deposit provisions an account without a petname (anti-squatting: only this kernel's own outbound acts bind names); withdraw/unsuspend/settle require an existing account; explicit `admin rename` binds exactly — an occupied petname is `ErrInvalidInput`, never suffixed. Auto-bind preference: existing petname > cached valid nickname > `k-<key8>` [convention]; collisions suffix `-2`; one store transaction converges concurrent first use. Suspend provisions and freezes atomically, so no inbound call meets a briefly-active account [→U37]. Key rotation unsupported: a lost key is lost identity and reachability. Three disjoint syntactic productions — hex UUID in `8-4-4-4-12` form, 43-character base64url key decoding to 32 bytes, or validated handle — one resolver by shape, no sigil; resolvers are contextual (user vs kernel position); only `show, rename, suspend/unsuspend, deposit/withdraw` consult both, and a bare name matching both namespaces is refused `ErrInvalidInput` — money and moderation never guess [→U38, U44].
+
+### D16 Discovery and evidence cache
+- **Discovery cache**: a verified gossip pull (authenticated as the dialed key, reply key matches, valid bare handle — else skipped, retried next pass) rebuilds that kernel's `DiscoveryDoc` rows (`kernel_public_key, kind, user_id, handle, description, action_id, name, input_schema, output_schema, serving_price, embed_vec, observed_at`) replace-all: one `kind=action` doc per verified manifest (`serving_price = mp + ceil(mp·remote_bps/10000)`; local read adds `import_bps` — indicative, resolve re-quotes), one `kind=user` doc per catalog user; indexed by the same lexical+semantic machinery as lookup; carries no execution semantics; truncatable with zero effect; purged with the peer [→U40].
+- **EvidenceRow**: `issuer_public_key, receipt_hash, subject_kernel_public_key, subject_action_id, counterparty_kernel_public_key, evidence_receipt_json, rating_json, remote_receipt_hash, receipt_created_at, effective_at, observed_at, equivocated`; keyed `(issuer_public_key, receipt_hash)`. Two different valid ratings under one key = equivocation, both excluded from derived metrics [→U39]. Learned evidence never re-gossiped; regenerable; purged with the peer. Retention cap E = 200 most recent per `(issuer, subject kernel, subject action)` [policy]; a rating rides only while its receipt is retained.
+- **Derived views** (`admin inspect`): execution summary counts only `issuer = subject` rows (no double count); counterparty experience groups the rest by issuer, never folded in. A rating is **trade-backed** iff its `remote_receipt_hash` equals a subject execution row's `receipt_hash` and that row names the rating's issuer as counterparty; unlinked ratings surface as unverified counts. This proves attribution and immutability, never honesty — own settled experience and distinct-issuer trade history are the only Sybil-resistant signals; how signals weight ranking is the replaceable layer [→U39]. Evidence never overwrites local `Stats`; imports initialize Stats to defaults.
+- **One loop** (`discovery_interval_seconds`): each pass enumerates namespace providers and pulls gossip from providers ∪ bootstrap seeds ∪ counterparties; a verified pull refreshes the `Kernel` row (nickname, about — never petname) and evidence cursor, and persists `peer_credit = counterparty_balance` when the peer reported one.
+- **Contact**: reachability is not retention. Outbound contact records on the peer's `Kernel` row only what it proves: a reply advances `last_seen`, a request that provably never left advances `last_contact_failed_at`, and anything between — a stream broken after dispatch, a call still awaiting its receipt — records nothing, since it is evidence of neither. One rule for every operation, or the same lost connection would date a peer differently by which one hit it. Recorded from the federation client (call, resolve, step completion, settlement) and the discovery pass (gossip, after verified accumulation, which creates the row). Both only move forward and neither is cleared, so a slow observation cannot overwrite newer truth; consumers compare them under their own freshness policy and the kernel computes no liveness verdict. Reads record nothing (step listing, `admin inspect`), so no state depends on being looked at, and suspension does not freeze it — moderation governs whose requests are answered, not what is true of the network. Display cache, never gating anything, never retention activity (answering gossip is free liveness; a zombie must not be immortal).
+- **Retention**: a peer is kept while it holds value (nonzero balance or locked funds), acted recently (settled call either direction, gossip mention, deposit/withdrawal), or is suspended (moderation outlives idleness). Idle past `peer_retention_days` [policy]: purge proxies + stats, discovery docs, evidence rows (issuer and subject), and the `Kernel` row (the account→kernel link is cleared first — the foreign key is restrictive, so deleting a `Kernel` row still referenced by an account is rejected); the credentialless account row remains as ledger anchor — the immutable ledger is preserved and every local counterparty's credits stay reconstructible [→G3, U15]. Purge is reachable only through zero value. Directory-only kernels stale past the same window are evicted with their docs/evidence; a re-pull re-learns them.
+
+### D17 Native stdlib
+Standard actions shipped with the kernel: no kernel privileges — equivalents could ship as HTTP/WASM actions; bootstrap-registered under `sys`, not user-creatable/updatable/deletable, callable only through `Call()`, interacting only via injected dependencies and the public entry points, never extending kernel interfaces (G8; borderline ruling 11). All `local`: identical stdlib everywhere makes serving it abroad pure duplication; backed by scarce local resources unbounded at price 0; a kernel with capacity to sell wraps its own `public` action [→U47 rationale]. Startup reconciles config (prices, settings) every boot and soft-deletes natives whose handler is absent from the build. LLM adapters are the replaceable `llm` interface (`Embed`, `Chat`); concrete adapters call Ollama; defaults `http://localhost:11434`, `gemma4:26b`, `nomic-embed-text` [policy]; tests use fakes. Catalog (all price 0 [policy] unless noted; config `native.<x>`):
+- `sys/lookup`: `query, limit=10` → `results[{action_id, action ref, description, price, score, input_schema, output_schema, quote_hash, observed_at?, last_seen?, last_contact_failed_at?}]`. Ranking: BM25 + cosine fused by RRF — replaceable research surface, its storage replaceable too and brute-force cosine acceptable; stats weighting UNDER REVISION, temporarily removed (see `ranking.md`); embedder optional (lexical-only degrade); dimension-mismatched vectors skipped; FTS operators sanitized to literals; `CanCall` applied before truncation [→U10]; discovery-doc third leg for authenticated local callers — a discovered hit renders `owner@<petname-or-key>/name` with the remote action id, indicative all-in price (`serving_price` + `import_bps`), and identical `quote_hash`; a local proxy shadows its discovery row. `observed_at` is the last verification against the authority (gossip observation, or a proxy's reconcile); the two contact timestamps are the hosting kernel's reachability (D16), so a hit carries when that kernel was last reached rather than reading as fresh; all three absent locally. Direct (non-`Call`) lookup is diagnostics-only.
+- `sys/user-lookup`: `query, limit` → `results[{principal_id {kernel_public_key, user_id}, reference, handle, description, kernel_public_key, score}]`; searches `sys` + owners of active public actions + discovered users; separate surface keeps typed results so `decide` consumes action refs only [→U40].
+- `sys/llm/chat`: `messages[{role, content}], system?` → `message {role, content}`; `ErrInvalidState` unconfigured.
+- `sys/llm/embed`: `text` (string) → `embedding` (array of numbers); `ErrInvalidInput` empty; `ErrInvalidState` unconfigured.
+- `sys/llm/json`: `messages, system?, output_schema` → `value` validated locally; `ErrSchemaViolation` unsupported schema; `ErrInvalidState`; `ErrExecutionFailed` no valid JSON.
+- `sys/llm/decide`: `messages[{role ∈ {system, user, assistant, tool}, content?, tool?{action, args, result}}], actions[]` (action refs) → `{action, args, message?}`; contracts fetched from the DB by ref, args validated; selects, never executes [→U46]; kernel-qualified candidates resolve via D13 — dead ones discarded, `ErrNotFound` only when none resolves; bare unknown refs strict `ErrNotFound`; `ErrInvalidState` no tool calling; `ErrExecutionFailed` no valid selection.
+- `sys/time`: → `{unix` integer seconds since the UTC epoch, `iso` RFC 3339`}`; `sys/random`: → `value ∈ [0,1)`; `sys/sink`: any → `{}` — the explicit clock, randomness, and no-op the deterministic sandbox withholds (random exists because scripts have no OS entropy).
+- `sys/message`: `to, message` → `step_id`; parks a `sys/sink` step for the resolved recipient with `partial_args {message}`; `ErrInvalidInput` unresolvable [→U22].
+- `sys/transfer`: `target, amount` → `amount`; `effect = "transfer"`; D18 [→U49].
+- `sys/web`: `url` (required string) → `{status` integer, `body` string, `content_type` the response Content-Type, `final_url` the URL actually fetched`}`; GET only; no caller headers/auth (nothing sensitive enters args/receipts/logs); scheme-less defaults https, explicit scheme never downgraded; SSRF per G9; non-2xx returned, not raised; 10 MiB cap [policy]; UA derived from the binary version; empty `url` `ErrInvalidInput`, unconfigured fetcher `ErrInvalidState`, transport failure `ErrExecutionFailed`. The mediated web path for scripts [→G9].
+- `sys/tinygo/compile`: `source` → `{status, artifact` base64 WASM, `artifact_hash` SHA-256 hex, `diagnostics}`; empty source `ErrInvalidInput`; price 5 [policy]; SDK prepended so authors write `func Handle(in map[string]any) (map[string]any, error)` while it owns `package`, imports, `alloc`, `run`, and `main`; author compile/validation errors are charged output-failures; missing toolchain `ErrInvalidState` uncharged; registration separate (`action create --kind wasm --artifact`).
+
+### D18 Value transfer — local only
+One deferred, receipt-backed `TransferEffect`, staged at admission, committed by the kernel at settlement — the handler only validates. Two channels, different wallets, never mixed [→G1]: execution price from the trace (taxed normally); value from the **immediate caller C**'s own `available` (role law — never an argument, never `P`), delivered untaxed, all-or-nothing. Value-bearing is decided by the signed `effect` contract field alone, never a name; `sys/transfer` is `local`, and the target must resolve to an ordinary active local account at admission (unknown, suspended, peer, or kernel-qualified rejected before funds move). Settlement: success delivers `value` to the beneficiary and refunds the remainder to `C`, recording one ledger entry (C→beneficiary, `reason` = the transaction id) in the same commit — the beneficiary is no party to the transaction, so the journal is where both sides read the movement [→U5, U15]; failure refunds all and journals nothing. Sender pays fees; beneficiary receives exactly `amount`. `/v1/transfers` (D4 ledger ops) remains the separate direct surface. Serves U49. Because what is locked is exactly what is delivered, the trace carries one number (`value`) and settlement is a single release: to the beneficiary on success, to `C` on failure. No fee, no reserve remainder, no quarantine — those existed only to price value across a boundary it no longer crosses.
+
+### D19 Dispatch records and retry
+Outbound proxy call: UUID v4 `idempotency_key` + `dispatch_json` (`mp, remote_bps, import_bps, expected_contract_hash`) recorded on the trace atomically with dispatch — enables restart-proof retry, keys the hash-conditional proxy deactivation, and freezes the fee rates the settlement uses (rows/steps predating the snapshot heal on next funded use; an already-dispatched call settles at its frozen rate) [→U35, G4, U8]. The running server's retry worker drains the traces pending at transport start (snapshotted before it serves HTTP), then re-drives on `remote_retry_interval_seconds` so a returning peer settles parked work without a restart, and fires the 24-hour max-pending-age bound; the loop never settles a parked trace on a connection failure. Forced closure fails an in-flight proxy call locally with refund; a remote commit stands there, absorbed bilaterally, surfacing at reconciliation. Inbound: the `idempotency_record_id` threads through the kernel so whichever commit finally settles — normal, retry-loop, max-age, forced closure, crash recovery, local-action crash included — completes the record atomically with the transaction; the service layer deletes the record only where no commit can ever occur, so a corrected retry is not locked out; awaiting-receipt stays honestly `pending` (replay = duplicate-in-flight with an error code). Step-completion keys are derived, not minted (P8). A failed stored settlement stores an error body so replays return failure status. [→U35, G4]
+
+### D20 Surfaces
+- **Shape**: the user-facing HTTP/CLI surface is a **public-interface contract** — visible at one kernel's boundary yet server-authoritative and unilaterally versionable, so it is design rather than federation wire protocol. HTTP API primary; CLI a pure client of it (`--server`, default `http://localhost:4040` — the only override); `juice serve` the sole SQLite opener; every command has at least one test; admin/peer commands hit the same public TCP API on `IsSuperuser`-gated routes, authority = the `sys` bearer alone (keep secret; TLS or loopback) [→U44–U45]. Handlers are thin wires; enrichment lives in the service layer, and a handler invokes the kernel directly only where it transforms nothing. Primary identifiers positional by natural key (user = handle, also key/id; action = `owner/name` or `owner@kernel/name`, also id; processes/steps/txs = ids); second mandatory value is second positional. Outputs render `handle`/`owner/name`/petname, never raw user ids; `GET /v1/me` alone returns the caller's own `id`, and a purged party falls back to its raw id. Resource ids remain where the surface identifies that resource; transaction-party, step-caller, process-owner, and ledger-party fields render as `*_handle`; the peer list carries no internal id. Detail views expose the full HTTP shape; lists summarize; `--json` full.
+- **Commands** (complete): `serve; user create/me/update/connect/disconnect/transfer/ledger; auth login/logout/recover; action create/show/update/delete/enable/disable/list/import/unimport/stats/ratings; process list/show/end; run; step create/list/show/complete; tx list/show/rate/verify; health; admin users/show/suspend/unsuspend/rename/deposit/withdraw/settle/peers/inspect/identity`. `admin` holds only operator verbs (money, access, federation trust, roster); other supervision is scope on normal commands (superuser sees all rows; may disable any action); `action list` active-only by default, `--all` widens; no duplicate admin read commands. `admin peers` merges counterparties (account, balance, `peer_credit`, `last_seen`) and discovery-only kernels, self excluded, suspended under `--all`, PETNAME and NICKNAME as separate columns (only the first resolves), `—` for unbound, and both contact timestamps (D16). `admin inspect <key|petname>`: identity, public actions (live gossip else cached docs — one projection either way, priced all-in indicative per D16), retained-evidence views (D16), reachability diagnostics (direct/hole-punched/relayed, latency, versions); degrades offline to local data + `unreachable`; writes nothing. `admin identity`: own key, handle, about, listen addresses, and the exposure position (`exposure_max`, `gross_receivables`, `settlement_trigger`, `settlement_quantum`, `settlement_due`; D14). `step complete <id> --peer <key>` completes a peer-held step (superuser scope — the request signs as the whole kernel). `serve` handles SIGTERM/SIGINT: stop accepting, drain, exit; no `juice stop`.
+- **Endpoints** (full list in `API.md`): `GET /health` unauthenticated `{status, handle, public_key}`; `GET /v1/actions` scoped (anonymous: active public; session: + local + own; superuser: all owners; suspended owners excluded; `?all=1` adds inactive/private rows in the caller's scope, `?owner=` filters by owner handle — self-match lists all the owner's own rows regardless of `active`/`visibility` — `?name=` filters by name); `GET /v1/me` (authenticated `id, handle, description, available, locked`, suspended rejected before handler; `connectors` = the directory-grouped consent tree — one node per folder (the granted actions' shared path up to its last `/`), each with its backing connection(s) and token-free actions (`owner/name`, requested scopes, `provider_key`, `created_at`) — a display grouping only, never gating a credential; `connections` = the full account inventory (provider, action count, `unused` flag, `provider_key`, `created_at`); `provider_key` also addresses `DELETE /v1/grants?account=`, omitted when a grant has no backing connection); `GET /v1/grants/plan?selector=` (expands the selector over delegated actions the caller may call; groups by `provider_key` — provider, scheme, requested scope union, destination host(s), connected/covered status, per-action `granted` flag — plus counts of skipped loginless or not-callable actions); `POST /v1/grants/start` (`{selector, provider, [redirect_uri], [flow]}`; already-covered scopes → immediate `{status:"granted", actions}`; code flow → `{state, authorize_url}`; device flow → `{state, verification_uri, user_code, interval, expires_in}`); `POST /v1/grants/complete` (`{state, [code]}`; device poll may report `pending`; foreign or expired state rejected); `POST /v1/grants` (`{selector, [provider], token}` — static bearer, `provider` optional when the selector resolves to one bearer group); `DELETE /v1/grants?selector=|account=`; `PUT /v1/me` (password account only; `{[description], [current_password, password]}`; at least one field required, `description` `""` clears; password change requires `current_password`; returns id, handle, description, available, locked); `POST /v1/transfers` (`{recipient, amount, [reason], [external_key]}`; returns the ledger entry with `operator_handle`/`from_handle`/`to_handle`, each present only when that side is set); `GET /v1/ledger[?limit=&offset=]` (own entries, newest first, default 50 cap 200, same handle projection); `GET /v1/actions/{id}/ratings[?limit=&offset=]` (projection `{value, note, created_at}`); `PUT/DELETE /v1/actions/{id}` (visibility updatable without deactivation; widening an OpenAPI import beyond private needs ownership proof); `POST /v1/actions/import|unimport`; `GET /v1/processes` (the owner's processes, descending `created_at`; each carries `awaiting_receipt` and, when set, `awaiting_receipt_since` — the earliest parked remote call's start, a factual age and never a liveness claim); `GET /v1/steps` (visible per `CanListStep`, filters `?process_id=`/`?status=`; each step carries `created_by` — the creating action `owner/name`, from its parent trace — beside `action` (the completion target) and `owner_handle` (the process owner/payer whose transaction the step settles into); a waiting step carries `allowed_input` (the derived completion schema, so a required caller completes without reading a private target) and, when its required caller is a peer, `waiting_on_peer`); `POST /v1/steps` (JWT: requires `trace_id` (funding trace), `action` (`owner/name` or id, as `/v1/run`), `required_caller`, `partial_args`, and precondition-4 authority over `trace_id`; capability: `trace_id` comes from the capability and is rejected in the body); `GET /v1/steps/{id}`; `POST /v1/steps/{id}/complete` (JWT or capability, `CanReadStep`; `args` required, `{}` valid, absent → `ErrInvalidInput`; returns `{result, tx_id, trace_id, step_id}`); `POST /v1/call` (capability-only; body `{action, args}`; returns `{result, tx_id, trace_id}`; no CLI, like inbound federation); `POST /v1/run` (never capability; `args` required; returns `{result, tx_id, trace_id, receipt_id, process_id}`); `POST /v1/auth/authorize` (unauthenticated; `{handle, password, code_challenge, [redirect_uri]}`; with `redirect_uri` → 302 redirect, without → 200 `{"redirect": "?code=CODE"}`); `POST /v1/auth/token` (auth code + `code_verifier` → `access_token` + `refresh_token`); `POST /v1/auth/logout` (refresh-token body; missing or revoked → `ErrUnauthenticated`); `POST /v1/auth/recover/start` (`{handle}`; no enrolled key → `ErrInvalidState`); `POST /v1/auth/recover/complete` (invalid/expired nonce or bad signature → `ErrUnauthorized`); `GET /v1/transactions[/{id}]` (`ErrNotFound` to non-parties; `rating` inline as `{value, note}` or null); `GET /v1/transactions/{id}/receipt-verification`.
+- **Errors**: `ErrUnauthenticated, ErrUnauthorized, ErrNotFound, ErrInvalidInput, ErrInvalidState, ErrInsufficientFunds, ErrExecutionFailed, ErrSchemaViolation, ErrTimeout, ErrInternal, ErrGrantRequired, ErrPeerUnreachable, ErrPeerUnfunded, ErrTermsChanged`; stable exit codes and HTTP statuses; structured meta (grant → action ref; `ErrPeerUnreachable`/`ErrPeerUnfunded`, and `ErrUnauthorized` on a peer's refusal (P7) → the peer under `Meta["peer"]`, petname where the failing path knows one and key otherwise (both name a kernel, D15), so every failure to reach a peer names it; a parked run → `process_id`, `pending_since`, `refund_eligible_at` (RFC 3339 UTC; eligibility, not settlement)); concise messages [→U28]. Duplicate-key user errors are `ErrInvalidInput` without SQL text; internal CHECK/FK violations stay `ErrInternal`.
+- **Rate limiting**: auth + account creation per client, 429; genuine loopback (no XFF) exempt; a loopback proxy's XFF keys on the last forwarded hop; federation limited at the transport (D12).
+- **Logging**: stderr (+ optional file), stdout payloads only; configurable format/level/file; required fields `time level event request_id caller_user_id process_id trace_id action_id tx_id status duration_ms error`; every kernel transition logs start/end; stable error codes; script logs carry trace id [→U44].
+- **Config**: `config.json` under `$JUICE_HOME/kernel/` (`$JUICE_HOME` default `~/.juice`, absolute, never cwd-relative — same identity wherever launched); DB default `$JUICE_HOME/kernel/juice.db` (`--config`/`--db` override); `cache/` regenerable, deletable. Keys [defaults = policy]: `db_path; fee_bps 2000; remote_bps 500; import_bps 500; exposure_max 1000; settlement_trigger 500; settlement_quantum 0; http_callback_url` (empty ⇒ derived loopback); `kernel_handle; bootstrap_peers` (shipped default `/dns4/daios.ai/tcp/31313/p2p/12D3KooWJ5ZwPSAV17q2hv6ttZ8J3hHsTMNaSC61kbVbvxvtArjK` [policy]; list two independently-operated nodes once a second exists); `credentials_key` (auto-generated first boot); `allow_local_sources false; remote_retry_interval_seconds 60; discovery_interval_seconds 300; peer_retention_days 90` (a non-positive interval falls back to its default; a non-positive retention disables purging); auth issuer, audience, and token TTL; log file, format, and level; script timeout and memory limits; `native.<action>` (one level, no deeper nesting; per-action price + settings; llm url/models; lookup default_limit 10; web price only, its User-Agent derived from the binary version; transfer price; tinygo price 5). Safe defaults when absent; invalid config rejected at startup; no committed secrets. Env (bootstrap/overrides only): `JUICE_HOME, JUICE_SECRET_KEY, JUICE_LOG_LEVEL, JUICE_CREDENTIALS_KEY, JUICE_BOOTSTRAP_PASSWORD, JUICE_BOOTSTRAP_KERNEL_HANDLE, JUICE_ALLOW_LOCAL_SOURCES`; nothing else.
+
+### D21 OpenAPI import
+`action import <spec-url>` imports representable operations as inactive `kind=http`, `source.type=openapi` actions owned by the importer, `Call(args) → object`. Methods GET/POST/PUT/PATCH/DELETE, stored in source, not `Call` semantics; manual and imported http rows share one source representation, distinguished by `source.type`. Required else rejected/kept-inactive with messages: `operationId` or `x-juice-name`; description or summary; parameters and/or body schema; one 2xx JSON response schema; `x-juice-price` default 0. Path/query/body compile into one canonical input schema; the selected 2xx response becomes the output schema. Never active: non-JSON, streaming, multipart, ambiguous success schemas, unsupported auth, unsafe URLs, invalid schemas (the last two rejected at import, not stored). Ratings/stats never imported. Provenance `{type, spec_url, base_url, method, path, operation_key, operation_hash}`; `operation_key = x-juice-name || operationId || canonical(method, path)`; match key `owner + source.type + spec_url + operation_key`; contract fields: description, method, path, bindings, both schemas, selected response, price, execution source (`operation_hash` excludes stats/ratings/timestamps/formatting). Reconcile: unchanged preserves active + stats; changed updates, deactivates, refreshes lookup, resets current stats, preserves id; removed/uncallable deactivates + resets; unimport deactivates by `spec_url` (optionally name or operation_key); scoped by provenance and match key — never touches manual rows, other servers, other mechanisms; never deletes transaction/receipt/rating/trace history; stat reset writes defaults only. Manual name collision rejects import. Draft import needs no ownership proof; public activation requires well-known challenge, in-document challenge, or verified credential [→U25]. Webhooks are not import machinery: external systems authenticate as users and use run/step-complete [→U24].
+
+### D22 Metrics
+Incremental mean `mean_{n+1} = mean_n + (x−mean_n)/(n+1)`. `latency_estimate`: mean over completed calls, denominator `uses`, sample = own transaction elapsed. `rating_estimate`: mean over rated calls, denominator `rating_count`. `uses = successes + failures`; missing stats have defined defaults; no cost estimate (the advertised price is the cost). Buyer-experienced latency = `max(descendant.ended_at) − root.started_at`, a subtree query — wall time including step dormancy, always current, never cached or retroactively written; ranking must treat it as wall time, not compute [→U15].
+
+## 8. Test catalog
+
+The catalog is carried below **in full** as this specification's conformance suite: every line is individually binding. The mapping assigns each block to the entries it verifies; redundancy between a conformance line and a normative rule is deliberate — the line freezes the rule's observable form.
+
+- **Method (D)**: three tiers — unit (`go test ./...`, offline, fakes for Ollama/script/fed, temp SQLite, no global state or ordering), flows (real libp2p on loopback, one kernel as bootstrap+relay), real-NAT release gate for federation-touching changes (excluded from `go test`). Fakes behind every interface seam.
+- **User-flow tests (acceptance — keep with the stories)**: local execution → U1, U3, U11, U16, U17, U13, U4; async/steps + restart → U22–U24, U23, G4; OpenAPI → U25, U26; delegated OAuth + bearer → U27, U28; ratings/reconciliation → U14, U15; federation loopback suite → U29, U31, U8, U34 (key-only reach), U39–U40, U37, U35, U41; NAT gate → U34.
+- **Unit/required tests (mechanism-freezing — move beside their entries)**: accounts/auth/recovery block → D9; action lifecycle + visibility block → D4, D5; run/settlement/wallet block → D2; steps block → D6; WASM block → D7; capability block → D8; lookup block → D17; native-action blocks → D17; delegated-auth block → D10; OpenAPI block → D21; ledger ops block → D4; ratings/receipts block → D11, P5; naming/petname block → D15; federation call/settlement blocks → P4, P7, D13, D14, D19; gossip/evidence blocks → P9, D16; steps-over-wire block → P8; settle block → P10; transfer block → D18; transport/domain blocks → P1, D12; CLI/HTTP conventions block → D20.
+- **Direct invariant tests**: balance non-negativity, settlement identity, wallet-transition closure, immutability, role law, reconstructibility, park/refund rules → G1–G6 (mechanically asserted via D2/D3/D6).
+
+### Conformance suite
+
+The suite below descends from the source contract and is amended with it; its internal `§N` references retain the source numbering mapped in the coverage table in §14.
 
 Required suites:
 
 ```text
-user creation
+user creation; a taken handle and a duplicate owner/name give ErrInvalidInput with no SQL text, while kernel-minted unique keys and CHECK/FK violations stay ErrInternal; replay is unchanged
 authentication token validation
-user update email; change reflected in GET /v1/me
+user update description; change reflected in GET /v1/me
 user update password with correct current_password; old password rejected after change
 user update password with wrong current_password returns ErrUnauthenticated
-user update with neither email nor password returns ErrInvalidInput
+user update with neither description nor password returns ErrInvalidInput
 key-only account (no password) UpdateUser returns ErrInvalidState
 password below the minimum length rejected at user creation, first boot, and password update
+seed-phrase recovery: an enrolled recovery key signs a server nonce to reset a lost password; old password rejected, new works; the nonce is single-use (replay rejected); a wrong-key signature is rejected; StartRecovery without an enrolled key returns ErrInvalidState
+CLI recovery key derivation is deterministic and its signed challenge verifies against the enrolled key under the kernel's payload
 action create/update/delete
 action activation/deactivation
-public/private access control
+public/local/private access control (private: owner only; local: any local caller, peer denied; public: anyone)
+caller-scoped CanCall: a provider's public composite reaches its own private helper in a customer's process; foreign code a process owner funds cannot reach that owner's private actions (no confused deputy)
 run creates, funds, and closes processes
 successful paid call
-failed call refunds remaining allocation to caller's trace
+failed call refunds remaining allocation to caller's trace and records that amount in the transaction's refund (the whole gross when nothing settled beneath it)
 run with insufficient user balance rejected
 subcall exceeding parent trace available fails with ErrInsufficientFunds
 input schema rejection
@@ -894,14 +352,18 @@ script timeout
 script memory limit
 lookup ranking with fake embeddings
 lookup ranks by fused relevance only while stats-based quality weighting is UNDER REVISION (temporarily removed): two identical-relevance actions score equally regardless of success history
-lookup results include action (@owner/name), input_schema, and output_schema
+an http action's read carries the decomposed http object and not the encoded source string it is stored as — decided by kind, so a source too malformed to decompose serves neither — while a wasm action's read still carries its source
+lookup results include action (owner/name), input_schema, and output_schema
+lookup returns an all-in price for every result: action.price locally, a discovered hit's serving_price marked up by current import_bps, repricing with no re-pull; a manifest with a negative price or out-of-range remote_bps is skipped at ingest and refused at import
+a pinned run succeeds unchanged and is refused — balance, locked, and process count unmoved — when price, effect, description, either schema, or the stable id moved, including when the new schema rejects the args: ErrTermsChanged against an action still active, ErrInvalidState while a terms-changing update holds it deactivated (D4), since liveness is checked before the pin; a re-implementation at unchanged terms moves nothing and keeps the pin valid; a private action refuses on visibility, never disclosing its quote
+a discovered hit's quote_hash equals that of the proxy it resolves to
 lookup degrades to lexical (BM25) ranking with no embedder configured; a keyword query still finds actions
 lookup skips an embedding vector whose dimension differs from the query's (no panic, no cross-space score)
 lookup applies CanCall before truncating, so uncallable matches do not starve callable results
 lookup query is sanitized: FTS5 operators/quotes in the query are treated as literal terms, not syntax
 stats update
 CLI commands
-CLI primary identifiers are positional natural keys (user=@handle, action=@owner/name)
+CLI primary identifiers are positional natural keys (user=handle, action=owner/name)
 CLI human-readable output exposes the same fields as the corresponding HTTP response
 logging smoke test
 superuser first-boot prompt and config storage
@@ -909,29 +371,33 @@ suspended user rejected at authentication
 direct buyer can rate transaction
 non-buyer cannot rate transaction
 native action callable through Call()
-@sys/random returns value in [0, 1)
-wasm script can call @sys/random to obtain a random value
-@sys/web returns status, body, and content_type for a public URL (fake fetcher)
-@sys/web with missing or empty url returns ErrInvalidInput
-@sys/web with unconfigured fetcher returns ErrInvalidState
-@sys/web rejects loopback/private/link-local URLs unless allow_local_sources
-@sys/tinygo/compile returns base64 artifact and hash for valid source; status=failure with diagnostics on compile or import-validation error; empty source returns ErrInvalidInput
+every native is registered local, so a fresh kernel gossips no action manifests while still advertising sys as a first-party user, and no peer can call one
+sys/random returns value in [0, 1)
+wasm script can call sys/random to obtain a random value
+sys/web returns status, body, and content_type for a public URL (fake fetcher)
+sys/web with missing or empty url returns ErrInvalidInput
+sys/web with unconfigured fetcher returns ErrInvalidState
+sys/web rejects private/link-local/reserved URLs unless allow_local_sources; loopback permitted by default
+loopback action source (127.0.0.1/::1/localhost) permitted by default; private/link-local still rejected without allow_local_sources; a loopback source redirecting to a private/link-local address is still blocked
+genuine-loopback client (no X-Forwarded-For) is exempt from the auth/account rate limiter; a loopback peer with X-Forwarded-For is limited by the forwarded client
+sys/tinygo/compile returns base64 artifact and hash for valid source; status=failure with diagnostics on compile or import-validation error; empty source returns ErrInvalidInput
 action create --artifact registers a wasm action from a pre-compiled base64 artifact
-@sys/llm/embed returns embedding array for valid text
-@sys/llm/embed with empty text returns ErrInvalidInput
-@sys/llm/embed with unconfigured embedder returns ErrInvalidState
-@sys/llm/json returns value matching output_schema for valid input
-@sys/llm/json with unsupported output_schema returns ErrSchemaViolation
-@sys/llm/json with unconfigured structured output returns ErrInvalidState
-@sys/llm/json rejects model output that fails schema validation
-@sys/llm/decide returns selected action and validated args
-@sys/llm/decide fetches action contract from DB by @owner/name
-@sys/llm/decide rejects unknown action reference with ErrNotFound
-@sys/llm/decide rejects returned args that fail action input_schema
-@sys/llm/decide with unconfigured tool calling returns ErrInvalidState
-@sys/llm/decide with no valid selection returns ErrExecutionFailed
+sys/llm/embed returns embedding array for valid text
+sys/llm/embed with empty text returns ErrInvalidInput
+sys/llm/embed with unconfigured embedder returns ErrInvalidState
+sys/llm/json returns value matching output_schema for valid input
+sys/llm/json with unsupported output_schema returns ErrSchemaViolation
+sys/llm/json with unconfigured structured output returns ErrInvalidState
+sys/llm/json rejects model output that fails schema validation
+sys/llm/decide returns selected action and validated args
+sys/llm/decide fetches action contract from DB by owner/name
+sys/llm/decide rejects unknown action reference with ErrNotFound
+sys/llm/decide rejects returned args that fail action input_schema
+sys/llm/decide with unconfigured tool calling returns ErrInvalidState
+sys/llm/decide with no valid selection returns ErrExecutionFailed
 non-superuser rejected from admin CLI commands
 active public action callable by any caller
+active local action callable by any local caller but not by a peer (inbound federation call denied with a signed zero-charge rejection)
 active private action callable only by owner
 inactive action not callable
 suspended owner's active public action is excluded from GET /v1/actions and uncallable (ErrInvalidState); unsuspend restores both
@@ -942,7 +408,7 @@ subcall transaction has owner_user_id = parent process owner
 subcall transaction has caller_user_id = parent action owner
 subcall transaction has target_user_id = target action owner
 subcall authorizes process use by caller_user_id
-subcall authorizes action access by process owner
+subcall authorizes action access by the immediate caller (the parent action owner), not the process owner
 subcall spends from parent trace within same process
 failed subcall refunds parent trace
 successful subcall remains settled if parent later fails
@@ -956,7 +422,8 @@ step complete with wrong caller returns ErrUnauthorized
 step complete against running or done step returns ErrInvalidState
 step complete resets to waiting when Call rejects before creating a transaction
 step complete with deactivated action resets step to waiting
-step complete with private action (CanCall lost) resets step to waiting
+step creation binds visibility against the creator (trace action owner), not the required caller: a private/local action can be parked for a caller who could not call it directly; a creator that cannot call the action is rejected
+step completion ignores visibility: an action narrowed to private after parking still completes (never bricked); only a liveness failure (deactivation/suspension) resets to waiting
 step complete disallowed-key (derived-schema) violation rejects, leaves step waiting, no action failure recorded
 step tx_id recorded atomically with status=done
 step-completion trace has parent_trace_id equal to step.parent_trace_id
@@ -974,22 +441,35 @@ wasm juice.step_create returns step_id bound to current process and trace
 wasm juice.step_complete executes the step's action and returns result, tx_id, trace_id
 capability (§9): an http action subcalls via POST /v1/call; the subcall obeys the role law (caller = the http action's owner) and spends from its trace, matching a WASM juice.call subcall exactly (parity)
 capability step_create sets parent_trace_id to the action's trace and parks from it; step_complete succeeds iff required_caller = action owner
+a capability is refused on the --peer completion path, dispatching nothing: that request signs as the whole kernel, and a capability carries no session caller, so the empty-caller form would cross federation as the operator
+in-execution completion is trace-confined: a capability and a WASM host are each refused (ErrUnauthorized) on a step another process's trace parked, even when addressed to that same owner; the step stays waiting, no balance moves, and the JWT and peer paths are unaffected
 capability is a signed trace_id valid only while the trace is unsettled; a tampered token and a token presented after settlement are both rejected; it never appears in args_json, reply_json, receipts, receipt hashes, or logs
 a capability presented to POST /v1/run is rejected (no wallet path); concurrent capability callbacks cannot exceed the subtree bound and the process locked releases exactly price
 capability + callback headers are injected on http dispatch and stripped across a host-changing redirect; absent callback URL sends none (leaf); an in-flight capability trace recovers as interrupted
 webhook caller authenticates as registered user and calls POST /v1/run directly
 webhook caller completes a pre-created step via POST /v1/steps/{id}/complete
-startup reads config.superuser_handle to confirm first boot and identify @sys
+startup reads config.superuser_handle to confirm first boot and identify sys
 second rating on same transaction rejected with ErrInvalidInput
 rating record created in ratings table, transaction row unchanged
+action ratings projection is {value, note, created_at} only; public readable anonymously, private only by owner, deactivated still readable
 rating note is included in the single platform-key Ed25519 rating signature payload
 ratings do not cascade
 Ed25519 signing keypair present after first boot
 zero-credit process satisfies fund locking for zero-price actions
 Kernel.Deposit rejected with ErrUnauthorized for non-superuser caller
 withdraw debits available with withdrawal record; rejected for non-superuser
+deposit/withdraw/transfer all record one ledger entry: deposit from-null→to-user, withdraw from-user→to-null, transfer from-sender→to-recipient
+transfer debits caller available and credits recipient in one commit; ledger entry recorded; both balances reconcile
+transfer with amount exceeding caller available rejected with ErrInsufficientFunds; balances unchanged
+transfer to self rejected with ErrInvalidInput
+transfer to a peer/kernel account (public_key set) rejected with ErrInvalidInput
+transfer by a suspended caller and to a suspended recipient both rejected
+transfer is idempotent over external_key: a replay returns the existing entry and moves no funds twice
+user ledger lists the caller's deposits, withdrawals, and transfers (from or to), most recent first, with from_handle/to_handle
+transfer resolves the recipient by key (global name) as well as by handle
 receipt created atomically with successful transaction commit
 receipt created atomically with failed transaction commit
+a transaction's and its receipt's reason is the failure code — never an upstream URL, body, or SQL — and a peer's reason is never adopted locally
 action owner reads transactions for calls to their action
 non-party denied access to a transaction
 upstream auth secret never appears in args, replies, logs, receipts, or read paths
@@ -1010,14 +490,13 @@ call on a delegated_bearer action with no grant rejects before locking funds wit
 delegated_bearer token supplied via POST /v1/grants; stored sealed; never in read paths; /v1/me lists it token-free; disconnect and deactivating update revoke it
 delegated_bearer action is excluded from manifests and gossip
 connection provider_key derived from the pinned base-URL host (bearer) and token_url|client_id + source registrable domain (oauth), never from action names; a colliding token_url|client_id with a different source domain does not ride an existing connection, and the consent plan surfaces the destination host
-grant selector matches by path segment (@tom/brief matches brief and brief/x, never briefing; trailing /* stripped; a full @owner/name is the degenerate one-action selector)
+grant selector matches by path segment (tom/brief matches brief and brief/x, never briefing; trailing /* stripped; a full owner/name is the degenerate one-action selector)
 consent plan groups the caller's delegated actions by provider_key, filters by CanCall, and marks connected/covered per group
 connecting an action whose provider connection already covers the scope union grants instantly with no browser round-trip
 one consent covers a multi-action provider group with the union of its scopes; a second action reuses the one connection
 re-consent for a wider group widens the stored scope union so earlier grants keep coverage
 disconnect by selector revokes only the matching grants; disconnect by account deletes the connection and cascades its grants
 a connection with zero grants is listed unused in /v1/me and is never auto-expired
-startup backfill re-homes each legacy grant token onto its derived connection (idempotent; latest created_at wins on collision; reseals under new AAD; an unrecoverable or non-delegated token deletes its grant; a nil credentials key leaves legacy rows untouched)
 OpenAPI import/unimport flow for API-owned actions
 OpenAPI import compiles parameters and JSON body into one input schema
 OpenAPI activation rejects incomplete schemas or missing descriptions
@@ -1027,28 +506,67 @@ OpenAPI import preserves Action.id, deactivates on contract change, and resets c
 remote import/unimport flow for signed manifests
 remote import preserves Action.id, deactivates on manifest contract change, and does not overwrite local Stats
 remote import initializes local Stats to defaults
-remote import names actions owner-qualified (addressed @peer/owner/name); two owners on a peer with the same action name do not collide
-admin deposit/withdraw/unfriend resolve a peer by key (global name) as well as by @handle
-fresh boot with no configured handle derives a distinct @k-<key> kernel handle, never @sys
+remote import names actions owner-qualified (addressed owner@peer/name); two owners on a peer with the same action name do not collide
+petname lifecycle (§13): discovery creates a Kernel row but no account and no petname; a verified outbound resolve creates both; binding seeds from the cached nickname, falls back to k-<key8>, suffixes -2 on collision, and is exact (rejecting, not suffixing) on an explicit rename; a nickname change never retargets a bound petname; a key- or id-shaped petname is rejected; inbound call and deposit by key provision without binding
+handle and petname may hold one string at once, each resolving only in its namespace; a bare name matching both is refused on the mixed commands; renaming a kernel account by id is rejected; an unbound kernel account renders as its key; admin users lists local accounts only
+concurrent first use of one key converges on one petname and one account; distinct keys racing for one nickname get distinct petnames; suspend-by-key provisions and freezes atomically; a suspended kernel account survives retention; a kernel account holds no handle, password, or recovery key (DB CHECK); deleting a Kernel row while an account references it is rejected
+the schema preserves every account id and transaction party, holds no reference to `users`, and keeps foreign_key_check empty
+a schema change that drops records may not strand funds: the migration retiring the cross-kernel value legs aborts while an unresolved payment reserve or an unsettled cross-kernel value lock exists — identified by shape (fees in the reserve, no local beneficiary, or a peer-funded lock), never by amount, since zero fees make a cross-kernel lock numerically identical to a local one — and applies once only local locks remain
+kernel about: sys's description surfaces as gossip `about` and in admin identity; admin inspect renders action descriptions carried in gossip/manifests
+admin deposit/withdraw/suspend resolve a peer by key (global name) as well as by handle
+a boot with no configured kernel name fails before writing anything: no superuser is created, and the next boot demands the name again rather than deriving one
 remote manifest signature is Ed25519 over canonical JSON excluding signature
-remote proxy transaction has target_user_id = proxy user id
-friend auto-accept creates zero-balance proxy pair; manual mode holds pending
-zero-balance friend's inbound call gets signed rejection receipt
-inbound call to a known-but-non-executable action (inactive, non-public, suspended owner) gets a signed zero-charge rejection receipt the caller settles on immediately
-unfriend sets denied_at, deactivates proxies, cancels steps addressed to peer; balance survives
-denied key's friend request rejected; own friend clears denial
-gossip lists only transacted friends with stats, keyed by public key with no URLs; non-transacted friends absent
-friending a peer does not import that peer's own imports (no transitive re-export); manifests and gossip exclude remote_proxy actions
-offline peer: inspect degrades to local data + unreachable, friend fails as unreachable, unfriend/peers/identity work locally
-gossip results stored per (kernel, introducer); StatTag namespaced by source
-proxy call locks mp+maxduty; success settles charge+duty on actual charge and refunds difference
-remote failure with charge refunds (mp+maxduty)−charge; duty is zero; settled remote work stays paid
+remote proxy transaction has target_user_id = kernel account id
+a peer's first signed call or a deposit by key provisions a zero-balance billing account
+a call whose proxy is absent or inactive re-resolves and reactivates the row in place, id preserved
+a federated call dispatches the peer's stable action id on first dispatch and on retry, so a stale cached reference or a renamed remote owner never parks the caller; an inbound call naming a cached remote_proxy id is refused
+changing import_bps reprices imported actions with no re-resolve, while an already-dispatched call settles at the rate frozen on its dispatch record; rows and steps predating the snapshot heal on next funded use
+a federated call binds recipient and expected_contract_hash; a contract-hash mismatch is refused pre-admission with a signed refresh_proxy rejection that deactivates the proxy (conditional on the dispatched hash), and the next call re-resolves and succeeds
+a refresh_proxy rejection carrying a success/charged receipt is malformed and quarantines; a funding (402) rejection carries no refresh_proxy and leaves the proxy active, as does an executed failure at any charge, while every other signed rejection deactivates it — so a retired remote action leaves lookup after one refusal
+manual enable/disable, update, and delete on a remote_proxy action are all rejected with ErrInvalidState; the row stays active+local (a hand-set public proxy would pass a peer's CanCall)
+a proxy is addressable only kernel-qualified (owner@kernel/name) or by raw action id; the legacy bare mount form (mount/owner/name) does not resolve
+a directory-only discovered kernel (never a peer) is evicted with its discovery docs and evidence once stale past peer_retention_days; a fresh one and a peer-backed one survive
+a sigil-prefixed handle is rejected at every boundary (user create, action ref, grant selector, step required-caller, manifest owner_handle), never stripped; owner@kernel/name and raw ids are unaffected
+a signature-valid inbound call from an unknown key is lazily provisioned a zero-balance account; a price-0 call then succeeds, a priced one gets an insufficient-funds rejection
+inbound call to a known-but-non-executable action (inactive, local/private so a peer fails CanCall, suspended owner) gets a signed zero-charge rejection receipt the caller settles on immediately
+suspend freezes a peer's inbound calls (signed rejection receipt) and is reversible with unsuspend; there is no denied_at
+gossip serves identity, first-party users (sys + public-action owners), own signed manifests, and one evidence page per pull with the catalog snapshot on every reply; evidence is never relayed (learned evidence is not re-gossiped); gossip carries no membership (no `known_kernels`), keyed by public key with no URLs
+a verified gossip pull advances last_seen for any known kernel, counterparty or not, while a request that provably never left advances last_contact_failed_at; an outcome proving neither — a stream broken after dispatch — moves nothing, and the call, resolve, step and gossip paths classify one network outcome identically; neither timestamp ever moves backwards or is cleared, a peer that answered badly (bad key, bad payload) is not recorded as unreachable, and a suspended peer keeps being dated
+a gossip pull is verified only when authenticated as the dialed key (reply `public_key` matches) with a valid bare handle; a key-mismatch or invalid-handle reply is skipped, never accumulated
+discovery is libp2p routing discovery: a DHT-client kernel connected only to a bootstrap server advertises the namespace, a second DHT-client kernel with no prior connection to it enumerates the namespace through that server, receives it with at least one address, and opens a gossip stream to it by public key (the loopback test forces DHT client/server modes, since AllowPrivateAddrs otherwise makes every node a server)
+discovery creates no account and binds no petname: enumerating and pulling a kernel writes Kernel/DiscoveryDoc only, never an account or balance
+admin peers merges counterparties and discovered kernels by public key, excludes this kernel, shows an account only for counterparties, dedups a kernel present in both sources into one row, and --all adds suspended counterparties
+resolving a peer's action does not import that peer's own imports (no transitive re-export); manifests and gossip exclude remote_proxy actions
+resolve-imported proxies get visibility=local; manifests and gossip serve only visibility=public actions (a local own action is excluded from both)
+the visibility column rejects any value outside {private, local, public}
+offline peer: inspect degrades to local data + unreachable, a cold call fails fast (ErrPeerUnreachable naming the peer under Meta[peer], as resolve and settlement also do), peers/identity work locally; the failed dial advances last_contact_failed_at, so lookup and the roster show the peer last-failing while it stays listed, and inspect advances neither timestamp
+a validly-signed gossip manifest is indexed as a discovery doc and a badly-signed one is skipped; sys/lookup surfaces a discovered-but-unresolved remote action as owner@key/name to a local caller, as owner@petname/name once named, with observed_at on remote-backed hits only; sys/user-lookup returns the stable principal_id plus a display reference
+evidence: a receipt hashes identically on both sides of the remote-receipt join (canonical JSON, not raw wire bytes); a remote rating counts only when the serving side names the rater's kernel as counterparty and the hashes join, else it is unverified; a late rating attaches (not equivocation) and two different ratings under one (issuer, receipt_hash) equivocate; the per-peer evidence cursor persists across passes; a signature verifies only under its own domain on the wire; the gossiped rating is a signed projection carrying no rater or transaction identity
+a delegated-auth action's execution produces no gossip evidence, while an ordinary public action's does
+outbound leg-(b) evidence covers every receipt-settled admitted execution (success or failure, rated or not, price 0 included); a never-dispatched (ErrPeerUnreachable) settlement, a signed zero-charge rejection (remote tx_id == the call's idempotency_key), and a quarantined receipt each produce no gossip evidence; an attached rating stays optional
+admin inspect derives two evidence views about a subject kernel — an execution summary from issuer=subject rows and per-issuer counterparty experience from the rest, never folded together; local Stats are unaffected by evidence; PurgePeerCascade removes the peer's discovery docs and evidence
+proxy call locks q = sr+ceil(sr·import_bps); success settles charge+premium to the peer row and ceil((charge+premium)·import_bps) to origin sys, refunding the difference
+remote failure with charge refunds q−(charge+premium); settled remote work stays paid
 failure counts against proxy stats regardless of charge
-duty credited to @sys; charge credited to proxy user
+serving markup (premium) credited to the serving kernel's sys; charge+premium credited to the kernel account (the bilateral payable); origin retains its import fee to origin sys; caller kernel earns only that local fee, never the premium
+local caller pays no remote premium; a local call to a local action is unaffected
+inbound paid call admitted iff global gross receivables G=Σmax(0,−available) stays ≤ X after reserving the worst-case obligation; default X=1000; X=0 ⇒ prepaid-only; two peer identities cannot jointly exceed one X (Sybil-proof)
+exposure admission is atomic under concurrency: parallel inbound calls cannot together breach X
+serving-markup reserve is snapshotted on the root trace and released at settlement from that snapshot (not the in-memory request), so crash recovery and forced closure never leak it in owner.locked
+probabilistic residual settlement: a pay outcome moves no balance and leaves the debt on the row (G unchanged, no lottery outcome can cause G>X); a clear outcome extinguishes the debt immediately; E[payment]=d
+a paid outcome is pending_cash until admin settle --cash records the rail move (deriving each kernel's side): clears d, books ±(Q−d) on sys, records external cash Q; the debtor leg rolls back if sys reserve < Q−d (no partial writes); replay is a no-op; a pending pay blocks the debtor's further credit-drawing calls
+cash finalization is the only non-conservative settlement move (Δrow+Δsys=Q=cash); clear/pay records are conservative (Δrow+Δsys=0); E[variance]=0
+settlement outcome is deterministic in (settlement_id, s, n, Q, d) and idempotent by settlement_id: a replayed finish (even a ground nonce) returns the first record, never a second signature
+creditor non-reveal past expiry lets the debtor clear the debt for zero with the signed open record; the expired-open reconcile makes the creditor apply the same clear-for-zero (idempotent); both ledgers end identical
+settle payload domains (settle_open, settle_finish, settle_reconcile) are disjoint from each other and from step_auth
+sys/transfer is an ordinary priced action (effect="transfer") with a deferred receipt-backed transfer effect; execution price funds from the trace (taxed), the delivered value funds from the immediate caller C's own balance (untaxed) — two channels, different wallets, never mixed
+a delivered value writes one ledger entry in the settling commit — C→beneficiary, amount = value, reason = the transaction id, read by both parties through their own ledger — while a failed transfer writes none; deliveries predating the journal backfill from their receipts, skipping any whose parties are not local accounts
+the value effect is staged from C.available atomic with funding and committed by the kernel at settlement, not by the handler; value-bearing is decided by the action's contract effect field, never its name; a composed subcall pays the value from the composing action's owner, and a failure refunds it whole
+value is local to one kernel: a peer caller, a kernel-qualified target, and a peer or suspended beneficiary are each rejected before funds move; no manifest carries an effect, so no proxy is value-bearing; a remote receipt claiming value is quarantined, never settled
 timeout does not settle; retry with same idempotency key recovers receipt
 restart with a dispatched proxy call resumes retry; receipt obtained after restart settles it; no interrupted refund
-running server's retry loop settles a pending remote call when the peer returns, without a restart; max-age expiry fires from the running server too
-process awaiting a remote receipt is reported with awaiting_receipt and its age; a waiting step addressed to a peer is flagged waiting_on_peer
+running server's retry loop settles a pending remote call when the peer returns, without a restart; max-age expiry fires from the running server too; work pending at transport start is drained once, not after a full interval
+a parked run returns ErrTimeout carrying process_id, pending_since, and refund_eligible_at (pending_since + max pending age; eligibility, not settlement); process awaiting a remote receipt is reported with awaiting_receipt and its age; a waiting step addressed to a peer is flagged waiting_on_peer
 inbound federation call rejected when args_hash does not match request body
 full remote receipt JSON stored atomically with transaction on remote-proxy call
 receipt verification returns valid for a well-formed stored remote receipt
@@ -1058,20 +576,38 @@ receipt verification returns ErrInvalidState for a non-remote-proxy transaction
 network identity derives deterministically from the platform Ed25519 signing key
 transport and Juice payload signature domains are disjoint (a signature valid in one is rejected in the other)
 fed transport is behind an interface with a fake implementation; all kernel federation logic is testable without libp2p
-friend by key over the fake transport creates the zero-balance proxy pair (auto-accept and manual)
+a cold resolve by key over the fake transport imports one action and creates a zero-balance proxy account
 outbound call whose first dispatch provably never connects settles immediately as ErrPeerUnreachable with a full refund; a dispatch that may have reached the peer never fail-fasts — allocation stays locked, process stays open, retry resumes on reconnect; the retry loop never settles a parked trace on a connection failure
-signed zero-charge 402 rejection settles as ErrPeerUnfunded with the peer handle in meta, never as the caller's own insufficient_funds
-gossip response carries counterparty_balance only for an authenticated friended non-denied peer; absent for strangers, denied keys, and anonymous pulls
-successful friend gossip pull persists peer_last_seen and peer_credit; friend sync runs with empty bootstrap_peers; admin peers surfaces both
-action listings annotate remote proxies with peer_state offline/unfunded from the sync cache; the annotation never gates a call
+signed zero-charge 402 rejection settles as ErrPeerUnfunded with the peer handle in meta, never as the caller's own insufficient_funds; any other signed rejection settles as ErrUnauthorized with that meta, a refresh_proxy rejection settles as an ordinary failure carrying Meta[retry]=refresh, never ErrTermsChanged, and the pinned re-run then executes when only the implementation moved, and an executed failure stays ErrExecutionFailed even at charge 0 on transport 402 — the marker (tx_id == the dispatched idempotency_key), not charge or status, decides
+gossip response carries counterparty_balance only for an authenticated known non-suspended peer; absent for strangers, suspended keys, and anonymous pulls
+successful peer gossip pull persists peer_last_seen and peer_credit; peer sync runs with empty bootstrap_peers; admin peers surfaces both
+peer step list returns only steps whose required caller is the requesting peer; another peer sees none; an unknown key gets an empty list and is NOT provisioned an account
+peer step complete resumes the step as the peer's account (role law: caller_user_id = kernel account), settles on the serving kernel, and is idempotent over (idempotency_key, counterparty): a replay returns the stored result and re-executes nothing
+peer step complete rejects a bad signature, a stale timestamp, an input body that does not match input_hash, a non-required-caller peer, an unknown key, and a suspended peer
+step-payload signature domains are disjoint: a call, step-list, and step-complete signature each verify only in their own domain
+a step payload signed for another kernel's recipient does not verify here (cross-kernel replay)
+the peer step list is scoped in the query: 60 steps in processes the peer owns do not crowd out the one step addressed to it, and results are oldest first
+a store failure on the peer step list propagates rather than reading as an empty list
+the outbound completion normalizes its input to the bytes the transport sends, so a pretty-printed body's input_hash still verifies at the peer
+the outbound completion's idempotency key is derived: a retry reuses it (returning the stored result), while different input or a different step derives a different key
+a mid-stream outbound failure is ErrTimeout (may have executed), not ErrPeerUnreachable; only a never-dispatched request is unreachable
+a parked remote dispatch completes its inbound idempotency record when the retry loop settles it, and likewise when a forced process closure settles it; a peer replaying the same key then gets the outcome instead of a duplicate-in-flight answer
+a remote settlement that FAILED stores an error body, so a replay returns the failure status rather than 200 with a null result
+a park-invariant violation from BeginStepCall is NOT reported as a lost claim (only the two genuine claim races carry that marker)
+a settled failure returns its committed transaction to the caller even when post-settlement bookkeeping fails (the caller was charged); a WASM timeout completion is reported as settled, not as a parked dispatch
+a crashed federated call to a LOCAL action completes its inbound idempotency record on recovery, not only a remote-proxy one
+a settled-failure replay carries the receipt and the settled transaction ids, and a success whose result contains an "error" field still replays as success (the receipt decides, not the body)
+the peer step list carries partial_args and allowed_input and withholds owner_handle, created_by, the target action ref, and every local trace/action id (§5 boundary)
+a replayed idempotency record returns the status its stored outcome implies: a settled failure never replays as 200, and the duplicate-in-flight reply carries an error code
+CompleteStep reports its outcome: a claim failure carries ErrStepNotClaimed while still presenting code invalid_state and HTTP 409; a rejection before anything settles does not; a failure after a committed transaction returns that transaction alongside the error
 ```
 
 Direct invariant tests:
 
 ```text
-balances are never negative
+ordinary-account balances are never negative (DB CHECK `kernel_public_key IS NOT NULL OR available >= 0`); a peer account may go negative, bounded not per-peer but by the kernel-global exposure cap `X` enforced at admission (§13); `locked` is never negative
 successful settlement satisfies taxable = net + fee, with taxable = trace.available at settlement
-wallet totals (user, process, trace) change only by run, call entry, settlement, refund, step park/unpark, deposit, withdrawal, closure
+wallet totals (user, process, trace) change only by run, call entry, settlement, refund, step park/unpark, deposit, withdrawal, transfer, closure
 closed processes cannot call actions
 inactive actions are not callable
 every call creates exactly one transaction
@@ -1106,12 +642,16 @@ Required user-flow tests (against the compiled kernel surface — CLI and HTTP o
 
 ```text
 — Local execution —
-user signs up, deposits arrive (admin), runs a public action by @owner/name, gets result;
-  process auto-created, auto-closed, exact price debited, provider's net and @sys fee observable in tx list
+user signs up, deposits arrive (admin), runs a public action by owner/name, gets result;
+  process auto-created, auto-closed, exact price debited, provider's net and sys fee observable in tx list
 provider creates a WASM action that subcalls two cheaper actions, activates it, a caller runs it;
   caller pays one advertised price, subproviders paid from the provider's budget, provider keeps margin
 caller runs an action that fails mid-tree; settled subcall stays paid, remainder refunded,
-  process closes, transactions show success and failure with reasons
+  process closes, transactions show success and failure with reasons that name the class and carry
+  no upstream host or body, locally and across a federated proxy
+two users sign up and one is funded; the funded user transfers credits to the other by handle;
+  balances move by exactly the amount, both see the entry in `user ledger`, and a transfer
+  exceeding the sender's balance is rejected with insufficient funds
 
 — Async / steps —
 action parks an approval step addressed to a human and returns; process stays open with price parked;
@@ -1119,6 +659,7 @@ action parks an approval step addressed to a human and returns; process stays op
 external system (webhook) registers as a user, a purchase flow pre-creates a step addressed to it,
   the system POSTs the payload to /v1/steps/{id}/complete; transaction obeys role law
 owner force-ends a process with waiting steps; steps cancelled, parked prices refunded, balances reconcile
+
 kernel restarts mid-flight: interrupted calls fail as interrupted with refunds; waiting steps survive
   and remain completable after restart
 
@@ -1137,7 +678,7 @@ an owner exposes two oauth_delegated actions under one directory sharing one pro
   seeing the bearer; `user me` shows one connection covering two actions (no token); refresh-token
   rotation on one action's call leaves the other working; provider invalid_grant deletes the connection
   so both next runs re-reject
-a user attaches one per-user API key to a delegated_bearer directory via `user connect @owner/path
+a user attaches one per-user API key to a delegated_bearer directory via `user connect owner/path
   --token`, running two actions that share it; the fake upstream sees the token in the configured header
   on both; `user me` shows one connection with two actions and no token; `user disconnect --account`
   revokes the connection so both next runs reject pre-lock with grant_required, the failure suggesting
@@ -1151,41 +692,100 @@ caller rates a transaction with a note; the note and rating value appear in tran
 
 — Federation (real transport over loopback; one kernel is the bootstrap+relay) —
 two kernels start on 127.0.0.1; the first serves as bootstrap+relay, the second dials it, and they
-  friend each other by key alone (no URL); keys resolve through the DHT — no dialable address is configured
-two kernels friend each other (auto-accept); operator A deposits B's proxy (and vice versa);
-  B imports A's action; B's user runs it; charge lands in A's proxy balance on B, duty to B's @sys,
+  reach each other by key alone (no URL); keys resolve through the DHT — no dialable address is configured
+B's operator deposits A's proxy by key (provisioning + funding it); A runs B's action by key (cold
+  resolve caches the proxy); charge+premium lands in A's proxy balance on B, premium to B's sys,
   difference refunded; both sides' tx verify passes all checks
 call settles over a forced-relay path: the two kernels are denied a direct dial, the call and its
   signed receipt travel through the relay, and settlement is byte-identical to the direct case
-B imports a large catalog from A: manifest sync is chunked per action and completes over a
-  bandwidth-capped stream
-kernel gossips a transacted peer; third kernel reads the gossip over the transport, sees earned stats,
-  friends the subject directly by key, imports, runs — its own Stats start at defaults and accumulate
-A unfriends B: B's proxies deactivate, B's next inbound call gets a signed rejection receipt,
-  steps addressed to B cancelled with refunds, balance intact; A re-friends and traffic resumes
-inbound call from an underfunded friend yields a signed rejection receipt the caller settles on
+B changes a served action's contract; A's next call gets a signed refresh_proxy rejection, the proxy
+  re-resolves to the new contract, and the following call succeeds with the row id preserved
+a kernel calls a remote action (unrated), so it gossips receipt-backed trade evidence about that subject; a
+  third kernel, connected only to the shared bootstrap server, enumerates routing discovery, finds both the
+  caller and the subject, pulls gossip directly from each, sees the caller's evidence about the subject under
+  the caller as issuer (creating no account for either), discovers the subject's action via its discovery
+  cache (sys/lookup), resolves it directly by key, runs — its own Stats start at defaults and accumulate
+a caller resolves and runs a discovered remote action, then continues past the charge: the action is
+  still found by sys/lookup (the proxy is indexed, not merely cached), its rendered reference is
+  owner@kernel/name with a non-empty owner_handle, re-running it by that reference needs no second
+  resolve, and the petname bound itself on first use — including when the peer already held an account
+B suspends A: A's next inbound call to B gets a signed rejection receipt; unsuspend restores it
+inbound call from an underfunded peer yields a signed rejection receipt the caller settles on
 caller runs a NAT-bound peer's action, the peer goes offline mid-call; the caller's allocation stays
   locked and the process stays open until the peer returns and a signed receipt settles it (no timeout settle)
+A parks a step addressed to B (via sys/message to B's key); B sees it in `admin inspect`, with its
+  derived allowed_input, and completes it with `step complete <id> --peer`; the step settles on A, a second
+  completion is refused, and a suspended B is refused until unsuspended
 
 — Federation (real-network release gate; excluded from `go test ./...`) —
-from a machine behind a real NAT, friend a remote peer by key, call it both directions with the path
+from a machine behind a real NAT, resolve a remote peer's action by key, call it both directions with the path
   hole-punched (asserted via `admin inspect`), then force a relay fallback and a restart-mid-call recovery
 ```
 
-## 16. Design rationale
+## 9. What is not a user story
 
-Stable kernel interfaces and explicit transitions keep correctness independent of transports and adapters. Small function-named packages and per-file tests reduce coupling, keep replaceable implementations visible, and expose coverage gaps. Execution and supervision are separated because execution may err while supervision supplies correction signals execution must not manipulate.
+Never presentable as user needs: "use SQLite/wazero/libp2p/Ollama"; "create a Process and Trace" or "route everything through `Call()`"; "add a table/column/interface/endpoint/native"; "use `X`, `Y`, `Q`" or a markup formula; "return this internal id" or "run these store methods in this order"; "every Go file has a test file". Their justification must be a story or guarantee, not incumbency. The required tests split likewise: acceptance tests belong with stories; mechanism-freezing tests belong beside the design they verify.
 
-Locking the full subtree price before execution prevents unfunded work anywhere in the tree; failure refunds of the remaining allocation keep accounting conservative, observable, and testable. Input-before-lock and output-before-settlement prevent charging invalid requests or paying malformed replies. Mediated WASM authority permits composition without credential leakage or authorization bypass.
+## 10. Deviations from the source contract
 
-Subtree pricing makes a price a price: the caller pays one advertised number, composition risk lives with the provider who composed, and the fee taxes each layer's margin (value added), not gross flows. `run` removes process bookkeeping from the user — funding is exact, closure automatic, a process simply the lifetime of a computation and its continuations. Steps are funded continuations: money reserved at suspension makes asynchronous composition safe, restartable, and honest about who pays.
+The sixteen rulings of 2026-08-14 are executed: `requirements-old.md`, the code, the tests, and the flows agree with this document, so the ledger that tracked their lag is empty. Engineering choices made while executing them, recorded because they bind future edits:
 
-Federation incentives align in both directions: a kernel federates because its users gain a larger action space and its providers gain outside demand, its operator earning the import duty. The domestic fee (default 20%) deliberately exceeds the import duty (default 5%), so a kernel always earns more on local supply than on imports — federation complements local providers rather than undercutting them. Discipline is self-enforcing: a kernel whose counterparty account runs dry stops serving it manifests, since executing unpaid work loses money twice — in service and in the failure stats that sink its rank abroad; funding restores exposure. Because gossip carries only trade-backed opinions, reliable behavior compounds into discoverability: reputation is the long-run asset earned by settling honestly.
+- The value channel is local, so what is locked from the caller is exactly what the beneficiary receives: the trace's separate value reserve collapsed into `value` (migration `043` drops the column), and the settlement primitives lost their credit/sys-credit/refund generality.
+- Two canonical formats are preserved rather than shortened: the step idempotency key keeps its reserved trailing component, so a completion retried across the upgrade recovers its stored outcome instead of re-executing under a fresh key; the remote contract hash keeps `effect` as a reserved empty key, so no cached proxy is re-keyed. Both are verified by unchanged hash fixtures. `Receipt.value_premium` is not among them: with value local, every issuer wrote 0 and the check compared 0 against 0, so field, column, and check are deleted rather than carried (migration `044`).
+- Migration `043` refuses to apply while any unresolved payment reserve or cross-kernel value lock exists, so no record backing locked funds is ever dropped. The locks are identified by shape — fees in the reserve, no local beneficiary, or a peer-funded lock — never by amount: both fee rates may be zero, which makes a cross-kernel lock numerically identical to a local one.
 
-A single peer-to-peer carrier expresses a system whose identity was always a key, never an address: one transport means one code path, one failure mode, and one thing to verify against §13, and it lets a home-router kernel federate identically to one on a public host. HTTP federation was the lone layer dragging advertised addresses, `.well-known` documents, and peer-URL SSRF rules into a key-native system; removing it deletes a whole class of configuration rather than maintaining a parallel path. The honest cost: a small class of public helper nodes (bootstrap, rendezvous, relay) is load-bearing infrastructure for all federation — they pass encrypted bytes and hold no Juice data, but someone must run them, unpaid and out-of-protocol for now. Settlement never knew the carrier, so moving it onto the transport changes how bytes arrive and nothing about who pays or what settles.
+## 11. Borderline rulings
 
-Replaceable lookup ranking permits research changes without changing kernel semantics; fixed stats plus optional tags preserve deterministic baseline metrics while isolating experiments. Latency is derived from transaction timestamps, not cached on traces, so buyer-experienced wall time is always current — a subtree query reflects late descendants without a retroactive write — at the cost of that query at read time.
+1. Subtree price — constraint (U11); trace-wallet enforcement design (D2).
+2. Role law — attribution constraint (G2); schema and precondition order design (D2).
+3. Caller-scoped visibility — the behaviors (encapsulation, no confused deputy, parked steps never bricked) constraints (U20, U22); enum and binding rule design (D5).
+4. Margin, not refund — constraint (U16): purchase at fixed price, not metered cost.
+5. Receipts — offline verifiability constraint (U36, G7); JCS/Ed25519/domains design (D11).
+6. Ratings as privacy-preserving public evidence — constraint (U39); projection shapes and 0/1 scale design (D16).
+7. Global exposure cap — Sybil-proof bounded loss constraint (U32); a single global counter near-forced (per-identity schemes fail the Sybil clause).
+8. Probabilistic residual settlement — zero-expected-loss constraint (U33): the spec's impossibility argument eliminates deterministic options, and a biased scheme transfers value systematically; commit/reveal design (D14).
+9. Resolve-on-use — permissionless calling constraint (U29); proxy cache and healing design (D13).
+10. Web standards vs libp2p — user-facing edge constrained to web standards (U25, U27, U45); kernel-to-kernel edge constrained by U34, which HTTPS-with-URLs cannot meet; libp2p design (D12).
+11. Native encapsulation — constraint (source contract former §9): natives are ordinary actions behind `Call()`, no kernel privileges; which natives exist design (D17).
+12. Credits by fiat — operator-rail deposits/withdrawals current constraint (U3); ROADMAP's rail-backed money is a planned constraint change, made deliberately.
 
-Fixed `@sys` and signing keys give stable system action names and verifiable receipts/manifests. Structured logs make production operation and research reproduction reconstructable.
+## 12. Rule for future simplification
 
-OpenAPI import as supervision keeps registration low-friction while preserving uniform execution. Federation imports signed action contracts without leaking implementation. Contract-change deactivation prevents silent interface drift for callers and LLMs. Unimport deactivates rather than deletes so history remains auditable. Friendship is deliberately worthless (auto-accepted, zero balance) so that trust lives in deposits and reputational gossip carries only earned, trade-backed opinions; a Bayesian shrinkage of ranking priors toward trust-weighted introducer means is the natural baseline formula, but the formula is the ranking layer's experiment, not kernel semantics.
+1. Name the user story served.
+2. Name the constraints that must remain true.
+3. Identify the design being replaced or deleted.
+4. Show money, authority, privacy, durability, and interoperability remain at least as strong.
+5. Prefer an existing web standard or existing kernel path.
+6. Delete the old path; never keep both.
+7. Update `requirements.md`, design docs, `API.md`, and acceptance tests at the same boundary.
+
+## 13. Non-normative residue
+
+- Source contract former §16 (design rationale) is justification, not contract: its content is preserved as commentary beside the entries it argues for (D2, D5, D12, D14, D15, D22; ruling texts in §11).
+- The source contract's file-header editing instructions are editorial meta.
+- Contract deviations, when any exist, are recorded in §10.
+
+## 14. Coverage
+
+Every section of the source contract is absorbed as follows; nothing else remains:
+
+| §  | Content | Class home |
+|----|---------|------------|
+| 1  | run/Call, role law, minimality, exec/supervision split | D2; G2, G8; minimality (§9) |
+| 2  | packages, constraints | D1 |
+| 3  | data model | D4 (wire shapes P5, P6; steps D6; grants D10; evidence D16; kernel D15/D16) |
+| 4  | authorization, preconditions, quote hash | D5, D2, P2, U48 |
+| 5  | persistence, atomicity, recovery | D3 |
+| 6  | transition and settlement | D2 |
+| 7  | action lifecycle, URL safety | D4, G9 |
+| 8  | imports, auth schemes, delegation, remote | D21, D10, D13, P6 |
+| 9  | adapters, capability, natives, stats | D7, D8, D17, D22, G9 |
+| 10 | steps | D6 |
+| 11 | receipts, ratings, tx access | D11, P5, D22 |
+| 12 | auth, errors, first boot, supervision ops | D9, D20, D4, P1 |
+| 13 | federation | D12–D16, D18, D19, P1, P3–P10 |
+| 14 | CLI, HTTP, config, logging | D20 |
+| 15 | tests | §8 |
+| 16 | rationale | §13 |
+
+Facts marked `[policy]` or `[convention]`, plus every design clause lacking a `[→…]` trace, constitute the enumerated simplification surface.

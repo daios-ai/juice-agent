@@ -105,7 +105,7 @@ func (e *Executor) retryOK() func(error) bool {
 }
 
 // Chatter summarises a conversation (used by compaction). Implemented by the
-// juice client over @sys/llm/chat.
+// juice client over sys/llm/chat.
 type Chatter interface {
 	Chat(ctx context.Context, messages []agent.Message) (string, error)
 }

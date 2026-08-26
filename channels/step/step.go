@@ -1,7 +1,7 @@
 // Package step is the kernel-native intake channel: it polls the kernel for
 // waiting steps addressed to the agent, turns each into a task, and delivers the
-// outcome by completing the step. This is how any other agent (e.g. @chat), a human
-// via @sys/message, or a message-in-step bridge (SMS/Slack) hands work to the agent
+// outcome by completing the step. This is how any other agent (e.g. chat), a human
+// via sys/message, or a message-in-step bridge (SMS/Slack) hands work to the agent
 // with zero pairwise integration. It speaks the kernel only through
 // channels.StepSource, staying kernel-free like the loop.
 package step
@@ -9,7 +9,6 @@ package step
 import (
 	"context"
 	"encoding/json"
-	"strings"
 	"sync"
 	"time"
 
@@ -36,7 +35,7 @@ type Step struct {
 	interval time.Duration
 	budget   int
 	handle   string          // this agent's handle; only steps addressed to it are its work
-	exclude  map[string]bool // owner_handles claimed by a dedicated channel (e.g. @chat); skipped here
+	exclude  map[string]bool // owner_handles claimed by a dedicated channel (e.g. chat); skipped here
 
 	submit func(agent.Task)
 	stop   chan struct{}
@@ -59,7 +58,7 @@ type stepMeta struct {
 // NewStep builds a step channel polling src every interval, stamping tasks with
 // budget. handle is the agent's own handle: only steps whose required caller is this
 // agent are its work (a step it merely owns is skipped). exclude names owner_handles
-// a dedicated channel claims (e.g. "@chat") — steps from those senders are left for
+// a dedicated channel claims (e.g. "chat") — steps from those senders are left for
 // that channel, so the generic and dedicated channels partition the agent's steps
 // without overlap.
 func NewStep(src channels.StepSource, interval time.Duration, budget int, handle string, exclude ...string) *Step {
@@ -68,7 +67,7 @@ func NewStep(src channels.StepSource, interval time.Duration, budget int, handle
 	}
 	ex := map[string]bool{}
 	for _, h := range exclude {
-		ex[strings.TrimPrefix(h, "@")] = true
+		ex[h] = true
 	}
 	return &Step{src: src, interval: interval, budget: budget, handle: handle, exclude: ex, stop: make(chan struct{}),
 		pending: map[string]stepMeta{}, seen: map[string]bool{}, active: map[string]bool{}}
@@ -129,7 +128,7 @@ func (s *Step) scan(ctx context.Context) {
 // channel. An empty required caller (only test fakes produce that; the kernel always
 // sets it) is treated as addressed here.
 func (s *Step) addressedToMe(st channels.StepInfo) bool {
-	if s.exclude[strings.TrimPrefix(st.OwnerHandle, "@")] {
+	if s.exclude[st.OwnerHandle] {
 		return false // a dedicated channel (e.g. chat) claims this sender
 	}
 	return st.RequiredCaller == "" || channels.SameHandle(st.RequiredCaller, s.handle)
@@ -147,7 +146,7 @@ func sessionKey(st channels.StepInfo) string {
 }
 
 // promptFromStep renders a step's parked request into the task prompt. A "message"
-// field (the @sys/message convention) is used directly; otherwise the whole
+// field (the sys/message convention) is used directly; otherwise the whole
 // partial_args is rendered.
 func promptFromStep(st channels.StepInfo) string {
 	if msg, ok := st.PartialArgs["message"].(string); ok && msg != "" {
@@ -160,7 +159,7 @@ func promptFromStep(st channels.StepInfo) string {
 }
 
 // Deliver completes the originating step with the task's answer. Completing runs the
-// step's onward action, which delivers the reply (for @sys/sink the reply rides in
+// step's onward action, which delivers the reply (for sys/sink the reply rides in
 // the completion transaction's args, readable by the sender). A failed or
 // interrupted task still completes (ack), so the sender's process is released and the
 // exchange never dangles.
@@ -188,7 +187,7 @@ func (s *Step) Deliver(taskID string, out agent.Outcome) {
 }
 
 // shapeReply maps the loop's reply (the reply tool's {answer: text}) onto the onward
-// action's reply contract. For an unconstrained onward (e.g. @sys/sink) the reply
+// action's reply contract. For an unconstrained onward (e.g. sys/sink) the reply
 // rides through as {answer: text} (readable in the completion tx args). For a
 // delivery action that declares a text-carrying field (text/message/…) the answer is
 // placed under it, so a bridge's action shape drives the mapping — the agent needs no

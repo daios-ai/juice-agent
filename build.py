@@ -4,12 +4,12 @@ agent.py — an OpenCode-style coding agent that builds and publishes a Juice WA
 
 This is the OpenCode loop adapted for Juice: ONE loop that maintains the full conversation and lets
 the model choose tool calls repeatedly (Gather / Act / Verify are emergent, not hardcoded phases).
-Each turn the model (@sys/llm/chat) emits exactly one tool call; the harness executes it via the
+Each turn the model (sys/llm/chat) emits exactly one tool call; the harness executes it via the
 `juice` CLI, appends the result to the conversation, and loops. The model writes a TinyGo `Handle`
-using the Juice WASM SDK, compiles it (@sys/tinygo/compile), tests it by actually running it, fixes
+using the Juice WASM SDK, compiles it (sys/tinygo/compile), tests it by actually running it, fixes
 its own code from the exact compiler/runtime errors it sees, and finally publishes it.
 
-Unlike @sys/make (a stateless pipeline that regenerates from scratch each attempt), the conversation
+Unlike sys/make (a stateless pipeline that regenerates from scratch each attempt), the conversation
 here is never reset — the model repairs its previous code in place. Verification is real kernel
 execution, and nothing is published until it runs correctly 3 times.
 
@@ -17,7 +17,7 @@ The action is published under whoever is currently logged into the CLI (resolved
 `juice user me`); log in first with `juice auth login <user>`.
 
 USAGE
-    juice auth login @me            # whoever you log in as owns the published action
+    juice auth login <handle>       # whoever you log in as owns the published action
     python3 agent.py "translate English into Chilean Spanish with heavy slang"
 
 CONFIG (environment)
@@ -77,15 +77,15 @@ THE CODE YOU WRITE (Juice WASM SDK):
 - Return (map[string]any{...}, nil) on success; return (nil, errors.New("reason")) to fail.
 - There is NO network and NO filesystem. You CANNOT call OpenAI or any external API. To use an LLM,
   call a Juice action with JuiceCall:
-    * Free-form text (translate / summarize / rewrite) -> @sys/llm/chat:
+    * Free-form text (translate / summarize / rewrite) -> sys/llm/chat:
         args := mustMarshal(map[string]any{
             "messages": []any{ map[string]any{"role": "user", "content": prompt} },
         })
-        reply, err := JuiceCall("@sys/llm/chat", args)
+        reply, err := JuiceCall("sys/llm/chat", args)
         if err != nil { return nil, err }
         var r struct{ Message struct{ Content string `json:"content"` } `json:"message"` }
         json.Unmarshal(reply, &r)   // r.Message.Content is the text
-    * Structured output (a number/record/list) -> @sys/llm/json with an "output_schema".
+    * Structured output (a number/record/list) -> sys/llm/json with an "output_schema".
 - Never call your own action (no self-recursion).
 
 TOOLS — emit exactly one per turn, as a fenced ```json block:
@@ -198,7 +198,7 @@ def slugify(s, maxlen=32):
 
 def free_name(base):
     """Resolve a free action name for the logged-in owner: the clean `base`, else `base-2`, `base-3`,
-    … up to `base-100` — the first not taken by a live action. Mirrors @sys/make's name allocation
+    … up to `base-100` — the first not taken by a live action. Mirrors sys/make's name allocation
     (make.go); soft-deleted names don't count (action show returns not-found for them)."""
     name = base
     for suffix in range(2, 101):
@@ -263,13 +263,13 @@ def sanitize_schema(schema):
     return out
 
 
-JUICE_CALL_RE = re.compile(r'JuiceCall\("(@[^"]+)"')
+JUICE_CALL_RE = re.compile(r'JuiceCall\("([^"]+)"')
 
 
 def compute_price(source):
     """Sum the prices of the distinct actions the source JuiceCalls — the subtree bound the registered
     action needs so its internal subcalls are funded (validated: price 0 traps at runtime). Mirrors
-    @sys/make's computePrice."""
+    sys/make's computePrice."""
     total = 0
     for ref in sorted(set(JUICE_CALL_RE.findall(source))):
         rc, out, _ = juice_cli("action", "show", ref)
@@ -330,7 +330,7 @@ def temp_action(state, h):
 def execute_tool(tool, args, source, state):
     if tool == "lookup":
         q = (args.get("query") or "").strip() or state["task"]
-        ok, res = jrun("@sys/lookup", {"query": q, "limit": 8})
+        ok, res = jrun("sys/lookup", {"query": q, "limit": 8})
         if not ok:
             return {"error": res.get("error")}
         return {"actions": [{"action": r.get("action"), "description": r.get("description"),
@@ -339,7 +339,7 @@ def execute_tool(tool, args, source, state):
     if tool == "compile":
         if not source or not source.strip():
             return {"error": "no source — include the code in a ```go block with func Handle"}
-        ok, res = jrun("@sys/tinygo/compile", {"source": source})
+        ok, res = jrun("sys/tinygo/compile", {"source": source})
         if not ok:
             return {"error": res.get("error")}  # kernel error (e.g. toolchain missing)
         if res.get("status") == "success":
@@ -409,7 +409,7 @@ def execute_tool(tool, args, source, state):
                                  f"{o.get('error')}. Fix the schema or code, recompile, retest."}
         juice_cli("action", "update", ref, "--public=true")
         header = (f"// Synthesized by agent.py for task: {state['task']}\n"
-                  f"// Handle body; @sys/tinygo/compile prepends the Juice WASM SDK.\n\n")
+                  f"// Handle body; sys/tinygo/compile prepends the Juice WASM SDK.\n\n")
         with open(os.path.join(BUILD_DIR, name + ".go"), "w") as f:
             f.write(header + state["sources"][h].rstrip("\n") + "\n")
         with open(os.path.join(BUILD_DIR, name + ".contract.json"), "w") as f:
@@ -452,7 +452,7 @@ def main():
     ]
 
     for i in range(MAX_ITERS):
-        ok, res = jrun("@sys/llm/chat", {"messages": messages})
+        ok, res = jrun("sys/llm/chat", {"messages": messages})
         if not ok:
             log(f"[{i+1}] chat failed: {res.get('error')}")
             break

@@ -12,17 +12,17 @@ import (
 
 func TestPromptBuildIncludesSectionsWhenPresent(t *testing.T) {
 	p := &Prompter{
-		Handle:    "@research",
+		Handle:    "research",
 		ReplyTool: "reply",
 		Persona:   "Be terse and formal.",
-		Knowledge: "Juice actions are @owner/name.",
+		Knowledge: "Juice actions are owner/name.",
 	}
-	msg := p.Build("Last time I used @sys/time for clocks.")
+	msg := p.Build("Last time I used sys/time for clocks.")
 	if msg.Role != agent.RoleSystem || msg.Kind != "system" {
 		t.Fatalf("role/kind = %q/%q", msg.Role, msg.Kind)
 	}
-	for _, want := range []string{"@research", "\"reply\"", "Be terse and formal.",
-		"Juice actions are @owner/name.", "Last time I used @sys/time", "# Persona", "# Knowledge", "# Memory"} {
+	for _, want := range []string{"research", "\"reply\"", "Be terse and formal.",
+		"Juice actions are owner/name.", "Last time I used sys/time", "# Persona", "# Knowledge", "# Memory"} {
 		if !strings.Contains(msg.Content, want) {
 			t.Fatalf("prompt missing %q:\n%s", want, msg.Content)
 		}
@@ -30,7 +30,7 @@ func TestPromptBuildIncludesSectionsWhenPresent(t *testing.T) {
 }
 
 func TestPromptOmitsEmptySections(t *testing.T) {
-	p := &Prompter{Handle: "@agent", ReplyTool: "reply"}
+	p := &Prompter{Handle: "agent", ReplyTool: "reply"}
 	msg := p.Build("")
 	for _, absent := range []string{"# Persona", "# Knowledge", "# Memory"} {
 		if strings.Contains(msg.Content, absent) {
@@ -48,7 +48,7 @@ func TestLoadPrompterReadsFilesAndSkipsMissing(t *testing.T) {
 	personaPath := filepath.Join(dir, "persona.md")
 	os.WriteFile(personaPath, []byte("speak like a pirate"), 0o644)
 	// knowledge file intentionally absent
-	p := LoadPrompter("@bob", "reply", personaPath, filepath.Join(dir, "knowledge.md"))
+	p := LoadPrompter("bob", "reply", personaPath, filepath.Join(dir, "knowledge.md"))
 	if p.Persona != "speak like a pirate" {
 		t.Fatalf("persona = %q", p.Persona)
 	}
@@ -75,8 +75,8 @@ func memTask() (agent.Task, agent.Outcome, []agent.Message) {
 	out := agent.Outcome{Status: agent.StatusAnswered}
 	msgs := []agent.Message{
 		{Role: agent.RoleUser, Content: "what time is it"},
-		{Role: agent.RoleAssistant, Action: "@sys/time"},
-		{Role: agent.RoleTool, Action: "@sys/time", TxID: "tx1"},
+		{Role: agent.RoleAssistant, Action: "sys/time"},
+		{Role: agent.RoleTool, Action: "sys/time", TxID: "tx1"},
 	}
 	return task, out, msgs
 }
@@ -84,7 +84,7 @@ func memTask() (agent.Task, agent.Outcome, []agent.Message) {
 func TestMemoryUpdateAppendsEntryAndDigestReadsIt(t *testing.T) {
 	dir := t.TempDir()
 	path := filepath.Join(dir, "memory.md")
-	m := NewMemory(path, 65536, &echoChatter{reply: "- asked the time; used @sys/time; answered"})
+	m := NewMemory(path, 65536, &echoChatter{reply: "- asked the time; used sys/time; answered"})
 
 	if m.Digest() != "" {
 		t.Fatal("digest should be empty before any update")
@@ -93,7 +93,7 @@ func TestMemoryUpdateAppendsEntryAndDigestReadsIt(t *testing.T) {
 	m.Update(context.Background(), "2026-07-10 01:00", task, out, msgs)
 
 	dig := m.Digest()
-	if !strings.Contains(dig, "@sys/time") || !strings.Contains(dig, "t1") {
+	if !strings.Contains(dig, "sys/time") || !strings.Contains(dig, "t1") {
 		t.Fatalf("memory digest missing content:\n%s", dig)
 	}
 	// The summariser must have been shown the transcript (the action it used).

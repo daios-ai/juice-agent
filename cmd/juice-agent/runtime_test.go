@@ -62,7 +62,7 @@ func newExecutor(dir string) *Executor {
 		DataDir: dir,
 		RetryOK: func(error) bool { return false },
 		Loop: agent.Config{
-			ReplyTool: "reply", LookupAction: "@sys/lookup", MaxTurns: 5,
+			ReplyTool: "reply", LookupAction: "sys/lookup", MaxTurns: 5,
 			Intrinsics: map[string]agent.Intrinsic{"reply": {
 				Handle: func(_ context.Context, a map[string]any) (map[string]any, bool, error) { return a, true, nil },
 			}},

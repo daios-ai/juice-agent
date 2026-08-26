@@ -15,7 +15,7 @@ import (
 // buildSystemPrompt, transposed: one builder, no per-model variation (the kernel
 // is the one provider). Absent sections are simply omitted.
 type Prompter struct {
-	Handle    string // the agent, e.g. "@research"
+	Handle    string // the agent, e.g. "research"
 	ReplyTool string // the terminal tool's name, e.g. "reply"
 	Persona   string // persona.md contents (may be empty)
 	Knowledge string // knowledge.md contents (may be empty)
@@ -38,7 +38,7 @@ func LoadPrompter(handle, replyTool, personaPath, knowledgePath string) *Prompte
 func (p *Prompter) Build(memoryDigest string) agent.Message {
 	handle := p.Handle
 	if handle == "" {
-		handle = "@agent"
+		handle = "agent"
 	}
 	reply := p.ReplyTool
 	if reply == "" {
@@ -79,7 +79,7 @@ func readFileOrEmpty(path string) string {
 // Memory is the agent's durable, legible cross-task memory: a Markdown file it
 // appends a task summary to when a task settles and reloads into the system
 // prompt before the next one. It is byte-bounded; over budget the oldest entries
-// are folded into a digest via one @sys/llm/chat call. This is the middle path
+// are folded into a digest via one sys/llm/chat call. This is the middle path
 // between pi (no automatic cross-task memory) and a semantic store — accumulation
 // is automatic, the result stays human-readable.
 type Memory struct {

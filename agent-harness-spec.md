@@ -19,7 +19,7 @@ pure loop in `agent/` is unchanged.
   `maker.go` (§8). **This is where all the work below lives.**
 
 The channel model (recap): a message to the agent is a **step addressed to it**
-(`required_caller = @agent`); the reply is the **completion** of that step (its
+(`required_caller = agent`); the reply is the **completion** of that step (its
 onward action delivers); the **channel is `owner_handle`**. The agent registers
 **nothing** — it is reached by steps, so startup does no bootstrap round-trip for
 reachability. (A *bridge* registers its delivery action, not the agent.)

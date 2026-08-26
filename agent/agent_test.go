@@ -125,9 +125,9 @@ func replyIntrinsic() map[string]Intrinsic {
 func baseConfig() Config {
 	return Config{
 		ReplyTool:      "reply",
-		LookupAction:   "@sys/lookup",
+		LookupAction:   "sys/lookup",
 		Tools:          []Tool{{Name: "reply", Description: "finish", InputSchema: map[string]any{"type": "object"}}},
-		Always:         []Candidate{{Ref: "@sys/lookup"}},
+		Always:         []Candidate{{Ref: "sys/lookup"}},
 		MaxTurns:       32,
 		CandidateLimit: 24,
 		LookupLimit:    8,
@@ -143,10 +143,10 @@ func newDeps(d Decider, c Catalog, r Runner, t Transcript) Deps {
 
 func TestStopsWhenReplySelected(t *testing.T) {
 	dec := &scriptedDecider{script: []Selection{
-		{Action: "@sys/time"},
+		{Action: "sys/time"},
 		{Action: "reply", Args: map[string]any{"answer": "it is noon"}},
 	}}
-	cat := &fakeCatalog{seed: []Candidate{{Ref: "@sys/time"}}}
+	cat := &fakeCatalog{seed: []Candidate{{Ref: "sys/time"}}}
 	run := &recordingRunner{}
 	tr := &memTranscript{}
 
@@ -163,24 +163,24 @@ func TestStopsWhenReplySelected(t *testing.T) {
 	if out.Turns != 2 {
 		t.Fatalf("turns = %d, want 2", out.Turns)
 	}
-	if len(run.calls) != 1 || run.calls[0] != "@sys/time" {
-		t.Fatalf("dispatched calls = %v, want [@sys/time]", run.calls)
+	if len(run.calls) != 1 || run.calls[0] != "sys/time" {
+		t.Fatalf("dispatched calls = %v, want [sys/time]", run.calls)
 	}
 }
 
 func TestBudgetRefusesThenContinues(t *testing.T) {
-	// @expensive costs 100; budget is 10. The loop must refuse it (not dispatch)
+	// expensive costs 100; budget is 10. The loop must refuse it (not dispatch)
 	// and let the model recover with reply.
 	dec := &scriptedDecider{script: []Selection{
-		{Action: "@expensive"},
+		{Action: "expensive"},
 		{Action: "reply", Args: map[string]any{"answer": "gave up on expensive"}},
 	}}
 	cat := &fakeCatalog{
-		seed: []Candidate{{Ref: "@expensive"}},
+		seed: []Candidate{{Ref: "expensive"}},
 		meta: map[string]struct {
 			price int
 			stats ActionStats
-		}{"@expensive": {price: 100}},
+		}{"expensive": {price: 100}},
 	}
 	run := &recordingRunner{}
 	tr := &memTranscript{}
@@ -212,16 +212,16 @@ func TestBudgetRefusesThenContinues(t *testing.T) {
 
 func TestBudgetSpendAccumulates(t *testing.T) {
 	dec := &scriptedDecider{script: []Selection{
-		{Action: "@a"},
-		{Action: "@b"},
+		{Action: "a"},
+		{Action: "b"},
 		{Action: "reply", Args: map[string]any{"answer": "done"}},
 	}}
 	cat := &fakeCatalog{
-		seed: []Candidate{{Ref: "@a"}, {Ref: "@b"}},
+		seed: []Candidate{{Ref: "a"}, {Ref: "b"}},
 		meta: map[string]struct {
 			price int
 			stats ActionStats
-		}{"@a": {price: 3}, "@b": {price: 4}},
+		}{"a": {price: 3}, "b": {price: 4}},
 	}
 	run := &recordingRunner{}
 	tr := &memTranscript{}
@@ -234,8 +234,8 @@ func TestBudgetSpendAccumulates(t *testing.T) {
 
 func TestTurnCapHalts(t *testing.T) {
 	// The model keeps calling a free action forever; only the turn cap stops it.
-	dec := &loopingDecider{action: "@sys/time"}
-	cat := &fakeCatalog{seed: []Candidate{{Ref: "@sys/time"}}}
+	dec := &loopingDecider{action: "sys/time"}
+	cat := &fakeCatalog{seed: []Candidate{{Ref: "sys/time"}}}
 	run := &recordingRunner{}
 	tr := &memTranscript{}
 	cfg := baseConfig()
@@ -321,7 +321,7 @@ func TestSingleDecideErrorRecovers(t *testing.T) {
 }
 
 func TestSteeringInjectedBeforeDecide(t *testing.T) {
-	steer := []Message{{Role: RoleUser, Content: "actually, use @sys/time"}}
+	steer := []Message{{Role: RoleUser, Content: "actually, use sys/time"}}
 	dec := &scriptedDecider{script: []Selection{
 		{Action: "reply", Args: map[string]any{"answer": "ok"}},
 	}}
@@ -342,7 +342,7 @@ func TestSteeringInjectedBeforeDecide(t *testing.T) {
 	// the steering message must appear in the transcript the decider saw
 	found := false
 	for _, m := range dec.lastMsgs {
-		if m.Content == "actually, use @sys/time" {
+		if m.Content == "actually, use sys/time" {
 			found = true
 		}
 	}
@@ -354,18 +354,18 @@ func TestSteeringInjectedBeforeDecide(t *testing.T) {
 func TestWorkingSetEvictsLowestValue(t *testing.T) {
 	ws := newWorkingSet(2)
 	// proven-good
-	ws.put(Candidate{Ref: "@good", Stats: ActionStats{Known: true, Uses: 10, Successes: 10, RatingCount: 5, RatingEstimate: 1.0}})
+	ws.put(Candidate{Ref: "good", Stats: ActionStats{Known: true, Uses: 10, Successes: 10, RatingCount: 5, RatingEstimate: 1.0}})
 	// persistent failer
-	ws.put(Candidate{Ref: "@bad", Stats: ActionStats{Known: true, Uses: 10, Successes: 0, RatingCount: 5, RatingEstimate: 0.0}})
+	ws.put(Candidate{Ref: "bad", Stats: ActionStats{Known: true, Uses: 10, Successes: 0, RatingCount: 5, RatingEstimate: 0.0}})
 	// untested (neutral) — adding this exceeds the cap of 2, so the lowest-value
-	// candidate (@bad) must be evicted.
-	ws.put(Candidate{Ref: "@new"})
+	// candidate (bad) must be evicted.
+	ws.put(Candidate{Ref: "new"})
 
-	if _, ok := ws.by["@bad"]; ok {
-		t.Fatal("@bad (lowest value) should have been evicted")
+	if _, ok := ws.by["bad"]; ok {
+		t.Fatal("bad (lowest value) should have been evicted")
 	}
-	if _, ok := ws.by["@good"]; !ok {
-		t.Fatal("@good (highest value) should be retained")
+	if _, ok := ws.by["good"]; !ok {
+		t.Fatal("good (highest value) should be retained")
 	}
 	if len(ws.by) != 2 {
 		t.Fatalf("size = %d, want 2", len(ws.by))
@@ -374,22 +374,22 @@ func TestWorkingSetEvictsLowestValue(t *testing.T) {
 
 func TestCandidatesRankProvenFirstAndAlwaysPresent(t *testing.T) {
 	ws := newWorkingSet(10)
-	ws.put(Candidate{Ref: "@proven", Price: 5, Stats: ActionStats{Known: true, Uses: 8, Successes: 8, RatingCount: 3, RatingEstimate: 0.9}})
-	ws.put(Candidate{Ref: "@fresh", Price: 2})
+	ws.put(Candidate{Ref: "proven", Price: 5, Stats: ActionStats{Known: true, Uses: 8, Successes: 8, RatingCount: 3, RatingEstimate: 0.9}})
+	ws.put(Candidate{Ref: "fresh", Price: 2})
 
-	cfg := Config{Always: []Candidate{{Ref: "@sys/lookup"}}}
+	cfg := Config{Always: []Candidate{{Ref: "sys/lookup"}}}
 	cands := ws.candidates(cfg)
 	// Value-sorted: proven before fresh.
 	var order []string
 	for _, c := range cands {
 		order = append(order, c.Ref)
 	}
-	pi, fi := indexOf(order, "@proven"), indexOf(order, "@fresh")
+	pi, fi := indexOf(order, "proven"), indexOf(order, "fresh")
 	if pi < 0 || fi < 0 || pi > fi {
 		t.Fatalf("proven should rank before fresh: %v", order)
 	}
 	// The always-offered candidate is present even though it was never put().
-	if indexOf(order, "@sys/lookup") < 0 {
+	if indexOf(order, "sys/lookup") < 0 {
 		t.Fatalf("always candidate missing: %v", order)
 	}
 }
@@ -405,15 +405,15 @@ func indexOf(s []string, v string) int {
 
 func TestParseLookup(t *testing.T) {
 	res := map[string]any{"results": []any{
-		map[string]any{"action": "@sys/time", "description": "current time", "input_schema": map[string]any{"type": "object"}},
+		map[string]any{"action": "sys/time", "description": "current time", "input_schema": map[string]any{"type": "object"}},
 		map[string]any{"description": "no action ref — skipped"},
-		map[string]any{"action": "@sys/web", "description": "fetch a page"},
+		map[string]any{"action": "sys/web", "description": "fetch a page"},
 	}}
 	got := parseLookup(res)
 	if len(got) != 2 {
 		t.Fatalf("parsed %d candidates, want 2", len(got))
 	}
-	if got[0].Ref != "@sys/time" || got[1].Ref != "@sys/web" {
+	if got[0].Ref != "sys/time" || got[1].Ref != "sys/web" {
 		t.Fatalf("refs = %q,%q", got[0].Ref, got[1].Ref)
 	}
 }
@@ -423,11 +423,11 @@ func TestMergeEnrichesWithMeta(t *testing.T) {
 	cat := &fakeCatalog{meta: map[string]struct {
 		price int
 		stats ActionStats
-	}{"@sys/web": {price: 3, stats: ActionStats{Known: true, Uses: 4, Successes: 3}}}}
+	}{"sys/web": {price: 3, stats: ActionStats{Known: true, Uses: 4, Successes: 3}}}}
 	deps := Deps{Catalog: cat}
-	mergeCandidates(context.Background(), deps, ws, []Candidate{{Ref: "@sys/web", Description: "fetch"}})
+	mergeCandidates(context.Background(), deps, ws, []Candidate{{Ref: "sys/web", Description: "fetch"}})
 
-	c := ws.by["@sys/web"]
+	c := ws.by["sys/web"]
 	if c.Price != 3 {
 		t.Fatalf("price = %d, want 3 (from Meta)", c.Price)
 	}
@@ -439,20 +439,20 @@ func TestMergeEnrichesWithMeta(t *testing.T) {
 func TestLookupResultMergesIntoWorkingSet(t *testing.T) {
 	// A lookup dispatch must expand the offered refs on the next turn.
 	dec := &refCapturingDecider{script: []Selection{
-		{Action: "@sys/lookup", Args: map[string]any{"query": "x"}},
+		{Action: "sys/lookup", Args: map[string]any{"query": "x"}},
 		{Action: "reply", Args: map[string]any{"answer": "done"}},
 	}}
 	cat := &fakeCatalog{seed: nil}
 	run := &recordingRunner{results: map[string]RunResult{
-		"@sys/lookup": {Result: map[string]any{"results": []any{
-			map[string]any{"action": "@sys/web", "description": "fetch"},
+		"sys/lookup": {Result: map[string]any{"results": []any{
+			map[string]any{"action": "sys/web", "description": "fetch"},
 		}}},
 	}}
 	tr := &memTranscript{}
 	Run(context.Background(), Task{Budget: 100}, baseConfig(), newDeps(dec, cat, run, tr))
 
-	if !dec.everOffered("@sys/web") {
-		t.Fatalf("@sys/web from lookup was never offered to decide; offered=%v", dec.allRefs)
+	if !dec.everOffered("sys/web") {
+		t.Fatalf("sys/web from lookup was never offered to decide; offered=%v", dec.allRefs)
 	}
 }
 
@@ -520,12 +520,12 @@ func TestLookupResultTrimmedInTranscript(t *testing.T) {
 	// A lookup dispatch persists only ref+description+score (no schemas), while
 	// the working set retains the full candidate for the client to render.
 	dec := &scriptedDecider{script: []Selection{
-		{Action: "@sys/lookup", Args: map[string]any{"query": "x"}},
+		{Action: "sys/lookup", Args: map[string]any{"query": "x"}},
 		{Action: "reply", Args: map[string]any{"answer": "done"}},
 	}}
 	run := &recordingRunner{results: map[string]RunResult{
-		"@sys/lookup": {Result: map[string]any{"results": []any{
-			map[string]any{"action": "@sys/web", "description": "fetch",
+		"sys/lookup": {Result: map[string]any{"results": []any{
+			map[string]any{"action": "sys/web", "description": "fetch",
 				"input_schema": map[string]any{"type": "object", "properties": map[string]any{"url": map[string]any{}}}},
 		}}},
 	}}
@@ -535,7 +535,7 @@ func TestLookupResultTrimmedInTranscript(t *testing.T) {
 	// find the persisted lookup tool-result
 	var lookupRes map[string]any
 	for _, m := range tr.msgs {
-		if m.Role == RoleTool && m.Action == "@sys/lookup" {
+		if m.Role == RoleTool && m.Action == "sys/lookup" {
 			lookupRes = m.Result
 		}
 	}
@@ -544,7 +544,7 @@ func TestLookupResultTrimmedInTranscript(t *testing.T) {
 	}
 	results, _ := lookupRes["results"].([]any)
 	first, _ := results[0].(map[string]any)
-	if first["action"] != "@sys/web" || first["description"] != "fetch" {
+	if first["action"] != "sys/web" || first["description"] != "fetch" {
 		t.Fatalf("trimmed result missing ref/desc: %v", first)
 	}
 	if _, hasSchema := first["input_schema"]; hasSchema {
@@ -632,7 +632,7 @@ func (d *loopingSubtaskDecider) Decide(_ context.Context, _ []Message, _ []Candi
 	if d.n == 1 {
 		return &Selection{Action: "subtask", Args: map[string]any{"instruction": "loop"}}, nil
 	}
-	return &Selection{Action: "@sys/time"}, nil
+	return &Selection{Action: "sys/time"}, nil
 }
 
 // toolNamingDecider records the harness tools it is offered on each turn, opens a
@@ -707,11 +707,11 @@ func TestRepeatChallengeThenBackDown(t *testing.T) {
 	// the loop drops it (does NOT dispatch) and nudges, and the model backs down
 	// with reply. Exactly ONE dispatch, one nudge, a clean answered outcome.
 	dec := &scriptedDecider{script: []Selection{
-		{Action: "@chat/message", Args: map[string]any{"text": "read it"}},
-		{Action: "@chat/message", Args: map[string]any{"text": "read it"}}, // repeat → challenged
+		{Action: "chat/message", Args: map[string]any{"text": "read it"}},
+		{Action: "chat/message", Args: map[string]any{"text": "read it"}}, // repeat → challenged
 		{Action: "reply", Args: map[string]any{"answer": "done"}},
 	}}
-	cat := &fakeCatalog{seed: []Candidate{{Ref: "@chat/message"}}}
+	cat := &fakeCatalog{seed: []Candidate{{Ref: "chat/message"}}}
 	run := &recordingRunner{}
 	tr := &memTranscript{}
 
@@ -753,8 +753,8 @@ func TestParaphraseLoopIntercepted(t *testing.T) {
 	// The case the old byte-identity guard missed: same action, different args every
 	// turn. Detection is action-based, so the repeats are dropped (never dispatched)
 	// and the model, nudged, backs down with reply. Exactly ONE dispatch.
-	dec := &paraphrasingDecider{action: "@chat/message", backdownAfter: 3}
-	cat := &fakeCatalog{seed: []Candidate{{Ref: "@chat/message"}}}
+	dec := &paraphrasingDecider{action: "chat/message", backdownAfter: 3}
+	cat := &fakeCatalog{seed: []Candidate{{Ref: "chat/message"}}}
 	run := &recordingRunner{}
 	tr := &memTranscript{}
 
@@ -777,8 +777,8 @@ func TestRepeatLoopHardStops(t *testing.T) {
 	// A stubborn paraphrase loop that never backs down: repeats are dropped, and
 	// after maxRepeats (default 3) consecutive drops the frame hard-stops. The
 	// action dispatched exactly ONCE; one nudge; terminates well under the turn cap.
-	dec := &paraphrasingDecider{action: "@chat/message"}
-	cat := &fakeCatalog{seed: []Candidate{{Ref: "@chat/message"}}}
+	dec := &paraphrasingDecider{action: "chat/message"}
+	cat := &fakeCatalog{seed: []Candidate{{Ref: "chat/message"}}}
 	run := &recordingRunner{}
 	tr := &memTranscript{}
 	cfg := baseConfig() // MaxRepeats 0 → default 3
@@ -805,12 +805,12 @@ func TestRepeatChangeOfCourseResets(t *testing.T) {
 	// After the nudge the model picks a DIFFERENT action; that is progress, so the
 	// repeat streak resets and there is no hard-stop.
 	dec := &scriptedDecider{script: []Selection{
-		{Action: "@a", Args: map[string]any{"x": 1}},
-		{Action: "@a", Args: map[string]any{"x": 1}}, // repeat → challenged
-		{Action: "@b", Args: map[string]any{"y": 2}}, // change of course
+		{Action: "a", Args: map[string]any{"x": 1}},
+		{Action: "a", Args: map[string]any{"x": 1}}, // repeat → challenged
+		{Action: "b", Args: map[string]any{"y": 2}}, // change of course
 		{Action: "reply", Args: map[string]any{"answer": "done"}},
 	}}
-	cat := &fakeCatalog{seed: []Candidate{{Ref: "@a"}, {Ref: "@b"}}}
+	cat := &fakeCatalog{seed: []Candidate{{Ref: "a"}, {Ref: "b"}}}
 	run := &recordingRunner{}
 	tr := &memTranscript{}
 
@@ -821,8 +821,8 @@ func TestRepeatChangeOfCourseResets(t *testing.T) {
 	if out.Status != StatusAnswered {
 		t.Fatalf("outcome = %+v, want answered (no repeat-loop)", out)
 	}
-	if len(run.calls) != 2 || run.calls[0] != "@a" || run.calls[1] != "@b" {
-		t.Fatalf("dispatched %v, want [@a @b] (one @a, challenge, then @b)", run.calls)
+	if len(run.calls) != 2 || run.calls[0] != "a" || run.calls[1] != "b" {
+		t.Fatalf("dispatched %v, want [a b] (one a, challenge, then b)", run.calls)
 	}
 	if n := countKind(tr.msgs, "repeat-challenge"); n != 1 {
 		t.Fatalf("repeat-challenge messages = %d, want 1", n)
@@ -833,13 +833,13 @@ func TestAlternationIsNotARepeat(t *testing.T) {
 	// A, B, A, B is not a repeat loop — the guard is consecutive-only, so no
 	// challenge is ever issued.
 	dec := &scriptedDecider{script: []Selection{
-		{Action: "@a", Args: map[string]any{"x": 1}},
-		{Action: "@b", Args: map[string]any{"x": 1}},
-		{Action: "@a", Args: map[string]any{"x": 1}},
-		{Action: "@b", Args: map[string]any{"x": 1}},
+		{Action: "a", Args: map[string]any{"x": 1}},
+		{Action: "b", Args: map[string]any{"x": 1}},
+		{Action: "a", Args: map[string]any{"x": 1}},
+		{Action: "b", Args: map[string]any{"x": 1}},
 		{Action: "reply", Args: map[string]any{"answer": "done"}},
 	}}
-	cat := &fakeCatalog{seed: []Candidate{{Ref: "@a"}, {Ref: "@b"}}}
+	cat := &fakeCatalog{seed: []Candidate{{Ref: "a"}, {Ref: "b"}}}
 	run := &recordingRunner{}
 	tr := &memTranscript{}
 
@@ -886,7 +886,7 @@ func (d *bracketRepeatDecider) Decide(_ context.Context, msgs []Message, _ []Can
 		d.opened = true
 		return &Selection{Action: "subtask", Args: map[string]any{"instruction": "loop"}}, nil
 	}
-	return &Selection{Action: "@sys/time", Args: map[string]any{"text": "same"}}, nil
+	return &Selection{Action: "sys/time", Args: map[string]any{"text": "same"}}, nil
 }
 
 func TestBracketRepeatIsolation(t *testing.T) {
@@ -923,8 +923,8 @@ func TestBracketRepeatIsolation(t *testing.T) {
 func TestRepeatGuardDisabled(t *testing.T) {
 	// MaxRepeats < 0 disables the guard: a looping action runs every turn until the
 	// turn cap, exactly as before, with no challenge inserted.
-	dec := &paraphrasingDecider{action: "@sys/time"}
-	cat := &fakeCatalog{seed: []Candidate{{Ref: "@sys/time"}}}
+	dec := &paraphrasingDecider{action: "sys/time"}
+	cat := &fakeCatalog{seed: []Candidate{{Ref: "sys/time"}}}
 	run := &recordingRunner{}
 	tr := &memTranscript{}
 	cfg := baseConfig()

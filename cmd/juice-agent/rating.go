@@ -8,7 +8,7 @@ import (
 )
 
 // Rater judges and records tool-call quality. Implemented by the juice client
-// (@sys/llm/json to judge, POST /rate to record).
+// (sys/llm/json to judge, POST /rate to record).
 type Rater interface {
 	ChatJSON(ctx context.Context, messages []agent.Message, schema map[string]any) (any, error)
 	Rate(ctx context.Context, txID string, rating int, note string) error
@@ -26,7 +26,7 @@ type dispatched struct {
 // RateTask grades every dispatched call in a finished transcript and records a
 // 0/1 rating with a one-line note for each — the agent's durable, kernel-held
 // memory of tool quality. A kernel-failed call is a mechanical 0; successful
-// calls are judged together by one @sys/llm/json call over the transcript. This
+// calls are judged together by one sys/llm/json call over the transcript. This
 // runs after the loop, never inside it (the kernel law: execution must not
 // rate). Rating is best-effort: a judging failure leaves calls unrated rather
 // than failing the task.

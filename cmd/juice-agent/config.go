@@ -2,6 +2,7 @@ package main
 
 import (
 	"encoding/json"
+	"fmt"
 	"os"
 	"path/filepath"
 	"strings"
@@ -54,8 +55,8 @@ type HTTPChannelConfig struct {
 	Addr string `json:"addr"`
 }
 
-// ChatChannelConfig enables the chat channel (juice-ui @chat rooms). Off by
-// default; the agent must be a room member (the @chat/msg grant is provisioned on
+// ChatChannelConfig enables the chat channel (juice-ui chat rooms). Off by
+// default; the agent must be a room member (the chat/msg grant is provisioned on
 // demand — see chatAdapter.ensureGrant).
 type ChatChannelConfig struct {
 	Enabled     bool `json:"enabled"`
@@ -106,16 +107,21 @@ func juiceHome() string {
 	return ".juice"
 }
 
-// resolveHandle fixes the agent's identity: the CLI @handle arg, else
-// AGENT_HANDLE, else the default @agent.
-func resolveHandle(cliHandle string) string {
-	if cliHandle != "" {
-		return cliHandle
+// resolveHandle fixes the agent's identity: the handle argument, else
+// AGENT_HANDLE, else the default agent. Handles are bare, as on the kernel: a
+// sigil or a slash is rejected, never stripped.
+func resolveHandle(cliHandle string) (string, error) {
+	handle := cliHandle
+	if handle == "" {
+		handle = os.Getenv("AGENT_HANDLE")
 	}
-	if h := os.Getenv("AGENT_HANDLE"); h != "" {
-		return h
+	if handle == "" {
+		handle = "agent"
 	}
-	return "@agent"
+	if strings.ContainsAny(handle, "@/") {
+		return "", fmt.Errorf("handle %q must be bare, without %q or %q", handle, "@", "/")
+	}
+	return handle, nil
 }
 
 // defaultStepPoll is the fallback poll interval (seconds) for the step channel,
@@ -132,9 +138,12 @@ func componentDir() string { return filepath.Join(juiceHome(), "agent") }
 // a merge, not a wholesale replace). A missing config file is fine; a malformed
 // one is an error. The step channel is always present (ensureStepChannel).
 func ResolveConfig(cliHandle string) (Config, error) {
-	handle := resolveHandle(cliHandle)
+	handle, err := resolveHandle(cliHandle)
+	if err != nil {
+		return Config{}, err
+	}
 	component := componentDir()
-	home := filepath.Join(component, "agents", strings.TrimPrefix(handle, "@"))
+	home := filepath.Join(component, "agents", handle)
 
 	cfg := DefaultConfig()
 	if err := overlayConfig(&cfg, filepath.Join(component, "config.json")); err != nil {

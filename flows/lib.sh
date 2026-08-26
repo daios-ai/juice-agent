@@ -3,7 +3,7 @@
 # flows/lib.sh — integration harness for juice-agent flows.
 #
 # Drives ONLY compiled binaries: a real juice kernel wired to a REAL Ollama
-# (the LLM the kernel ships with, behind @sys/llm/*), and the juice-agent daemon.
+# (the LLM the kernel ships with, behind sys/llm/*), and the juice-agent daemon.
 # Bash cannot reach either in process, so a flow can never bypass the binary.
 #
 # Because a real model sits in the loop, LLM-dependent flows assert robust
@@ -66,7 +66,7 @@ wait_line() {
 # ---------------------------------------------------------------------------
 # kernel (wired to real Ollama)
 # ---------------------------------------------------------------------------
-# start_kernel dir — boot a juice kernel using the real LLM, login @sys, fund it.
+# start_kernel dir — boot a juice kernel using the real LLM, login sys, fund it.
 # Sets KDB, KCFG, KHOME, KURL.
 start_kernel() {
     local dir="$1"
@@ -74,7 +74,7 @@ start_kernel() {
     mkdir -p "$KHOME"
     cat > "$KCFG" <<EOF
 { "fee_bps": 0, "log_format": "json", "log_level": "info", "allow_local_sources": true,
-  "kernel_handle": "@agent-test-kernel", "bootstrap_peers": [],
+  "kernel_handle": "agent-test-kernel", "bootstrap_peers": [],
   "native": { "llm": { "url": "$OLLAMA_URL", "chat_model": "$CHAT_MODEL", "embed_model": "$EMBED_MODEL" } } }
 EOF
     JUICE_BOOTSTRAP_PASSWORD=sys-pass HOME="$KHOME" \
@@ -83,19 +83,21 @@ EOF
     local addr; addr=$(wait_line "$dir/kernel.log" '"msg":"server.ready".*"addr":"\([^"]*\)"')
     [ -n "$addr" ] || { echo "kernel did not start" >&2; cat "$dir/kernel.log" >&2; return 1; }
     KURL="http://$addr"
-    k auth login @sys --password sys-pass >/dev/null 2>&1
-    k admin deposit @sys 100000 --reason flows >/dev/null 2>&1
+    k auth login sys --password sys-pass >/dev/null 2>&1
+    k admin deposit sys 100000 --reason flows >/dev/null 2>&1
 }
 
-k()  { HOME="$KHOME" JUICE_SERVER="$KURL" "$JUICE_BIN" --config "$KCFG" --db "$KDB" "$@" 2>/dev/null; }
-kj() { HOME="$KHOME" JUICE_SERVER="$KURL" "$JUICE_BIN" --config "$KCFG" --db "$KDB" --json "$@" 2>/dev/null; }
+# The CLI's base URL is --server only (no JUICE_SERVER env, no config fallback).
+k()  { HOME="$KHOME" "$JUICE_BIN" --server "$KURL" --config "$KCFG" --db "$KDB" "$@" 2>/dev/null; }
+kj() { HOME="$KHOME" "$JUICE_BIN" --server "$KURL" --config "$KCFG" --db "$KDB" --json "$@" 2>/dev/null; }
 
-# create_agent — register @agent and fund it.
-create_agent() { create_user @agent agent-pass; }
+# create_agent — register the agent user and fund it.
+create_agent() { create_user agent agent-pass; }
 
-# create_user handle password — register and fund a kernel user.
+# create_user handle password — register and fund a kernel user. `user create`
+# takes no email; the printed recovery phrase is discarded here.
 create_user() {
-    k user create "$1" "${1#@}@example.com" --password "$2" >/dev/null 2>&1
+    k user create "$1" --password "$2" >/dev/null 2>&1
     k admin deposit "$1" 100000 --reason flows >/dev/null 2>&1
 }
 
@@ -103,15 +105,15 @@ create_user() {
 # agentd
 # ---------------------------------------------------------------------------
 # agent_home dir [handle] — echo an agent's home under JUICE_HOME=$dir. Handle
-# defaults to @agent; the leading @ is stripped for the directory name. Homes
-# nest under the component's agents/ subtree ($JUICE_HOME/agent/agents/<handle>).
+# defaults to agent. Homes nest under the component's agents/ subtree
+# ($JUICE_HOME/agent/agents/<handle>).
 agent_home() {
-    local dir="$1" handle="${2:-@agent}"
-    echo "$dir/agent/agents/${handle#@}"
+    local dir="$1" handle="${2:-agent}"
+    echo "$dir/agent/agents/$handle"
 }
 
 # start_agentd dir [cfg-fragment] — write the agent's config.json, launch the
-# @agent daemon with JUICE_HOME=$dir, set ADATA and AHTTP. The temp dir is
+# agent daemon with JUICE_HOME=$dir, set ADATA and AHTTP. The temp dir is
 # JUICE_HOME so persona/knowledge/memory and data stay out of the repo; memory is
 # off by default (flows that test it enable it in their fragment).
 start_agentd() {
@@ -127,7 +129,7 @@ start_agentd() {
   "channels": { "http": { "addr": "127.0.0.1:0" }, "step": { "poll_seconds": 1 } }
   ${extra:+, $extra} }
 EOF
-    JUICE_HOME="$dir" AGENT_PASSWORD=agent-pass "$AGENTD" @agent serve >"$dir/agentd.log" 2>&1 &
+    JUICE_HOME="$dir" AGENT_PASSWORD=agent-pass "$AGENTD" serve agent >"$dir/agentd.log" 2>&1 &
     AGENTD_PID=$!; track "$AGENTD_PID"
     local addr; addr=$(wait_line "$dir/agentd.log" '"event":"serving".*"http_addr":"\([^"]*\)"')
     [ -n "$addr" ] || { echo "agentd did not start" >&2; cat "$dir/agentd.log" >&2; return 1; }

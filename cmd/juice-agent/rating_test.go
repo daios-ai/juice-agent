@@ -35,7 +35,7 @@ func (r *fakeRater) Rate(_ context.Context, txID string, rating int, note string
 
 func TestRateTaskMechanicalZeroForFailures(t *testing.T) {
 	msgs := []agent.Message{
-		{Role: agent.RoleTool, Action: "@bad/thing", TxID: "tx-bad", IsError: true, Content: "boom"},
+		{Role: agent.RoleTool, Action: "bad/thing", TxID: "tx-bad", IsError: true, Content: "boom"},
 	}
 	r := newFakeRater(map[string]any{"ratings": []any{}})
 	RateTask(context.Background(), msgs, r, nil, nil)
@@ -50,8 +50,8 @@ func TestRateTaskMechanicalZeroForFailures(t *testing.T) {
 
 func TestRateTaskJudgesSuccessfulCalls(t *testing.T) {
 	msgs := []agent.Message{
-		{Role: agent.RoleTool, Action: "@sys/time", TxID: "tx-0"},
-		{Role: agent.RoleTool, Action: "@sys/web", TxID: "tx-1"},
+		{Role: agent.RoleTool, Action: "sys/time", TxID: "tx-0"},
+		{Role: agent.RoleTool, Action: "sys/web", TxID: "tx-1"},
 	}
 	judgment := map[string]any{"ratings": []any{
 		map[string]any{"index": float64(0), "rating": float64(1), "note": "gave the time"},

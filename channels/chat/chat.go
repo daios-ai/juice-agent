@@ -1,8 +1,8 @@
 // Package chat is the agent's chat channel: a dedicated notification-driven service
-// over juice-ui's @chat rooms, and the reference for how a service channel is
-// built. It supplies only the chat-specific pieces — how to list @chat doorbells,
+// over juice-ui's chat rooms, and the reference for how a service channel is
+// built. It supplies only the chat-specific pieces — how to list chat doorbells,
 // read a room, post a reply, complete a doorbell, key a conversation by room, and
-// provision the @chat/msg grant — and hands them to the generic channels.Service
+// provision the chat/msg grant — and hands them to the generic channels.Service
 // driver, which owns the delivery loop, at-least-once cursor, and reply loop guard.
 // It speaks the kernel only through channels.Kernel, so it stays kernel-free; the
 // cmd adapter implements that interface over the juice client.
@@ -19,11 +19,11 @@ import (
 
 // chatHandle is the juice-ui chat service's user handle; it owns the doorbell steps
 // that notify members of new messages. Its member actions live in the msg/ folder
-// (@chat/msg/read, @chat/msg/message) under one grant selector (chatGrant); the open
-// @chat/register sits outside that folder.
+// (chat/msg/read, chat/msg/message) under one grant selector (chatGrant); the open
+// chat/register sits outside that folder.
 const (
-	chatHandle = "@chat"
-	chatGrant  = "@chat/msg"
+	chatHandle = "chat"
+	chatGrant  = "chat/msg"
 )
 
 // New builds the chat channel: the generic Service driver configured with chat's
@@ -34,8 +34,8 @@ func New(k channels.Kernel, cfg channels.ServiceConfig) *channels.Service {
 	return channels.NewService(&chatActions{k: k, handle: cfg.Handle}, cfg)
 }
 
-// chatActions implements channels.ServiceActions over @chat's kernel actions, and
-// provisions the @chat/msg grant on demand so enabling chat is only a config flag: a
+// chatActions implements channels.ServiceActions over chat's kernel actions, and
+// provisions the chat/msg grant on demand so enabling chat is only a config flag: a
 // first-run, absent, or revoked grant self-heals lazily on the first grant_required
 // from a read or post. The mutex serializes concurrent provisioning.
 type chatActions struct {
@@ -51,7 +51,7 @@ func (a *chatActions) Pending(ctx context.Context) ([]channels.StepInfo, error) 
 	}
 	var out []channels.StepInfo
 	for _, s := range steps {
-		if s.OwnerHandle == chatHandle { // @chat owns the doorbells; the agent is their required caller
+		if s.OwnerHandle == chatHandle { // chat owns the doorbells; the agent is their required caller
 			out = append(out, s)
 		}
 	}
@@ -64,7 +64,7 @@ func (a *chatActions) SessionKey(s channels.StepInfo) string {
 }
 
 // Read fetches a room's new messages, provisioning the grant and retrying once if
-// the kernel reports the agent has not yet connected @chat/msg.
+// the kernel reports the agent has not yet connected chat/msg.
 func (a *chatActions) Read(ctx context.Context, room string, after int64) ([]channels.Msg, error) {
 	out, err := a.readOnce(ctx, room, after)
 	if a.k.GrantRequired(err) {
@@ -114,12 +114,12 @@ func (a *chatActions) Complete(ctx context.Context, stepID string) error {
 
 func (a *chatActions) Transient(err error) bool { return a.k.Transient(err) }
 
-// ensureGrant makes sure the agent holds the @chat/msg grant. It is idempotent: if
-// the agent already lists the @chat/msg connector it returns at once. Otherwise it
+// ensureGrant makes sure the agent holds the chat/msg grant. It is idempotent: if
+// the agent already lists the chat/msg connector it returns at once. Otherwise it
 // runs the headless path the browser's "Connect to chat" button uses — register the
 // agent's handle for a pending key, complete the verification step (which the kernel
 // lets only the handle's owner do, proving identity), then attach the key as the
-// @chat/msg grant.
+// chat/msg grant.
 func (a *chatActions) ensureGrant(ctx context.Context) error {
 	a.mu.Lock()
 	defer a.mu.Unlock()

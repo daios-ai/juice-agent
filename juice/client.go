@@ -8,6 +8,9 @@ package juice
 import (
 	"bytes"
 	"context"
+	"crypto/rand"
+	"crypto/sha256"
+	"encoding/base64"
 	"encoding/json"
 	"errors"
 	"fmt"
@@ -23,15 +26,16 @@ import (
 )
 
 // Client is an authenticated kernel client for one handle. It is safe for
-// concurrent use; the bearer token is guarded by a mutex and refreshed on 401.
+// concurrent use; the token pair is guarded by a mutex and renewed on 401.
 type Client struct {
 	base     string
 	handle   string
 	password string
 	hc       *http.Client
 
-	mu    sync.Mutex
-	token string
+	mu      sync.Mutex
+	token   string // access token (bearer)
+	refresh string // refresh token, consumed by renew on 401
 }
 
 // New builds a client for base URL and credentials. It does not log in; call
@@ -45,32 +49,100 @@ func New(base, handle, password string) *Client {
 	}
 }
 
-// Login exchanges the handle+password for a bearer token (password grant).
+// tokenPair is the body of a successful token or refresh exchange.
+type tokenPair struct {
+	AccessToken  string `json:"access_token"`
+	RefreshToken string `json:"refresh_token"`
+}
+
+// Login authenticates with the handle+password over the kernel's PKCE flow:
+// authorize with a code challenge, then exchange the returned code plus the
+// verifier for an access/refresh token pair.
 func (c *Client) Login(ctx context.Context) error {
-	var out struct {
-		Token string `json:"token"`
-	}
-	if err := c.call(ctx, http.MethodPost, "/v1/auth/token",
-		map[string]any{"handle": c.handle, "password": c.password}, &out, false); err != nil {
+	verifier, challenge, err := pkcePair()
+	if err != nil {
 		return err
 	}
-	if out.Token == "" {
-		return &KernelError{Status: 200, Code: "invalid_state", Message: "login returned empty token"}
+	var auth struct {
+		Redirect string `json:"redirect"`
+	}
+	if err := c.call(ctx, http.MethodPost, "/v1/auth/authorize",
+		map[string]any{"handle": c.handle, "password": c.password, "code_challenge": challenge},
+		&auth, false); err != nil {
+		return err
+	}
+	code, err := codeFromRedirect(auth.Redirect)
+	if err != nil {
+		return err
+	}
+	var pair tokenPair
+	if err := c.call(ctx, http.MethodPost, "/v1/auth/token",
+		map[string]any{"code": code, "code_verifier": verifier}, &pair, false); err != nil {
+		return err
+	}
+	return c.setTokens(pair)
+}
+
+// pkcePair returns a fresh S256 verifier/challenge pair.
+func pkcePair() (verifier, challenge string, err error) {
+	raw := make([]byte, 32)
+	if _, err := rand.Read(raw); err != nil {
+		return "", "", err
+	}
+	verifier = base64.RawURLEncoding.EncodeToString(raw)
+	sum := sha256.Sum256([]byte(verifier))
+	return verifier, base64.RawURLEncoding.EncodeToString(sum[:]), nil
+}
+
+// codeFromRedirect extracts the authorization code from the authorize reply's
+// redirect value (a query string like "?code=CODE").
+func codeFromRedirect(redirect string) (string, error) {
+	q, err := url.ParseQuery(strings.TrimPrefix(redirect, "?"))
+	if err != nil || q.Get("code") == "" {
+		return "", &KernelError{Status: 200, Code: "invalid_state",
+			Message: "authorize returned no code: " + redirect}
+	}
+	return q.Get("code"), nil
+}
+
+// renew rotates the token pair via the refresh endpoint. It fails when no
+// refresh token is held or the kernel rejects it (revoked, expired).
+func (c *Client) renew(ctx context.Context) error {
+	c.mu.Lock()
+	refresh := c.refresh
+	c.mu.Unlock()
+	if refresh == "" {
+		return &KernelError{Status: 401, Code: "unauthenticated", Message: "no refresh token"}
+	}
+	var pair tokenPair
+	if err := c.call(ctx, http.MethodPost, "/v1/auth/refresh",
+		map[string]any{"refresh_token": refresh}, &pair, false); err != nil {
+		return err
+	}
+	return c.setTokens(pair)
+}
+
+func (c *Client) setTokens(pair tokenPair) error {
+	if pair.AccessToken == "" {
+		return &KernelError{Status: 200, Code: "invalid_state", Message: "auth returned empty access token"}
 	}
 	c.mu.Lock()
-	c.token = out.Token
+	c.token, c.refresh = pair.AccessToken, pair.RefreshToken
 	c.mu.Unlock()
 	return nil
 }
 
-// do issues an authenticated request, transparently logging in and retrying
-// once on a 401 (an expired or missing token).
+// do issues an authenticated request, transparently renewing the token pair —
+// or re-logging-in from the in-memory password when renewal fails — and
+// retrying once on a 401 (an expired or missing token).
 func (c *Client) do(ctx context.Context, method, path string, body, out any) error {
 	err := c.call(ctx, method, path, body, out, true)
 	var ke *KernelError
 	if err != nil && asKernel(err, &ke) && ke.Status == http.StatusUnauthorized {
-		if lerr := c.Login(ctx); lerr != nil {
-			return lerr
+		if rerr := c.renew(ctx); rerr != nil {
+			if lerr := c.Login(ctx); lerr != nil {
+				return lerr
+			}
 		}
 		return c.call(ctx, method, path, body, out, true)
 	}
@@ -171,9 +243,9 @@ func (c *Client) Run(ctx context.Context, action string, args map[string]any) (a
 // --- Decider ---------------------------------------------------------------
 
 // Decide performs one selection round-trip. It renders the harness tools and
-// catalog candidates into a chat prompt, runs @sys/llm/chat, and extracts a JSON
-// selection from the reply. We use plain chat, not @sys/llm/decide: decide only
-// accepts @owner/name refs (so plain harness-tool names can't be offered) and,
+// catalog candidates into a chat prompt, runs sys/llm/chat, and extracts a JSON
+// selection from the reply. We use plain chat, not sys/llm/decide: decide only
+// accepts owner/name refs (so plain harness-tool names can't be offered) and,
 // on Ollama, its grammar-constrained JSON corrupts copied strings (measured:
 // timestamps garbled). Unconstrained chat + balanced-brace extraction is both
 // more capable (offers tools) and higher-fidelity.
@@ -205,7 +277,7 @@ func (c *Client) Decide(ctx context.Context, messages []agent.Message, catalog [
 }
 
 // selectionPrompt renders the one-shot instruction + tool list the model chooses
-// from: harness tools (plain names) first, then catalog actions (@owner/name)
+// from: harness tools (plain names) first, then catalog actions (owner/name)
 // with price, stats, and a compact schema.
 func selectionPrompt(catalog []agent.Candidate, tools []agent.Tool) string {
 	var b strings.Builder
@@ -218,14 +290,14 @@ func selectionPrompt(catalog []agent.Candidate, tools []agent.Tool) string {
 		b.WriteByte('\n')
 	}
 	if len(catalog) > 0 {
-		b.WriteString("Actions (@owner/name), preferring proven ones:\n")
+		b.WriteString("Actions (owner/name), preferring proven ones:\n")
 		for _, c := range catalog {
 			fmt.Fprintf(&b, "- %s — %s; price=%d%s; args: %s\n",
 				c.Ref, c.Description, c.Price, statsSummary(c.Stats), argSummary(c.InputSchema))
 		}
 		b.WriteByte('\n')
 	}
-	b.WriteString(`Respond with ONLY a JSON object: {"action": "<name or @owner/name>", "args": {...}}. No prose, no code fences.`)
+	b.WriteString(`Respond with ONLY a JSON object: {"action": "<name or owner/name>", "args": {...}}. No prose, no code fences.`)
 	return b.String()
 }
 
@@ -318,9 +390,9 @@ func trunc(s string, n int) string {
 
 // --- LLM helpers (compaction, rating, embedding) ---------------------------
 
-// Chat runs @sys/llm/chat over role/content messages and returns the reply text.
+// Chat runs sys/llm/chat over role/content messages and returns the reply text.
 func (c *Client) Chat(ctx context.Context, messages []agent.Message) (string, error) {
-	res, err := c.Run(ctx, "@sys/llm/chat", map[string]any{"messages": toChatMessages(messages)})
+	res, err := c.Run(ctx, "sys/llm/chat", map[string]any{"messages": toChatMessages(messages)})
 	if err != nil {
 		return "", err
 	}
@@ -331,9 +403,9 @@ func (c *Client) Chat(ctx context.Context, messages []agent.Message) (string, er
 	return "", nil
 }
 
-// ChatJSON runs @sys/llm/json with an output schema and returns the validated value.
+// ChatJSON runs sys/llm/json with an output schema and returns the validated value.
 func (c *Client) ChatJSON(ctx context.Context, messages []agent.Message, schema map[string]any) (any, error) {
-	res, err := c.Run(ctx, "@sys/llm/json", map[string]any{
+	res, err := c.Run(ctx, "sys/llm/json", map[string]any{
 		"messages": toChatMessages(messages), "output_schema": schema,
 	})
 	if err != nil {
@@ -342,9 +414,9 @@ func (c *Client) ChatJSON(ctx context.Context, messages []agent.Message, schema 
 	return res.Result["value"], nil
 }
 
-// Embed runs @sys/llm/embed and returns the embedding vector.
+// Embed runs sys/llm/embed and returns the embedding vector.
 func (c *Client) Embed(ctx context.Context, text string) ([]float64, error) {
-	res, err := c.Run(ctx, "@sys/llm/embed", map[string]any{"text": text})
+	res, err := c.Run(ctx, "sys/llm/embed", map[string]any{"text": text})
 	if err != nil {
 		return nil, err
 	}
@@ -388,12 +460,12 @@ func toChatMessages(msgs []agent.Message) []map[string]any {
 
 // --- Catalog ---------------------------------------------------------------
 
-// Lookup ranks active actions for a query via @sys/lookup.
+// Lookup ranks active actions for a query via sys/lookup.
 func (c *Client) Lookup(ctx context.Context, query string, limit int) ([]agent.Candidate, error) {
 	if limit <= 0 {
 		limit = 10
 	}
-	res, err := c.Run(ctx, "@sys/lookup", map[string]any{"query": query, "limit": limit})
+	res, err := c.Run(ctx, "sys/lookup", map[string]any{"query": query, "limit": limit})
 	if err != nil {
 		return nil, err
 	}
@@ -420,7 +492,6 @@ type actionJSON struct {
 	ActionRef string `json:"action"`
 	Price     int    `json:"price"`
 	Active    bool   `json:"active"`
-	Public    bool   `json:"public"`
 	Name      string `json:"name"`
 }
 
@@ -433,7 +504,7 @@ type statsJSON struct {
 	RatingEstimate  float64 `json:"rating_estimate"`
 }
 
-// Meta fetches an action's price and stats by @owner/name. Price comes from the
+// Meta fetches an action's price and stats by owner/name. Price comes from the
 // filtered action list; stats from GET /v1/stats/{id}. A missing stats row
 // yields zeroed, not-Known stats (an untested action).
 func (c *Client) Meta(ctx context.Context, ref string) (int, agent.ActionStats, error) {
@@ -457,7 +528,7 @@ func (c *Client) Meta(ctx context.Context, ref string) (int, agent.ActionStats, 
 	return a.Price, stats, nil
 }
 
-// resolve finds the action row for a @owner/name ref via the filtered list
+// resolve finds the action row for a owner/name ref via the filtered list
 // (which the {id} path does not accept — it resolves UUIDs only).
 func (c *Client) resolve(ctx context.Context, ref string) (actionJSON, error) {
 	owner, name, err := splitRef(ref)
@@ -477,10 +548,12 @@ func (c *Client) resolve(ctx context.Context, ref string) (actionJSON, error) {
 	return actionJSON{}, &KernelError{Status: 404, Code: "not_found", Message: "action not found: " + ref}
 }
 
-// splitRef splits @owner/name into ("@owner", "name") at the first slash.
+// splitRef splits a bare owner/name ref at the first slash (names may contain
+// further slashes). A sigil-prefixed ref is malformed: the kernel rejects
+// sigils, never strips them.
 func splitRef(ref string) (owner, name string, err error) {
 	i := strings.Index(ref, "/")
-	if !strings.HasPrefix(ref, "@") || i < 0 {
+	if strings.HasPrefix(ref, "@") || i <= 0 || i == len(ref)-1 {
 		return "", "", &KernelError{Status: 400, Code: "invalid_input", Message: "malformed action ref: " + ref}
 	}
 	return ref[:i], ref[i+1:], nil
@@ -506,7 +579,7 @@ type CreateActionReq struct {
 }
 
 // CreateAction registers a kind=wasm action from a base64 artifact and returns
-// its id and @owner/name ref.
+// its id and owner/name ref.
 func (c *Client) CreateAction(ctx context.Context, req CreateActionReq) (id, ref string, err error) {
 	body := map[string]any{
 		"name": req.Name, "kind": "wasm", "price": req.Price,
@@ -526,7 +599,7 @@ func (c *Client) CreateAction(ctx context.Context, req CreateActionReq) (id, ref
 }
 
 // CreateWasmAction is the Publisher-shaped wrapper over CreateAction, used by
-// the maker's @agent/publish intrinsic.
+// the maker's agent-side publish intrinsic.
 func (c *Client) CreateWasmAction(ctx context.Context, name, description string, price int, in, out map[string]any, artifactB64 string) (id, ref string, err error) {
 	return c.CreateAction(ctx, CreateActionReq{
 		Name: name, Description: description, Price: price,
@@ -542,7 +615,7 @@ func (c *Client) EnableAction(ctx context.Context, id string) error {
 // SetPublic makes an action public by id.
 func (c *Client) SetPublic(ctx context.Context, id string) error {
 	return c.do(ctx, http.MethodPut, "/v1/actions/"+url.PathEscape(id),
-		map[string]any{"public": true}, nil)
+		map[string]any{"visibility": "public"}, nil)
 }
 
 // DeleteAction removes an action by id (history preserved kernel-side).
@@ -550,7 +623,7 @@ func (c *Client) DeleteAction(ctx context.Context, id string) error {
 	return c.do(ctx, http.MethodDelete, "/v1/actions/"+url.PathEscape(id), nil, nil)
 }
 
-// ResolveID returns the action id for a @owner/name ref, or "" if absent.
+// ResolveID returns the action id for a owner/name ref, or "" if absent.
 func (c *Client) ResolveID(ctx context.Context, ref string) (string, error) {
 	a, err := c.resolve(ctx, ref)
 	if err != nil {
@@ -572,7 +645,7 @@ type Self struct {
 }
 
 // Connector is a directory-grouped grant node from GET /v1/me: the folder the
-// granted actions share (e.g. "@chat/msg") and the actions granted beneath it. It
+// granted actions share (e.g. "chat/msg") and the actions granted beneath it. It
 // lets a caller check whether a grant selector is already connected without
 // exposing any token.
 type Connector struct {

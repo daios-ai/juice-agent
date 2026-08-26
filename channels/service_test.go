@@ -86,7 +86,7 @@ func (f *fakeService) Complete(_ context.Context, stepID string) error {
 func (f *fakeService) Transient(error) bool { return f.transient }
 
 func step(id, room string) StepInfo {
-	return StepInfo{ID: id, OwnerHandle: "@svc", RequiredCaller: "@agent",
+	return StepInfo{ID: id, OwnerHandle: "svc", RequiredCaller: "agent",
 		PartialArgs: map[string]any{"room": room}}
 }
 
@@ -94,7 +94,7 @@ func step(id, room string) StepInfo {
 // pointer to the captured tasks.
 func newSvc(t *testing.T, fs *fakeService, loop LoopConfig, now func() time.Time) (*Service, *[]agent.Task) {
 	t.Helper()
-	s := NewService(fs, ServiceConfig{Name: "svc", Handle: "@agent", Interval: time.Hour,
+	s := NewService(fs, ServiceConfig{Name: "svc", Handle: "agent", Interval: time.Hour,
 		Budget: 20, DataDir: t.TempDir(), Loop: loop, Now: now})
 	var tasks []agent.Task
 	var mu sync.Mutex
@@ -108,7 +108,7 @@ func answered(text string) agent.Outcome {
 
 func TestServiceReadsSubmitsAndDelivers(t *testing.T) {
 	fs := newFakeService()
-	fs.rooms["r1"] = []Msg{{Seq: 1, From: "@alice", Text: "what time is it?"}}
+	fs.rooms["r1"] = []Msg{{Seq: 1, From: "alice", Text: "what time is it?"}}
 	fs.steps = []StepInfo{step("d1", "r1")}
 	s, tasks := newSvc(t, fs, LoopConfig{}, nil)
 
@@ -116,7 +116,7 @@ func TestServiceReadsSubmitsAndDelivers(t *testing.T) {
 	if len(*tasks) != 1 || (*tasks)[0].Channel != "svc" {
 		t.Fatalf("tasks = %+v, want 1 svc task", *tasks)
 	}
-	if got := (*tasks)[0].Messages[0].Content; got != "@alice: what time is it?" {
+	if got := (*tasks)[0].Messages[0].Content; got != "alice: what time is it?" {
 		t.Fatalf("prompt = %q", got)
 	}
 	// The cursor must NOT advance until the reply is delivered (at-least-once).
@@ -137,7 +137,7 @@ func TestServiceReadsSubmitsAndDelivers(t *testing.T) {
 
 func TestServiceSkipsOwnMessages(t *testing.T) {
 	fs := newFakeService()
-	fs.rooms["r1"] = []Msg{{Seq: 1, From: "@agent", Text: "my own post"}}
+	fs.rooms["r1"] = []Msg{{Seq: 1, From: "agent", Text: "my own post"}}
 	fs.steps = []StepInfo{step("d1", "r1")}
 	s, tasks := newSvc(t, fs, LoopConfig{}, nil)
 
@@ -165,7 +165,7 @@ func TestServiceEmptyReadCompletesStep(t *testing.T) {
 
 func TestServiceMalformedStepCompleted(t *testing.T) {
 	fs := newFakeService()
-	fs.steps = []StepInfo{{ID: "d1", OwnerHandle: "@svc", PartialArgs: map[string]any{}}} // no room
+	fs.steps = []StepInfo{{ID: "d1", OwnerHandle: "svc", PartialArgs: map[string]any{}}} // no room
 	s, tasks := newSvc(t, fs, LoopConfig{}, nil)
 	s.scan(context.Background())
 	if len(*tasks) != 0 || !fs.completed["d1"] {
@@ -202,7 +202,7 @@ func TestServiceReadPermanentCompletesStep(t *testing.T) {
 
 func TestServicePostTransientLeavesStepAndCursor(t *testing.T) {
 	fs := newFakeService()
-	fs.rooms["r1"] = []Msg{{Seq: 1, From: "@alice", Text: "x"}}
+	fs.rooms["r1"] = []Msg{{Seq: 1, From: "alice", Text: "x"}}
 	fs.steps = []StepInfo{step("d1", "r1")}
 	s, tasks := newSvc(t, fs, LoopConfig{}, nil)
 	s.scan(context.Background())
@@ -227,7 +227,7 @@ func TestServicePostTransientLeavesStepAndCursor(t *testing.T) {
 
 func TestServicePostPermanentGivesUp(t *testing.T) {
 	fs := newFakeService()
-	fs.rooms["r1"] = []Msg{{Seq: 1, From: "@alice", Text: "x"}}
+	fs.rooms["r1"] = []Msg{{Seq: 1, From: "alice", Text: "x"}}
 	fs.steps = []StepInfo{step("d1", "r1")}
 	s, tasks := newSvc(t, fs, LoopConfig{}, nil)
 	s.scan(context.Background())
@@ -244,7 +244,7 @@ func TestServicePostPermanentGivesUp(t *testing.T) {
 
 func TestServiceFailedTaskRepliesWithFallback(t *testing.T) {
 	fs := newFakeService()
-	fs.rooms["r1"] = []Msg{{Seq: 1, From: "@alice", Text: "x"}}
+	fs.rooms["r1"] = []Msg{{Seq: 1, From: "alice", Text: "x"}}
 	fs.steps = []StepInfo{step("d1", "r1")}
 	s, tasks := newSvc(t, fs, LoopConfig{}, nil)
 	s.scan(context.Background())
@@ -259,7 +259,7 @@ func TestServiceFailedTaskRepliesWithFallback(t *testing.T) {
 
 func TestServiceEmptyAnswerRepliesWithFallback(t *testing.T) {
 	fs := newFakeService()
-	fs.rooms["r1"] = []Msg{{Seq: 1, From: "@alice", Text: "x"}}
+	fs.rooms["r1"] = []Msg{{Seq: 1, From: "alice", Text: "x"}}
 	fs.steps = []StepInfo{step("d1", "r1")}
 	s, tasks := newSvc(t, fs, LoopConfig{}, nil)
 	s.scan(context.Background())
@@ -271,12 +271,12 @@ func TestServiceEmptyAnswerRepliesWithFallback(t *testing.T) {
 
 func TestServiceOneActiveTaskPerConversation(t *testing.T) {
 	fs := newFakeService()
-	fs.rooms["r1"] = []Msg{{Seq: 1, From: "@alice", Text: "one"}}
+	fs.rooms["r1"] = []Msg{{Seq: 1, From: "alice", Text: "one"}}
 	fs.steps = []StepInfo{step("d1", "r1")}
 	s, tasks := newSvc(t, fs, LoopConfig{}, nil)
 
 	s.scan(context.Background()) // submits, marks r1 active
-	fs.rooms["r1"] = append(fs.rooms["r1"], Msg{Seq: 2, From: "@alice", Text: "two"})
+	fs.rooms["r1"] = append(fs.rooms["r1"], Msg{Seq: 2, From: "alice", Text: "two"})
 	fs.steps = append(fs.steps, step("d2", "r1"))
 	s.scan(context.Background()) // r1 busy -> nothing new
 	if len(*tasks) != 1 {
@@ -291,10 +291,10 @@ func TestServiceOneActiveTaskPerConversation(t *testing.T) {
 
 func TestServiceCursorPersistsAcrossReopen(t *testing.T) {
 	fs := newFakeService()
-	fs.rooms["r1"] = []Msg{{Seq: 5, From: "@alice", Text: "hi"}}
+	fs.rooms["r1"] = []Msg{{Seq: 5, From: "alice", Text: "hi"}}
 	fs.steps = []StepInfo{step("d1", "r1")}
 	dir := t.TempDir()
-	s := NewService(fs, ServiceConfig{Name: "svc", Handle: "@agent", Interval: time.Hour, Budget: 20, DataDir: dir})
+	s := NewService(fs, ServiceConfig{Name: "svc", Handle: "agent", Interval: time.Hour, Budget: 20, DataDir: dir})
 	var tasks []agent.Task
 	s.submit = func(tk agent.Task) { tasks = append(tasks, tk) }
 	s.scan(context.Background())
@@ -312,11 +312,11 @@ func TestServiceCursorPersistsAcrossReopen(t *testing.T) {
 func TestServiceLoopGuardSuppresses(t *testing.T) {
 	fs := newFakeService()
 	clk := newClock()
-	// Budget of 1 reply per window to @flooder.
+	// Budget of 1 reply per window to flooder.
 	s, tasks := newSvc(t, fs, LoopConfig{Enabled: true, Max: 1, Window: time.Minute, Cooldown: time.Minute}, clk.now)
 
-	// First message from @flooder is answered.
-	fs.rooms["r1"] = []Msg{{Seq: 1, From: "@flooder", Text: "a"}}
+	// First message from flooder is answered.
+	fs.rooms["r1"] = []Msg{{Seq: 1, From: "flooder", Text: "a"}}
 	fs.steps = []StepInfo{step("d1", "r1")}
 	s.scan(context.Background())
 	if len(*tasks) != 1 {
@@ -324,9 +324,9 @@ func TestServiceLoopGuardSuppresses(t *testing.T) {
 	}
 	s.Deliver((*tasks)[0].ID, answered("ok"))
 
-	// A second message from @flooder within the window is suppressed: no task, but
+	// A second message from flooder within the window is suppressed: no task, but
 	// the step is completed (unread cleared) and the cursor advances.
-	fs.rooms["r1"] = append(fs.rooms["r1"], Msg{Seq: 2, From: "@flooder", Text: "b"})
+	fs.rooms["r1"] = append(fs.rooms["r1"], Msg{Seq: 2, From: "flooder", Text: "b"})
 	fs.steps = []StepInfo{step("d2", "r1")}
 	s.scan(context.Background())
 	if len(*tasks) != 1 {
@@ -342,27 +342,27 @@ func TestServiceLoopGuardSuppresses(t *testing.T) {
 
 func TestServiceSeedsPriorConversation(t *testing.T) {
 	fs := newFakeService()
-	fs.rooms["r1"] = []Msg{{Seq: 1, From: "@alice", Text: "capital of France?"}}
+	fs.rooms["r1"] = []Msg{{Seq: 1, From: "alice", Text: "capital of France?"}}
 	fs.steps = []StepInfo{step("d1", "r1")}
 	s, tasks := newSvc(t, fs, LoopConfig{}, nil)
 
 	s.scan(context.Background())
 	// First task: no prior history — just the new message.
-	if got := (*tasks)[0].Messages; len(got) != 1 || got[0].Content != "@alice: capital of France?" {
+	if got := (*tasks)[0].Messages; len(got) != 1 || got[0].Content != "alice: capital of France?" {
 		t.Fatalf("task1 messages = %+v, want the single new message", got)
 	}
 	s.Deliver((*tasks)[0].ID, answered("Paris."))
 
 	// A follow-up in the same room.
-	fs.rooms["r1"] = append(fs.rooms["r1"], Msg{Seq: 2, From: "@alice", Text: "and its population?"})
+	fs.rooms["r1"] = append(fs.rooms["r1"], Msg{Seq: 2, From: "alice", Text: "and its population?"})
 	fs.steps = []StepInfo{step("d2", "r1")}
 	s.scan(context.Background())
 
 	got := (*tasks)[1].Messages
 	want := []agent.Message{
-		{Role: agent.RoleUser, Content: "@alice: capital of France?"},
+		{Role: agent.RoleUser, Content: "alice: capital of France?"},
 		{Role: agent.RoleAssistant, Content: "Paris."},
-		{Role: agent.RoleUser, Content: "@alice: and its population?"},
+		{Role: agent.RoleUser, Content: "alice: and its population?"},
 	}
 	if len(got) != len(want) {
 		t.Fatalf("task2 messages = %+v, want 3 turns (prior exchange + new message)", got)
@@ -376,27 +376,27 @@ func TestServiceSeedsPriorConversation(t *testing.T) {
 
 func TestServiceContextDisabledIsSingleMessage(t *testing.T) {
 	fs := newFakeService()
-	fs.rooms["r1"] = []Msg{{Seq: 1, From: "@alice", Text: "q1"}}
+	fs.rooms["r1"] = []Msg{{Seq: 1, From: "alice", Text: "q1"}}
 	fs.steps = []StepInfo{step("d1", "r1")}
-	s := NewService(fs, ServiceConfig{Name: "svc", Handle: "@agent", Interval: time.Hour,
+	s := NewService(fs, ServiceConfig{Name: "svc", Handle: "agent", Interval: time.Hour,
 		Budget: 20, DataDir: t.TempDir(), ContextMessages: -1}) // disabled
 	var tasks []agent.Task
 	s.submit = func(tk agent.Task) { tasks = append(tasks, tk) }
 
 	s.scan(context.Background())
 	s.Deliver(tasks[0].ID, answered("a1"))
-	fs.rooms["r1"] = append(fs.rooms["r1"], Msg{Seq: 2, From: "@alice", Text: "q2"})
+	fs.rooms["r1"] = append(fs.rooms["r1"], Msg{Seq: 2, From: "alice", Text: "q2"})
 	fs.steps = []StepInfo{step("d2", "r1")}
 	s.scan(context.Background())
 
-	if got := tasks[1].Messages; len(got) != 1 || got[0].Content != "@alice: q2" {
+	if got := tasks[1].Messages; len(got) != 1 || got[0].Content != "alice: q2" {
 		t.Fatalf("disabled: task2 must be a single new message, got %+v", got)
 	}
 }
 
 func TestServiceContextRecordedOnlyAfterPost(t *testing.T) {
 	fs := newFakeService()
-	fs.rooms["r1"] = []Msg{{Seq: 1, From: "@alice", Text: "q"}}
+	fs.rooms["r1"] = []Msg{{Seq: 1, From: "alice", Text: "q"}}
 	fs.steps = []StepInfo{step("d1", "r1")}
 	s, tasks := newSvc(t, fs, LoopConfig{}, nil)
 	s.scan(context.Background())
@@ -414,7 +414,7 @@ func TestServiceContextRecordedOnlyAfterPost(t *testing.T) {
 	fs.steps = []StepInfo{step("d1", "r1")}
 	s.scan(context.Background())
 	s.Deliver((*tasks)[len(*tasks)-1].ID, answered("a"))
-	if got := s.conv.seed("r1"); len(got) != 2 || got[0].Content != "@alice: q" || got[1].Content != "a" {
+	if got := s.conv.seed("r1"); len(got) != 2 || got[0].Content != "alice: q" || got[1].Content != "a" {
 		t.Fatalf("after a successful post the exchange must be recorded, got %+v", got)
 	}
 }

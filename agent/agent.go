@@ -57,7 +57,7 @@ type ActionStats struct {
 	Known           bool    `json:"-"`
 }
 
-// Candidate is a callable action in the working set: its @owner/name ref, the
+// Candidate is a callable action in the working set: its owner/name ref, the
 // contract fields lookup returns, its price (the subtree bound), and its stats.
 type Candidate struct {
 	Ref         string         `json:"ref"`
@@ -86,13 +86,13 @@ type RunResult struct {
 // Decider performs one model round-trip: given the conversation, the catalog
 // candidates (with descriptions/schemas/stats to render), and the harness tools,
 // it returns the next selection. Implemented by the juice client over
-// @sys/llm/chat (it builds the tool list itself and extracts a JSON selection).
+// sys/llm/chat (it builds the tool list itself and extracts a JSON selection).
 type Decider interface {
 	Decide(ctx context.Context, messages []Message, catalog []Candidate, tools []Tool) (*Selection, error)
 }
 
 // Catalog discovers actions and reads their metadata. Lookup ranks active
-// actions for a query (@sys/lookup); Meta fetches an action's price and stats.
+// actions for a query (sys/lookup); Meta fetches an action's price and stats.
 type Catalog interface {
 	Lookup(ctx context.Context, query string, limit int) ([]Candidate, error)
 	Meta(ctx context.Context, ref string) (price int, stats ActionStats, err error)
@@ -153,7 +153,7 @@ type Outcome struct {
 }
 
 // Tool is a plain-named harness capability offered to the model alongside the
-// catalog's @owner/name actions. Unlike an action it is not registered anywhere
+// catalog's owner/name actions. Unlike an action it is not registered anywhere
 // on the platform — the harness intercepts its selection (see Intrinsic). Names
 // never contain "/", so they are unambiguous against action refs.
 type Tool struct {
@@ -168,9 +168,9 @@ type Tool struct {
 type Config struct {
 	ReplyTool      string      // the terminal tool's name (e.g. "reply")
 	SubtaskTool    string      // the bracket-opening tool's name (e.g. "subtask"); "" disables brackets
-	LookupAction   string      // the discovery action ref (e.g. "@sys/lookup")
+	LookupAction   string      // the discovery action ref (e.g. "sys/lookup")
 	Tools          []Tool      // harness tools rendered to the model each turn
-	Always         []Candidate // catalog candidates always offered (e.g. @sys/lookup)
+	Always         []Candidate // catalog candidates always offered (e.g. sys/lookup)
 	MaxTurns       int
 	CandidateLimit int
 	LookupLimit    int
@@ -485,7 +485,7 @@ func mergeCandidates(ctx context.Context, deps Deps, ws *workingSet, cs []Candid
 	}
 }
 
-// parseLookup extracts candidates from a @sys/lookup result object
+// parseLookup extracts candidates from a sys/lookup result object
 // ({"results":[{action, description, input_schema, ...}]}).
 func parseLookup(res map[string]any) []Candidate {
 	raw, _ := res["results"].([]any)
@@ -570,7 +570,7 @@ func (w *workingSet) candidates(cfg Config) []Candidate {
 	return out
 }
 
-// trimLookup rewrites a @sys/lookup result to carry only ref + description +
+// trimLookup rewrites a sys/lookup result to carry only ref + description +
 // score per candidate, dropping the schemas that bloat the transcript.
 func trimLookup(res map[string]any) map[string]any {
 	raw, _ := res["results"].([]any)

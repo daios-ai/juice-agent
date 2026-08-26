@@ -29,8 +29,8 @@ flow_bootstrap() {
 
     # Harness tools are NOT registered on the platform — the catalog stays clean.
     local acts; acts=$(kj action list --all)
-    assert_not_contains bootstrap.no_fake_reply   "@agent/reply"   "$acts"
-    assert_not_contains bootstrap.no_fake_publish "@agent/publish" "$acts"
+    assert_not_contains bootstrap.no_fake_reply   "agent/reply"   "$acts"
+    assert_not_contains bootstrap.no_fake_publish "agent/publish" "$acts"
 
     kill -9 "$AGENTD_PID" 2>/dev/null; wait "$AGENTD_PID" 2>/dev/null
     start_agentd "$dir" || { fail bootstrap.restart "no daemon"; return; }
@@ -45,7 +45,7 @@ flow_recovery() {
     mkdir -p "$adata"
     printf '%s\n%s\n' \
         '{"role":"user","content":"half-done task"}' \
-        '{"role":"assistant","action":"@sys/time"}' > "$adata/orphan.jsonl"
+        '{"role":"assistant","action":"sys/time"}' > "$adata/orphan.jsonl"
 
     start_agentd "$dir" || { fail recovery.agentd "no daemon"; return; }
     if grep -q '"event":"recovery"' "$dir/agentd.log" && grep -q 'orphan' "$dir/agentd.log"; then
@@ -66,7 +66,7 @@ flow_init() {
     mkdir -p "$dir/agent"
     echo "{ \"server_url\": \"$KURL\", \"memory\": {\"enabled\": false} }" > "$dir/agent/config.json"
 
-    JUICE_HOME="$dir" AGENT_PASSWORD=agent-pass "$AGENTD" @agent serve >"$dir/agentd.log" 2>&1 &
+    JUICE_HOME="$dir" AGENT_PASSWORD=agent-pass "$AGENTD" serve agent >"$dir/agentd.log" 2>&1 &
     local pid=$!; track "$pid"
     wait_line "$dir/agentd.log" '"event":"\(serving\)"' >/dev/null || { fail init.serving "no daemon"; cat "$dir/agentd.log" >&2; return; }
 
@@ -89,7 +89,7 @@ flow_init() {
     # An operator edit must survive a restart (init never truncates).
     printf 'INIT-MARKER-9Z\n' > "$home/persona.md"
     kill -9 "$pid" 2>/dev/null; wait "$pid" 2>/dev/null
-    JUICE_HOME="$dir" AGENT_PASSWORD=agent-pass "$AGENTD" @agent serve >"$dir/agentd2.log" 2>&1 &
+    JUICE_HOME="$dir" AGENT_PASSWORD=agent-pass "$AGENTD" serve agent >"$dir/agentd2.log" 2>&1 &
     local pid2=$!; track "$pid2"
     wait_line "$dir/agentd2.log" '"event":"\(serving\)"' >/dev/null || { fail init.restart "no daemon"; return; }
     grep -q 'INIT-MARKER-9Z' "$home/persona.md" \
@@ -134,8 +134,8 @@ flow_role_law() {
     start_kernel "$dir"; create_agent
     start_agentd "$dir" || { fail role_law.agentd "no daemon"; return; }
 
-    echo '{"to":"@agent","message":"Please reply that you acknowledge this."}' > "$dir/msg.json"
-    local sid; sid=$(kj run @sys/message "@$dir/msg.json" | python3 -c "import sys,json; print(json.load(sys.stdin)['result']['step_id'])" 2>/dev/null)
+    echo '{"to":"agent","message":"Please reply that you acknowledge this."}' > "$dir/msg.json"
+    local sid; sid=$(kj run sys/message "@$dir/msg.json" | python3 -c "import sys,json; print(json.load(sys.stdin)['result']['step_id'])" 2>/dev/null)
     assert_nonempty role_law.step_created "$sid"
 
     local deadline=$(( $(date +%s) + 300 )) st=""
@@ -148,7 +148,7 @@ flow_role_law() {
 
     local txid; txid=$(kj step show "$sid" | jfield tx_id)
     if [ -n "$txid" ]; then
-        assert_eq role_law.caller_is_agent "@agent" "$(kj tx show "$txid" | jfield caller_handle)"
+        assert_eq role_law.caller_is_agent "agent" "$(kj tx show "$txid" | jfield caller_handle)"
     else
         fail role_law.tx "step had no tx_id"
     fi
@@ -159,14 +159,14 @@ flow_step() {
     local dir; dir=$(new_dir)
     start_kernel "$dir" || { fail step.kernel "no kernel"; return; }
     create_agent
-    create_user @other other-pass
+    create_user other other-pass
     start_agentd "$dir" || { fail step.agentd "no daemon"; return; }
 
-    # A step addressed to @agent is picked up and COMPLETED by the daemon even
+    # A step addressed to the agent is picked up and COMPLETED by the daemon even
     # with no LLM: a failed loop still acks the step (waiting -> done). The
     # reply/ack rides in the completion transaction's args, readable by the sender.
-    echo '{"to":"@agent","message":"deterministic ping"}' > "$dir/m.json"
-    local sid; sid=$(kj run @sys/message "@$dir/m.json" | python3 -c "import sys,json; print(json.load(sys.stdin)['result']['step_id'])" 2>/dev/null)
+    echo '{"to":"agent","message":"deterministic ping"}' > "$dir/m.json"
+    local sid; sid=$(kj run sys/message "@$dir/m.json" | python3 -c "import sys,json; print(json.load(sys.stdin)['result']['step_id'])" 2>/dev/null)
     assert_nonempty step.created "$sid"
     local st="" deadline=$(( $(date +%s) + 30 ))
     while [ "$(date +%s)" -lt "$deadline" ]; do
@@ -177,10 +177,10 @@ flow_step() {
     args=$(kj tx show "$tx" | python3 -c 'import sys,json; print(json.dumps(json.load(sys.stdin).get("args",{})))' 2>/dev/null)
     assert_contains step.reply_in_tx_args "deterministic ping" "$args"
 
-    # A step addressed to @other is not the agent's work: the daemon leaves it
+    # A step addressed to other is not the agent's work: the daemon leaves it
     # waiting (only steps whose required caller is the agent are its to do).
-    echo '{"to":"@other","message":"not for the agent"}' > "$dir/o.json"
-    local oid; oid=$(kj run @sys/message "@$dir/o.json" | python3 -c "import sys,json; print(json.load(sys.stdin)['result']['step_id'])" 2>/dev/null)
+    echo '{"to":"other","message":"not for the agent"}' > "$dir/o.json"
+    local oid; oid=$(kj run sys/message "@$dir/o.json" | python3 -c "import sys,json; print(json.load(sys.stdin)['result']['step_id'])" 2>/dev/null)
     sleep 3 # several daemon polls
     assert_eq step.foreign_untouched waiting "$(kj step show "$oid" | jfield status)"
 }
@@ -192,7 +192,7 @@ flow_rating() {
     start_kernel "$dir"; create_agent
     start_agentd "$dir" || { fail rating.agentd "no daemon"; return; }
 
-    # A time question makes the model dispatch @sys/time, giving the post-task
+    # A time question makes the model dispatch sys/time, giving the post-task
     # rating pass a real call to grade.
     local id out; id=$(submit_http "What is the current time? Reply with an ISO-8601 timestamp." 100)
     out=$(await_http "$id") || { fail rating.await "no outcome"; return; }
@@ -254,26 +254,26 @@ flow_named() {
     echo "=== FLOW named (multiple named agents) ==="  # mechanism only, no LLM
     local dir; dir=$(new_dir)
     start_kernel "$dir"
-    create_user @alice alice-pass
-    create_user @bob bob-pass
+    create_user alice alice-pass
+    create_user bob bob-pass
     # One component-wide config.json ($JUICE_HOME/agent/config.json) supplies the
     # shared server_url; each named agent inherits it and gets its own home.
     mkdir -p "$dir/agent"
     echo "{ \"server_url\": \"$KURL\", \"memory\": {\"enabled\": false} }" > "$dir/agent/config.json"
 
-    JUICE_HOME="$dir" AGENT_PASSWORD=alice-pass "$AGENTD" @alice serve >"$dir/alice.log" 2>&1 &
+    JUICE_HOME="$dir" AGENT_PASSWORD=alice-pass "$AGENTD" serve alice >"$dir/alice.log" 2>&1 &
     track $!
-    JUICE_HOME="$dir" AGENT_PASSWORD=bob-pass "$AGENTD" @bob serve >"$dir/bob.log" 2>&1 &
+    JUICE_HOME="$dir" AGENT_PASSWORD=bob-pass "$AGENTD" serve bob >"$dir/bob.log" 2>&1 &
     track $!
     wait_line "$dir/alice.log" '"event":"\(serving\)"' >/dev/null
     wait_line "$dir/bob.log"   '"event":"\(serving\)"' >/dev/null
 
     # Each named agent logs in and serves under its own handle (distinct users on
     # one kernel; no fake per-agent actions are registered).
-    assert_contains named.alice_identity '"handle":"@alice"' "$(cat "$dir/alice.log")"
-    assert_contains named.bob_identity   '"handle":"@bob"'   "$(cat "$dir/bob.log")"
+    assert_contains named.alice_identity '"handle":"alice"' "$(cat "$dir/alice.log")"
+    assert_contains named.bob_identity   '"handle":"bob"'   "$(cat "$dir/bob.log")"
     local acts; acts=$(kj action list --all)
-    assert_not_contains named.no_fake_actions "@alice/reply" "$acts"
+    assert_not_contains named.no_fake_actions "alice/reply" "$acts"
 }
 
 flow_memory() {

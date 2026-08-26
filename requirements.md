@@ -1,6 +1,6 @@
 # Juice Agent Requirements
 
-Version: 0.1.3
+Version: 0.2.0
 Status: implementation requirements
 Codename: `juice-agent`
 
@@ -9,26 +9,33 @@ document and the design differ, this document governs the implementation. It dep
 restates, the kernel contract in `juicedocs/requirements.md` (cited as *kernel §N*); a requirement
 here must not violate one there.
 
-Revision 0.1.3 adopts the juice-family filesystem convention (§11): a fixed
-`$JUICE_HOME/agent/agents/<handle>/` home per agent (no cwd-relative or `named`/unnamed split),
-layered `config.json` in place of `agent.json`, a password precedence chain ending in an interactive
-no-echo prompt (`golang.org/x/term`), `serve` as the default action on a handle, a clean cut-over from
-the legacy layout, an always-present step channel, and creation of blank
-`persona.md`/`knowledge.md`/`memory.md` plus a dumped standard `config.json` at agent initialization
-(§9, §11). Token persistence is a deferred future item.
+Revision 0.2.0 aligns with the revised kernel contract: references and handles are bare
+(`owner/name`, `handle`) — the kernel rejects a sigil-prefixed reference at every boundary, never
+strips it, and `@` on the wire appears only in the remote form `owner@kernel/name`. The CLI carries
+no sigil either: the verb comes first and the agent's handle is the positional that follows it
+(`juice-agent serve research`, `juice-agent task research "<prompt>"`), matching the juice-family
+CLI convention; a handle carrying `@` or `/` is rejected, never stripped. Authentication is the kernel's PKCE flow
+(authorize with an S256 code challenge → code → access/refresh token pair), with the pair held in
+memory and rotated via `POST /v1/auth/refresh` on a `401`, falling back to a full re-login from the
+in-memory password. Action publication sets `visibility` (the kernel's `private`/`local`/`public`
+enum), replacing the retired `public` boolean. Revision 0.1.3 adopted the juice-family filesystem
+convention (§11): a fixed `$JUICE_HOME/agent/agents/<handle>/` home per agent, layered
+`config.json`, a password precedence chain ending in an interactive no-echo prompt
+(`golang.org/x/term`), a clean cut-over from the legacy layout, an always-present step channel, and
+blank-file initialization (§9, §11). Token persistence is a deferred future item.
 
 ## 1. Purpose and position
 
 `juice-agent` is a Go daemon implementing a general task-solving agent whose entire capability
 surface is a Juice kernel's action catalog. It is an ordinary kernel client: it authenticates as a
-registered user (its *handle*, e.g. `@agent`) and derives every agent affordance from that one fact —
-reasoning from `@sys/llm/*`, tools from the actions callable under `CanCall` (kernel §4), dispatch
+registered user (its *handle*, e.g. `agent`) and derives every agent affordance from that one fact —
+reasoning from `sys/llm/*`, tools from the actions callable under `CanCall` (kernel §4), dispatch
 from `POST /v1/run`, budget from its wallet, address from its handle, and accountability from the
 transaction role law (kernel §1).
 
 The daemon must add no agent-specific API to the kernel and require none. It must hold no model
 credentials, no API keys, and no provider adapters; the kernel is its sole external interface. Many
-named agents are one binary: `juice-agent @handle serve` launches the same binary as a distinct
+named agents are one binary: `juice-agent serve <handle>` launches the same binary as a distinct
 kernel user rooted in its own home (§9), and agents compose only through the kernel, never through a
 private protocol.
 
@@ -92,7 +99,7 @@ run(task):
   cands = always ∪ Catalog.Lookup(task.prompt, k)          # seed the working set
   loop:
     inject queued steering messages                         # polled before every model call
-    sel = Decider.Decide(messages, candidates, tools)       # ONE @sys/llm/chat round-trip, JSON extracted
+    sel = Decider.Decide(messages, candidates, tools)       # ONE sys/llm/chat round-trip, JSON extracted
     if sel is error:  fail after MaxDecideErrors consecutive # policy layer retries transport errors only
     if sel.action == ReplyTool:   return answered(sel.args)  # THE STOP RULE — nothing dispatched
     if repeat-guard trips (§6):   drop, nudge, re-query
@@ -103,11 +110,11 @@ run(task):
     if turns == MaxTurns: fail(turn-cap)
 ```
 
-**Turn primitive.** A turn is exactly one `@sys/llm/chat` call over the transcript plus a tool list
+**Turn primitive.** A turn is exactly one `sys/llm/chat` call over the transcript plus a tool list
 the client builds itself: the catalog candidates (each rendered with description, price, stats, and a
 compact schema, §8) followed by the plain-named harness tools. The model must reply with a single
 JSON object `{action, args}`, extracted client-side by a balanced-brace parser. The loop must **not**
-use `@sys/llm/decide`: it accepts only `@owner/name` references (so plain-named harness tools could
+use `sys/llm/decide`: it accepts only `owner/name` references (so plain-named harness tools could
 not be candidates) and its grammar-constrained output corrupts copied strings on Ollama (measured).
 Validation splits by tool kind: harness-tool args get a required-keys check in-harness; catalog args
 are validated kernel-side at dispatch (`POST /v1/run`), and a schema violation is fed back to the
@@ -121,12 +128,12 @@ it pops the frame (§5). The reply tool is never dispatched and nothing is regis
 **Harness tools are not catalog rows.** `reply`, `publish`, and `subtask` are plain-named
 affordances the daemon offers and intercepts; they must **not** be registered on the platform, so
 the catalog stays a truthful registry of real capabilities. Harness-tool names contain no `/`, so
-they are unambiguous against `@owner/name` action references. Each carries a schema only to
+they are unambiguous against `owner/name` action references. Each carries a schema only to
 standardise the args the model supplies. The loop keeps an intrinsics table keyed by tool name;
 adding an agent-native capability is a table entry plus a `Tool` definition, with no platform
 registration and no artifact.
 
-**Discovery is in-band.** `@sys/lookup` (`Config.LookupAction`) is a permanent candidate. The model
+**Discovery is in-band.** `sys/lookup` (`Config.LookupAction`) is a permanent candidate. The model
 expands its own tool set by selecting it; the harness runs it as an ordinary call and merges the
 results into the working set, bounded by `candidate_limit` and evicted by value (§8). The working set
 is per-task and starts fresh each run.
@@ -192,7 +199,7 @@ startup whose transcript lacks a terminal record is marked `interrupted` — the
 the kernel's `reason = interrupted` recovery (kernel §5). Recovery must be idempotent.
 
 **Compaction.** When a transcript nears `compact_bytes`, older turns are replaced by a summary
-written by `@sys/llm/chat` (fixed template: Goal / Constraints / Progress / Key Decisions / Next
+written by `sys/llm/chat` (fixed template: Goal / Constraints / Progress / Key Decisions / Next
 Steps / Critical Context), keeping a recent tail verbatim and cutting only at turn boundaries. The
 kernel reports no token usage, so the trigger is a configurable byte budget.
 
@@ -204,7 +211,7 @@ with the choice. When the working set exceeds `candidate_limit`, the lowest-valu
 evicted (Laplace-smoothed success rate + rating prior; unknown ≈ neutral).
 
 **Rating pass.** After a task ends — in the policy layer, never in the loop, mirroring the kernel law
-that execution must not rate (kernel §1) — one `@sys/llm/json` call judges each dispatched call over
+that execution must not rate (kernel §1) — one `sys/llm/json` call judges each dispatched call over
 the finished transcript, and the agent posts `rating ∈ {0,1}` plus a one-line note per transaction
 (`POST /v1/transactions/{id}/rate`). A kernel-failed call is a mechanical `0`; duplicate ratings are
 skipped. The agent is `owner_user_id` of every call it makes, so it is the rightful rater (kernel
@@ -212,9 +219,9 @@ skipped. The agent is `owner_user_id` of every call it makes, so it is the right
 
 **Self-extension (the maker).** The agent may publish actions. It keeps a legible task index under
 the data dir (prompt, outcome, spent, actions used). After a task, when ≥`min_repeats` semantically
-similar prompts (cosine over `@sys/llm/embed`) have recurred within `window` **and** no catalog
-action covers them well (a `@sys/lookup` score below `threshold`), a synthesis task is enqueued to
-the agent itself. Synthesis runs the ordinary loop with `@sys/tinygo/compile` and the `publish`
+similar prompts (cosine over `sys/llm/embed`) have recurred within `window` **and** no catalog
+action covers them well (a `sys/lookup` score below `threshold`), a synthesis task is enqueued to
+the agent itself. Synthesis runs the ordinary loop with `sys/tinygo/compile` and the `publish`
 harness tool available. `publish` is a transactional publish: create private → enable → run declared
 `test_inputs` → make public on pass, or delete and return diagnostics on fail. Once published,
 future repetitions find the new action through ordinary lookup. Gated by `maker.enabled` (default
@@ -232,7 +239,7 @@ greppable, diffable, hand-editable), differing only in authorship:
 
 All three are fixed filenames (never operator-configurable, per the family convention, §11) and live
 in the **agent home**, `$JUICE_HOME/agent/agents/<handle>/`, which also holds `config.json` and `data/`.
-`juice-agent @research serve` resolves this home, so a differently-behaved agent is a directory, not
+`juice-agent serve research` resolves this home, so a differently-behaved agent is a directory, not
 new code.
 
 **Initialization.** The first time an agent is launched, the daemon creates its home (§11) and
@@ -245,7 +252,7 @@ truncated. An empty authored file contributes nothing to the system prompt (equi
 message — role line + `persona.md` + `knowledge.md` + `memory.md` digest + the operating contract —
 and prepends it. The loop is unchanged; it receives messages and never knows a prompt exists.
 
-**Learned memory.** After a task settles (alongside the rating pass), one `@sys/llm/chat` call
+**Learned memory.** After a task settles (alongside the rating pass), one `sys/llm/chat` call
 summarises what the agent did and learned into a dated `memory.md` entry; the next task loads
 `memory.md` into the system prompt. The update is best-effort and must never fail the task.
 `memory.md` is bounded by `memory_bytes`; over budget, the oldest entries fold into a digest.
@@ -268,10 +275,10 @@ The loop must never know which channel a task came from. Only enabled channels r
 configuration, not architecture. Implementations:
 
 - `step` — kernel-native: poll `GET /v1/steps?status=waiting` for steps addressed to the agent
-  (`required_caller = @handle`); the step's `partial_args` carry the request; completing the step
-  delivers the outcome under the role law (kernel §10). This makes `@sys/message` and any other agent
+  (`required_caller = handle`); the step's `partial_args` carry the request; completing the step
+  delivers the outcome under the role law (kernel §10). This makes `sys/message` and any other agent
   an input with zero pairwise integration.
-- `service` — a dedicated notification-driven service (e.g. juice-ui `@chat`): the generic `Service`
+- `service` — a dedicated notification-driven service (e.g. juice-ui `chat`): the generic `Service`
   driver polls the service's notification steps, reads each conversation's new messages, runs the loop,
   posts the reply, and completes the step (at-least-once via a persisted read cursor), with a
   per-(session, sender) loop guard. A channel supplies only its read/post/ack actions, session key, and
@@ -283,7 +290,7 @@ configuration, not architecture. Implementations:
   `window_seconds` trips a `cooldown_seconds` pause; omitted numbers default to `20 / 60s / 60s`.
 - `http` — Juice-independent: a local HTTP endpoint accepting tasks directly, enabled only when
   `channels.http.addr` is non-empty.
-- `cli` — a one-shot dev surface (`juice-agent task "<prompt>"`), needing no channel; it runs one
+- `cli` — a one-shot dev surface (`juice-agent task <handle> "<prompt>"`), needing no channel; it runs one
   task and prints the outcome as JSON.
 
 **Adding a channel.** Create a subpackage `channels/<name>/` (importing `agent` + `channels`, never
@@ -323,7 +330,7 @@ Requirements, mirroring the convention:
 1. The root is `$JUICE_HOME` (default `~/.juice`); all state is under `$JUICE_HOME/agent/`.
 2. **Fixed default, never cwd-relative** — the agent attaches to the same state wherever it is
    launched from. There is no `named`/unnamed distinction and no cwd fallback: the default handle
-   `@agent` lives at `$JUICE_HOME/agent/agents/agent/` like every other agent.
+   `agent` lives at `$JUICE_HOME/agent/agents/agent/` like every other agent.
 3. The daemon `MkdirAll`s the agent home and its `data/` (mode `0700`) at startup, before any write,
    and provisions the home if absent: blank `persona.md`/`knowledge.md`/`memory.md` (§9) and a
    standard `config.json` (§below). Provisioning never truncates an existing file.
@@ -341,8 +348,9 @@ Requirements, mirroring the convention:
 
 ### Handle, config, and secrets
 
-The handle is the CLI `@handle` arg, else `AGENT_HANDLE`, else the default `@agent` — it is the home
-directory's name, not a config key. Config is layered: the component-level
+The handle is the positional argument following the verb, else `AGENT_HANDLE`, else the default
+`agent` — it is the home directory's name, not a config key. Handles are bare everywhere: a value
+carrying `@` or `/` is rejected with an error, never stripped, as on the kernel. Config is layered: the component-level
 `$JUICE_HOME/agent/config.json` supplies host-wide defaults (e.g. `server_url`), and the per-agent
 `$JUICE_HOME/agent/agents/<handle>/config.json` overrides them key-by-key (a merge, not a wholesale
 replace) — a self-contained agent is one directory, and shared keys are written once. Both files use
@@ -367,18 +375,19 @@ project's single third-party dependency):
 4. **interactive no-echo TTY prompt** — used only when none of the above is set and stdin is a
    terminal; a `serve` launched without a TTY (systemd) therefore requires 1–3.
 
-**Token persistence is deferred.** A running daemon already re-authenticates itself on token expiry
-from the in-memory password (the client renews the bearer token on any `401`), so password-at-start
-suffices for the process lifetime; it is re-supplied only on restart, for which the non-interactive
-sources cover unattended operation. A `tokens/` store that would let a manual restart skip the prompt
-is a documented future item (it requires kernel-issued refresh tokens the client does not yet consume)
-and is not built.
+**Token persistence is deferred.** The client authenticates over the kernel's PKCE flow and holds
+the resulting access/refresh token pair in memory only. On a `401` it first rotates the pair via
+`POST /v1/auth/refresh`, and falls back to a full re-login from the in-memory password when the
+refresh token is absent or revoked — so password-at-start suffices for the process lifetime, and it
+is re-supplied only on restart, for which the non-interactive sources cover unattended operation. A
+`tokens/` store that would persist the refresh token across restarts (letting a manual restart skip
+the prompt) is a documented future item and is not built.
 
 ### Lifecycle
 
-`juice-agent @handle` runs the daemon: `serve` is the default action when a handle is given with no
-subcommand (so `juice-agent @research` serves), `serve`/`task`/`bench`/`version` remain explicit, and
-a bare `juice-agent` with no handle and no command prints usage. Serving resolves the agent home from
+`juice-agent serve [handle]` runs the daemon: the verb always comes first, and the handle is the
+positional after it (`task` and `bench` take it as their first positional, the prompt or suite
+second). A bare `juice-agent` with no command prints usage. Serving resolves the agent home from
 the handle → creates the home and blank files if absent → loads layered config → authenticates
 (password by the chain above; re-login on revocation) → assembles the executor and the system prompt →
 runs startup recovery (mark interrupted tasks) → starts the enabled channels and the worker pool.
@@ -402,11 +411,11 @@ removes the binary only and never `$JUICE_HOME`.
 | `max_repeats`      | `3`                    | agent | consecutive repeats before hard-stop (§6); `< 0` disables                      |
 | `concurrency`      | `4`                    | agent | worker-pool size                                                              |
 | `candidate_limit`  | `24`                   | agent | working-set cap (value-evicted)                                              |
-| `lookup_limit`     | `8`                    | agent | results per `@sys/lookup`                                                     |
+| `lookup_limit`     | `8`                    | agent | results per `sys/lookup`                                                     |
 | `compact_bytes`    | `262144`               | agent | transcript byte budget triggering compaction (§7)                             |
 | `rate_tasks`       | `true`                 | agent | run the post-task rating pass (§8)                                            |
 | `maker`            | `{enabled:false, min_repeats:3, window:50, budget:40, threshold:0.85}` | agent | self-extension trigger (§8)       |
-| `channels`         | step always on         | agent | `step {poll_seconds}` (always present, §11 rule 6), optional `http {addr}`, and optional `chat {enabled, poll_seconds, context_messages, loop{enabled, max_events, window_seconds, cooldown_seconds}}` (the juice-ui @chat channel) |
+| `channels`         | step always on         | agent | `step {poll_seconds}` (always present, §11 rule 6), optional `http {addr}`, and optional `chat {enabled, poll_seconds, context_messages, loop{enabled, max_events, window_seconds, cooldown_seconds}}` (the juice-ui chat channel) |
 
 `handle`, `data_dir`, and the persona/knowledge/memory filenames are not config keys: the handle is
 the home directory's name (CLI arg / `AGENT_HANDLE`), `data_dir` is derived as `<home>/data`, and the
@@ -437,22 +446,26 @@ assembly, the byte-bounded memory update, the rating pass, and the maker trigger
 filesystem contract: `JUICE_HOME`-rooted home resolution (fixed, never cwd-relative), layered
 config (component defaults overridden per agent), the guaranteed step channel, the password
 precedence chain, idempotent home creation at mode 0700, blank-file and standard-`config.json`
-initialization that never truncates an existing file, and clean-cut-over legacy detection. `juice` is
-tested against `httptest` kernels. Every production file has its `_test.go`.
+initialization that never truncates an existing file, clean-cut-over legacy detection, and handle
+resolution — the positional after the verb, else `AGENT_HANDLE`, else `agent`, with a value carrying
+`@` or `/` rejected from either source. `juice` is tested against `httptest` kernels, including the
+PKCE handshake (the fake verifies the challenge is `S256(verifier)`), token rotation on a `401`, the
+fall back to a full re-login when the refresh token is revoked, `visibility` on publication, and the
+rejection of a sigil-prefixed action ref. Every production file has its `_test.go`.
 
 **Flows (`flows/`).** End-to-end shell scripts against the compiled binary, booting a real
 `juice serve` on a temp DB with the **real Ollama the kernel ships with** (no fake model). Mechanism
-flows (`bootstrap`, `init`, `recovery`, `drain`) touch no model and are deterministic — `init` asserts
-that a first launch under a temp `JUICE_HOME` creates `$JUICE_HOME/agent/agents/<handle>/` with blank
-`persona.md`/`knowledge.md`/`memory.md` and a dumped `config.json` carrying a step channel, and leaves
-pre-existing files untouched on relaunch. LLM
-flows (`task`,
-`role_law`, `rating`, `maker`, `persona`, `named`, `memory`) assert robust structural properties, not
-exact model text, and skip (never fail) when the chat model is absent. The budget and turn-cap rails
+flows (`bootstrap`, `init`, `recovery`, `drain`, `step`, `named`) touch no model and are
+deterministic — `init` asserts that a first launch under a temp `JUICE_HOME` creates
+`$JUICE_HOME/agent/agents/<handle>/` with blank `persona.md`/`knowledge.md`/`memory.md` and a dumped
+`config.json` carrying a step channel, and leaves pre-existing files untouched on relaunch; `named`
+asserts two agents serve as distinct kernel users. LLM flows (`task`, `persona`, `rating`,
+`role_law`, `memory`, `maker`) assert robust structural properties, not exact model text, and skip
+(never fail) when the chat model is absent. The budget and turn-cap rails
 are code invariants proven by `go test ./agent`; the flows assert the surviving invariant (spend
 never exceeds budget). Nothing is committed until unit tests and flows pass.
 
-**Experiments (`bench/`) — excluded from `go test ./...`.** `juice-agent bench <suite.json> [N]`
+**Experiments (`bench/`) — excluded from `go test ./...`.** `juice-agent bench <handle> <suite.json> [N]`
 runs a versioned, immutable task suite (id, prompt, budget, machine-checkable success criterion)
 against a live kernel + real LLM, N repetitions per task (default 5). Per-task metrics: success rate,
 mean credits (read from the ledger), mean latency, mean turns. One JSON report per run — keyed by

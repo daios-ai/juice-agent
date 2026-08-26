@@ -63,7 +63,7 @@ func replyIntrinsics() map[string]agent.Intrinsic {
 func TestExecutorRunsRatesAndRecordsOutcome(t *testing.T) {
 	dir := t.TempDir()
 	k := &fakeKernel{script: []agent.Selection{
-		{Action: "@sys/time"},
+		{Action: "sys/time"},
 		{Action: "reply", Args: map[string]any{"answer": "noon"}},
 	}}
 	e := &Executor{
@@ -72,8 +72,8 @@ func TestExecutorRunsRatesAndRecordsOutcome(t *testing.T) {
 		Retry:   RetryPolicy{MaxRetries: 0},
 		RetryOK: func(error) bool { return false },
 		Loop: agent.Config{
-			ReplyTool: "reply", LookupAction: "@sys/lookup",
-			Always: []agent.Candidate{{Ref: "@sys/lookup"}}, MaxTurns: 10, Intrinsics: replyIntrinsics(),
+			ReplyTool: "reply", LookupAction: "sys/lookup",
+			Always: []agent.Candidate{{Ref: "sys/lookup"}}, MaxTurns: 10, Intrinsics: replyIntrinsics(),
 		},
 		RateTasks: true,
 	}
@@ -87,9 +87,9 @@ func TestExecutorRunsRatesAndRecordsOutcome(t *testing.T) {
 	if out.Status != agent.StatusAnswered || out.Answer["answer"] != "noon" {
 		t.Fatalf("outcome = %+v", out)
 	}
-	// The dispatched @sys/time call must have been rated.
-	if k.rated["tx-@sys/time"] != 1 {
-		t.Fatalf("expected @sys/time rated 1, got %v", k.rated)
+	// The dispatched sys/time call must have been rated.
+	if k.rated["tx-sys/time"] != 1 {
+		t.Fatalf("expected sys/time rated 1, got %v", k.rated)
 	}
 	// The transcript file must end with a terminal outcome record.
 	data, _ := os.ReadFile(filepath.Join(dir, "t1.jsonl"))
@@ -106,7 +106,7 @@ func TestExecutorEnqueuesMakerSynthesis(t *testing.T) {
 	var enqueued []agent.Task
 	e := &Executor{
 		Kernel: k, DataDir: dir, RetryOK: func(error) bool { return false },
-		Loop: agent.Config{ReplyTool: "reply", LookupAction: "@sys/lookup",
+		Loop: agent.Config{ReplyTool: "reply", LookupAction: "sys/lookup",
 			MaxTurns: 5, Intrinsics: replyIntrinsics()},
 		Maker:   maker,
 		Enqueue: func(tk agent.Task) { enqueued = append(enqueued, tk) },
@@ -179,7 +179,7 @@ func TestRetryRunnerRetriesTransport(t *testing.T) {
 	r := &flakyRunner{failN: 1}
 	wrapped := retryRunner{inner: r, policy: RetryPolicy{MaxRetries: 3, BaseDelay: time.Millisecond},
 		retryOK: alwaysRetry, sleep: func(time.Duration) {}}
-	if _, err := wrapped.Run(context.Background(), "@x", nil); err != nil {
+	if _, err := wrapped.Run(context.Background(), "x", nil); err != nil {
 		t.Fatalf("expected success, got %v", err)
 	}
 	if r.calls != 2 {
@@ -233,7 +233,7 @@ func bracketExecutor(dir string) *Executor {
 		DataDir: dir,
 		RetryOK: func(error) bool { return false },
 		Loop: agent.Config{
-			ReplyTool: "reply", SubtaskTool: "subtask", LookupAction: "@sys/lookup", MaxTurns: 10,
+			ReplyTool: "reply", SubtaskTool: "subtask", LookupAction: "sys/lookup", MaxTurns: 10,
 			Tools: []agent.Tool{
 				{Name: "reply", InputSchema: map[string]any{"type": "object", "required": []any{"answer"}}},
 				{Name: "subtask", InputSchema: map[string]any{"type": "object", "required": []any{"instruction"}}},

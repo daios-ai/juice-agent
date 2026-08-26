@@ -12,14 +12,14 @@ func TestConvStoreSeedAndAppend(t *testing.T) {
 	if got := c.seed("r1"); got != nil {
 		t.Fatalf("empty seed = %v, want nil", got)
 	}
-	c.append("r1", "@alice: capital of France?", "Paris.")
-	c.append("r1", "@alice: and its population?", "About 2.1 million.")
+	c.append("r1", "alice: capital of France?", "Paris.")
+	c.append("r1", "alice: and its population?", "About 2.1 million.")
 
 	got := c.seed("r1")
 	want := []agent.Message{
-		{Role: agent.RoleUser, Content: "@alice: capital of France?"},
+		{Role: agent.RoleUser, Content: "alice: capital of France?"},
 		{Role: agent.RoleAssistant, Content: "Paris."},
-		{Role: agent.RoleUser, Content: "@alice: and its population?"},
+		{Role: agent.RoleUser, Content: "alice: and its population?"},
 		{Role: agent.RoleAssistant, Content: "About 2.1 million."},
 	}
 	if len(got) != len(want) {

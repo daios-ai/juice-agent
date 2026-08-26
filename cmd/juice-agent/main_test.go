@@ -29,7 +29,7 @@ func TestLoggerEmitsStructuredJSON(t *testing.T) {
 	old := os.Stderr
 	os.Stderr = w
 	l := newLogger()
-	l.event("dispatch", map[string]any{"action": "@sys/time", "price": 0})
+	l.event("dispatch", map[string]any{"action": "sys/time", "price": 0})
 	w.Close()
 	os.Stderr = old
 
@@ -39,7 +39,7 @@ func TestLoggerEmitsStructuredJSON(t *testing.T) {
 	if err := json.Unmarshal(buf.Bytes(), &rec); err != nil {
 		t.Fatalf("log line not valid JSON: %v (%q)", err, buf.String())
 	}
-	if rec["event"] != "dispatch" || rec["action"] != "@sys/time" {
+	if rec["event"] != "dispatch" || rec["action"] != "sys/time" {
 		t.Fatalf("log record = %v", rec)
 	}
 	if _, ok := rec["time"]; !ok {
@@ -56,7 +56,7 @@ func TestResolvePasswordStdinFlag(t *testing.T) {
 	w.WriteString("s3cret\n")
 	w.Close()
 
-	pw, err := resolvePassword("@agent", true)
+	pw, err := resolvePassword("agent", true)
 	if err != nil {
 		t.Fatalf("stdin password: %v", err)
 	}
@@ -68,7 +68,7 @@ func TestResolvePasswordStdinFlag(t *testing.T) {
 func TestResolvePasswordEnvAndFile(t *testing.T) {
 	t.Setenv("AGENT_PASSWORD_FILE", "")
 	t.Setenv("AGENT_PASSWORD", "from-env")
-	if pw, err := resolvePassword("@agent", false); err != nil || pw != "from-env" {
+	if pw, err := resolvePassword("agent", false); err != nil || pw != "from-env" {
 		t.Fatalf("env password = %q err=%v", pw, err)
 	}
 
@@ -77,7 +77,7 @@ func TestResolvePasswordEnvAndFile(t *testing.T) {
 	f := filepath.Join(t.TempDir(), "pw")
 	os.WriteFile(f, []byte("  from-file\n"), 0o600)
 	t.Setenv("AGENT_PASSWORD_FILE", f)
-	if pw, err := resolvePassword("@agent", false); err != nil || pw != "from-file" {
+	if pw, err := resolvePassword("agent", false); err != nil || pw != "from-file" {
 		t.Fatalf("file password = %q err=%v", pw, err)
 	}
 }
@@ -87,7 +87,7 @@ func TestResolvePasswordNoSourceNonTTYErrors(t *testing.T) {
 	// resolution must fail rather than block.
 	t.Setenv("AGENT_PASSWORD", "")
 	t.Setenv("AGENT_PASSWORD_FILE", "")
-	if _, err := resolvePassword("@agent", false); err == nil {
+	if _, err := resolvePassword("agent", false); err == nil {
 		t.Fatal("expected an error when no password source is available")
 	}
 }

@@ -31,7 +31,7 @@ func publishTool() agent.Tool {
 			"properties": map[string]any{
 				"name":          map[string]any{"type": "string", "description": "kebab-case action name"},
 				"description":   map[string]any{"type": "string", "description": "what the action does"},
-				"artifact":      map[string]any{"type": "string", "description": "base64 WASM artifact from @sys/tinygo/compile"},
+				"artifact":      map[string]any{"type": "string", "description": "base64 WASM artifact from sys/tinygo/compile"},
 				"input_schema":  map[string]any{"type": "object", "description": "the action's input schema"},
 				"output_schema": map[string]any{"type": "object", "description": "the action's output schema"},
 				"test_inputs":   map[string]any{"type": "array", "description": "distinct inputs to validate before publishing", "items": map[string]any{"type": "object"}},
@@ -41,12 +41,12 @@ func publishTool() agent.Tool {
 	}
 }
 
-// lookupCandidate is @sys/lookup as an always-offered catalog candidate, so the
+// lookupCandidate is sys/lookup as an always-offered catalog candidate, so the
 // agent can always search even before its first lookup.
 func lookupCandidate() agent.Candidate {
 	return agent.Candidate{
-		Ref:         "@sys/lookup",
-		Description: "Semantic search over active actions; returns matching @owner/name actions",
+		Ref:         "sys/lookup",
+		Description: "Semantic search over active actions; returns matching owner/name actions",
 		Price:       0,
 		InputSchema: map[string]any{
 			"type":       "object",

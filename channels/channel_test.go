@@ -7,12 +7,13 @@ func TestSameHandle(t *testing.T) {
 		a, b string
 		want bool
 	}{
-		{"@agent", "@agent", true},
-		{"@agent", "agent", true}, // leading @ is optional on either side
-		{"agent", "@agent", true},
-		{"@agent", "@alice", false},
+		{"agent", "agent", true},
+		{"agent", "alice", false},
+		// Handles are bare everywhere; a stray sigil is a different string, never
+		// stripped (kernel contract).
+		{"@agent", "agent", false},
 		{"", "", true},
-		{"@a", "@ab", false},
+		{"a", "ab", false},
 	}
 	for _, c := range cases {
 		if got := SameHandle(c.a, c.b); got != c.want {

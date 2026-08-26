@@ -19,11 +19,11 @@ func setJuiceHome(t *testing.T) string {
 
 func TestResolveConfigDefaultsWhenNoFiles(t *testing.T) {
 	root := setJuiceHome(t)
-	cfg, err := ResolveConfig("@research")
+	cfg, err := ResolveConfig("research")
 	if err != nil {
 		t.Fatalf("resolve: %v", err)
 	}
-	if cfg.Handle != "@research" {
+	if cfg.Handle != "research" {
 		t.Fatalf("handle = %q", cfg.Handle)
 	}
 	wantHome := filepath.Join(root, "agent", "agents", "research")
@@ -45,7 +45,7 @@ func TestResolveConfigDefaultsWhenNoFiles(t *testing.T) {
 func TestResolveConfigAlwaysHasStepChannel(t *testing.T) {
 	setJuiceHome(t)
 	// No config files at all — the step channel must still be present.
-	cfg, err := ResolveConfig("@research")
+	cfg, err := ResolveConfig("research")
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -59,19 +59,39 @@ func TestResolveConfigAlwaysHasStepChannel(t *testing.T) {
 
 func TestResolveHandlePrecedence(t *testing.T) {
 	setJuiceHome(t)
-	// CLI arg wins.
-	if got := resolveHandle("@cli"); got != "@cli" {
-		t.Fatalf("cli precedence = %q", got)
+	// The handle argument wins.
+	if got, err := resolveHandle("cli"); err != nil || got != "cli" {
+		t.Fatalf("arg precedence = %q, %v", got, err)
 	}
 	// Else AGENT_HANDLE.
-	t.Setenv("AGENT_HANDLE", "@env")
-	if got := resolveHandle(""); got != "@env" {
-		t.Fatalf("env precedence = %q", got)
+	t.Setenv("AGENT_HANDLE", "env")
+	if got, err := resolveHandle(""); err != nil || got != "env" {
+		t.Fatalf("env precedence = %q, %v", got, err)
 	}
 	// Else default.
 	t.Setenv("AGENT_HANDLE", "")
-	if got := resolveHandle(""); got != "@agent" {
-		t.Fatalf("default = %q", got)
+	if got, err := resolveHandle(""); err != nil || got != "agent" {
+		t.Fatalf("default = %q, %v", got, err)
+	}
+}
+
+func TestResolveHandleRejectsSigilAndSlash(t *testing.T) {
+	setJuiceHome(t)
+	// Handles are bare: a sigil or a slash is an error, never stripped.
+	for _, bad := range []string{"@research", "sys/lookup", "a@b"} {
+		if _, err := resolveHandle(bad); err == nil {
+			t.Fatalf("resolveHandle(%q) must be rejected", bad)
+		}
+	}
+	// The same rule applies to AGENT_HANDLE.
+	t.Setenv("AGENT_HANDLE", "@env")
+	if _, err := resolveHandle(""); err == nil {
+		t.Fatal("AGENT_HANDLE with a sigil must be rejected")
+	}
+	// And it surfaces through ResolveConfig.
+	t.Setenv("AGENT_HANDLE", "")
+	if _, err := ResolveConfig("@research"); err == nil {
+		t.Fatal("ResolveConfig must reject a sigil-prefixed handle")
 	}
 }
 
@@ -89,7 +109,7 @@ func TestResolveConfigLayeredMerge(t *testing.T) {
 	os.WriteFile(filepath.Join(home, "config.json"),
 		[]byte(`{"max_turns":7,"maker":{"enabled":true}}`), 0o644)
 
-	cfg, err := ResolveConfig("@triage")
+	cfg, err := ResolveConfig("triage")
 	if err != nil {
 		t.Fatalf("resolve: %v", err)
 	}
@@ -115,14 +135,14 @@ func TestResolveConfigMalformedIsError(t *testing.T) {
 		t.Fatal(err)
 	}
 	os.WriteFile(filepath.Join(home, "config.json"), []byte(`{ not json`), 0o644)
-	if _, err := ResolveConfig("@agent"); err == nil {
+	if _, err := ResolveConfig("agent"); err == nil {
 		t.Fatal("malformed config.json should be a startup error")
 	}
 }
 
 func TestEnsureHomeCreatesDirAndBlankFiles(t *testing.T) {
 	setJuiceHome(t)
-	cfg, err := ResolveConfig("@research")
+	cfg, err := ResolveConfig("research")
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -152,7 +172,7 @@ func TestEnsureHomeCreatesDirAndBlankFiles(t *testing.T) {
 
 func TestEnsureHomeDumpsStandardConfigWithStep(t *testing.T) {
 	setJuiceHome(t)
-	cfg, err := ResolveConfig("@research")
+	cfg, err := ResolveConfig("research")
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -186,7 +206,7 @@ func TestEnsureHomeDumpsStandardConfigWithStep(t *testing.T) {
 
 func TestEnsureHomeIsIdempotentAndNonTruncating(t *testing.T) {
 	setJuiceHome(t)
-	cfg, err := ResolveConfig("@research")
+	cfg, err := ResolveConfig("research")
 	if err != nil {
 		t.Fatal(err)
 	}

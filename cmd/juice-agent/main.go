@@ -34,38 +34,25 @@ var (
 )
 
 func main() {
-	args := os.Args[1:]
-	// An optional leading @handle names the agent to launch: `juice-agent @research`.
-	handle := ""
-	if len(args) > 0 && strings.HasPrefix(args[0], "@") {
-		handle = args[0]
-		args = args[1:]
-	}
 	// --password-stdin may appear anywhere; extract it before subcommand dispatch.
 	stdinPass := false
-	args = extractFlag(args, "--password-stdin", &stdinPass)
+	args := extractFlag(os.Args[1:], "--password-stdin", &stdinPass)
 
-	// serve is the default action when a handle is given with no subcommand, so
-	// `juice-agent @research` runs the daemon. A bare invocation prints usage.
-	cmd, rest := "", []string(nil)
+	// The verb comes first; the agent's handle is the positional that follows it.
 	if len(args) == 0 {
-		if handle == "" {
-			usage()
-			os.Exit(2)
-		}
-		cmd = "serve"
-	} else {
-		cmd, rest = args[0], args[1:]
+		usage()
+		os.Exit(2)
 	}
+	cmd, rest := args[0], args[1:]
 
 	var err error
 	switch cmd {
 	case "serve":
-		err = runServe(rest, handle, stdinPass)
+		err = runServe(rest, stdinPass)
 	case "task":
-		err = runTask(rest, handle, stdinPass)
+		err = runTask(rest, stdinPass)
 	case "bench":
-		err = runBench(rest, handle, stdinPass)
+		err = runBench(rest, stdinPass)
 	case "version", "--version", "-v":
 		fmt.Printf("juice-agent %s (%s)\n", version, commit)
 		return
@@ -96,14 +83,14 @@ func extractFlag(args []string, name string, set *bool) []string {
 
 func usage() {
 	fmt.Fprintln(os.Stderr, `usage:
-  juice-agent @handle                         run the daemon as that agent (serve is the default)
-  juice-agent [@handle] serve                 run the daemon (channels + worker pool)
-  juice-agent [@handle] task "<prompt>"       run one task and print its outcome
-  juice-agent [@handle] bench <suite.json>    run the experiment suite and write a report
+  juice-agent serve [handle]                  run the daemon (channels + worker pool)
+  juice-agent task <handle> "<prompt>"        run one task and print its outcome
+  juice-agent bench <handle> <suite.json>     run the experiment suite and write a report
+  juice-agent version                         print version and commit
 
-Each agent lives in its own home under $JUICE_HOME/agent/<handle>/ (JUICE_HOME default ~/.juice),
-holding config.json, persona.md, knowledge.md, memory.md, and data/. The handle is the @handle arg,
-else AGENT_HANDLE, else @agent.
+Each agent lives in its own home under $JUICE_HOME/agent/agents/<handle>/ (JUICE_HOME default
+~/.juice), holding config.json, persona.md, knowledge.md, memory.md, and data/. Handles are bare;
+serve takes it as its argument, else AGENT_HANDLE, else agent.
 password (in precedence order): --password-stdin, AGENT_PASSWORD, AGENT_PASSWORD_FILE, or an
 interactive prompt when run in a terminal.`)
 }
@@ -151,7 +138,7 @@ func setup(ctx context.Context, log *logger, cliHandle string, stdinPass bool) (
 	loopCfg := agent.Config{
 		ReplyTool:      "reply",
 		SubtaskTool:    "subtask",
-		LookupAction:   "@sys/lookup",
+		LookupAction:   "sys/lookup",
 		Tools:          []agent.Tool{replyTool(), subtaskTool(), publishTool()},
 		Always:         []agent.Candidate{lookupCandidate()},
 		MaxTurns:       cfg.MaxTurns,
@@ -184,7 +171,12 @@ func setup(ctx context.Context, log *logger, cliHandle string, stdinPass bool) (
 	return exec, cl, loopCfg, cfg, nil
 }
 
-func runServe(_ []string, handle string, stdinPass bool) error {
+// runServe serves as args[0], or as the default agent when no handle is given.
+func runServe(args []string, stdinPass bool) error {
+	handle := ""
+	if len(args) > 0 {
+		handle = args[0]
+	}
 	log := newLogger()
 	runCtx, cancel := context.WithCancel(context.Background())
 	defer cancel()
@@ -220,10 +212,12 @@ func runServe(_ []string, handle string, stdinPass bool) error {
 	return nil
 }
 
-func runTask(args []string, handle string, stdinPass bool) error {
-	if len(args) < 1 || strings.TrimSpace(args[0]) == "" {
-		return fmt.Errorf("usage: juice-agent task \"<prompt>\"")
+// runTask runs one task as args[0] with the prompt in args[1].
+func runTask(args []string, stdinPass bool) error {
+	if len(args) < 2 || strings.TrimSpace(args[1]) == "" {
+		return fmt.Errorf(`usage: juice-agent task <handle> "<prompt>"`)
 	}
+	handle, prompt := args[0], args[1]
 	log := newLogger()
 	ctx := context.Background()
 	exec, _, _, cfg, err := setup(ctx, log, handle, stdinPass)
@@ -234,7 +228,7 @@ func runTask(args []string, handle string, stdinPass bool) error {
 		ID:       "cli-" + time.Now().Format("20060102-150405"),
 		Channel:  "cli",
 		Budget:   cfg.DefaultBudget,
-		Messages: []agent.Message{{Role: agent.RoleUser, Content: args[0]}},
+		Messages: []agent.Message{{Role: agent.RoleUser, Content: prompt}},
 	}
 	out, err := exec.Execute(ctx, task, nil)
 	if err != nil {
@@ -247,7 +241,7 @@ func runTask(args []string, handle string, stdinPass bool) error {
 
 // chatHandle is the sender the chat channel claims; the generic step channel
 // excludes it so the two partition the agent's steps without overlap.
-const chatHandle = "@chat"
+const chatHandle = "chat"
 
 // buildChannels constructs the enabled intake surfaces from config. One
 // kernelAdapter is the single kernel bridge shared by every channel: the step

@@ -14,7 +14,7 @@ import (
 )
 
 // Embedder produces embedding vectors (for repetition detection). Implemented
-// by the juice client over @sys/llm/embed.
+// by the juice client over sys/llm/embed.
 type Embedder interface {
 	Embed(ctx context.Context, text string) ([]float64, error)
 }
@@ -135,7 +135,7 @@ func (m *Maker) countSimilarLocked(rec taskRecord) int {
 func (m *Maker) synthesisTask(origin, prompt string) *agent.Task {
 	instr := "A request of this kind keeps recurring and no existing action serves it well:\n\n" +
 		prompt + "\n\nBuild a reusable Juice WASM action that handles this class of request. " +
-		"Write a TinyGo Handle, compile it with @sys/tinygo/compile, then select the publish tool with " +
+		"Write a TinyGo Handle, compile it with sys/tinygo/compile, then select the publish tool with " +
 		"the compiled artifact, a kebab-case name, a description, typed input/output schemas, and a " +
 		"few distinct test_inputs. Publish only once it passes its tests, then finish with the reply tool."
 	return &agent.Task{

@@ -92,7 +92,7 @@ type fakePublisher struct {
 
 func (p *fakePublisher) CreateWasmAction(_ context.Context, _, _ string, _ int, _, _ map[string]any, _ string) (string, string, error) {
 	p.created = true
-	return "act-1", "@agent/thing", nil
+	return "act-1", "agent/thing", nil
 }
 func (p *fakePublisher) EnableAction(_ context.Context, _ string) error { p.enabled = true; return nil }
 func (p *fakePublisher) SetPublic(_ context.Context, _ string) error    { p.madePublic = true; return nil }

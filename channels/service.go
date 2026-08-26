@@ -33,7 +33,7 @@ type Msg struct {
 // juice client) implements it, keeping this package kernel-free.
 //
 //   - Pending lists the service's waiting notification steps addressed to the
-//     agent (e.g. @chat doorbells), each carrying its conversation in PartialArgs.
+//     agent (e.g. chat doorbells), each carrying its conversation in PartialArgs.
 //   - SessionKey extracts the conversation a step belongs to (e.g. the room). It is
 //     also the handle passed to Read/Post and the unit of serialization.
 //   - Read returns a conversation's messages newer than after (oldest first).

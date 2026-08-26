@@ -66,7 +66,7 @@ type Kernel interface {
 	// Run dispatches an action and returns its result map.
 	Run(ctx context.Context, action string, args map[string]any) (map[string]any, error)
 	// Connectors lists the grant directories the agent already holds (e.g.
-	// "@chat/msg"), for provisioning idempotency.
+	// "chat/msg"), for provisioning idempotency.
 	Connectors(ctx context.Context) ([]string, error)
 	// ConnectGrant attaches a static token as the grant for selector.
 	ConnectGrant(ctx context.Context, selector, token string) error
@@ -77,15 +77,9 @@ type Kernel interface {
 	GrantRequired(err error) bool
 }
 
-// SameHandle compares two @handles ignoring an optional leading '@'. Shared by the
-// framework (own-message filtering) and the step channel (required-caller match).
+// SameHandle compares two bare handles. Shared by the framework (own-message
+// filtering) and the step channel (required-caller match); handles carry no
+// sigil anywhere in the system.
 func SameHandle(a, b string) bool {
-	return trimAt(a) == trimAt(b)
-}
-
-func trimAt(h string) string {
-	if len(h) > 0 && h[0] == '@' {
-		return h[1:]
-	}
-	return h
+	return a == b
 }
