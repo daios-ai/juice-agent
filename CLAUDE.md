@@ -9,6 +9,7 @@ Rules
 - Never commit before passing ALL unit tests and user flows!
 - Never commit before updating README.md: document operator
   details, never internals.
+- Never add a Claude-Session trailer or any session identifier to commit messages.
 
 Answering questions
 ===================
