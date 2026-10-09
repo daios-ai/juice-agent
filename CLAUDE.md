@@ -21,5 +21,5 @@ In all your answers:
 - never beat around the bush, never use theatricals
 - do not introduce vague nomenclature, stick to what's being used
   or to what's standard in the literature
-- always provide logical or mathematical justification.
+- ALWAYS provide logical, mathematical, or evidential (data or precedent) justification.
 

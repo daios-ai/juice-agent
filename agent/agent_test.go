@@ -35,14 +35,11 @@ func (d *scriptedDecider) Decide(_ context.Context, msgs []Message, catalog []Ca
 	return &s, nil
 }
 
-// fakeCatalog serves canned lookup results and per-ref meta.
+// fakeCatalog serves canned lookup results and per-ref authoritative reads. A
+// ref absent from read reads as a free, effect-free candidate.
 type fakeCatalog struct {
-	seed  []Candidate
-	extra map[string][]Candidate // keyed by query substring match on first call
-	meta  map[string]struct {
-		price int
-		stats ActionStats
-	}
+	seed    []Candidate
+	read    map[string]Candidate
 	lookups int
 }
 
@@ -51,26 +48,33 @@ func (c *fakeCatalog) Lookup(_ context.Context, _ string, _ int) ([]Candidate, e
 	return c.seed, nil
 }
 
-func (c *fakeCatalog) Meta(_ context.Context, ref string) (int, ActionStats, error) {
-	if m, ok := c.meta[ref]; ok {
-		return m.price, m.stats, nil
+func (c *fakeCatalog) Read(_ context.Context, ref string) (Candidate, error) {
+	if r, ok := c.read[ref]; ok {
+		return r, nil
 	}
-	return 0, ActionStats{}, nil
+	return Candidate{Ref: ref}, nil
 }
 
-// recordingRunner records dispatched calls and returns canned results/errors.
+// recordingRunner records dispatched calls, their quote pins and run keys, and
+// returns canned results/errors (a canned result rides with a canned error, as a
+// failed call's settlement does).
 type recordingRunner struct {
 	calls   []string
+	quotes  []string
+	keys    []string
 	results map[string]RunResult
 	errs    map[string]error
 }
 
-func (r *recordingRunner) Run(_ context.Context, action string, _ map[string]any) (RunResult, error) {
+func (r *recordingRunner) Run(_ context.Context, action string, _ map[string]any, quoteHash, key string) (RunResult, error) {
 	r.calls = append(r.calls, action)
+	r.quotes = append(r.quotes, quoteHash)
+	r.keys = append(r.keys, key)
+	res, ok := r.results[action]
 	if err := r.errs[action]; err != nil {
-		return RunResult{}, err
+		return res, err
 	}
-	if res, ok := r.results[action]; ok {
+	if ok {
 		return res, nil
 	}
 	return RunResult{Result: map[string]any{"ok": true}}, nil
@@ -125,9 +129,9 @@ func replyIntrinsic() map[string]Intrinsic {
 func baseConfig() Config {
 	return Config{
 		ReplyTool:      "reply",
-		LookupAction:   "sys/lookup",
+		LookupAction:   "sys@k/lookup",
 		Tools:          []Tool{{Name: "reply", Description: "finish", InputSchema: map[string]any{"type": "object"}}},
-		Always:         []Candidate{{Ref: "sys/lookup"}},
+		Always:         []Candidate{{Ref: "sys@k/lookup"}},
 		MaxTurns:       32,
 		CandidateLimit: 24,
 		LookupLimit:    8,
@@ -143,14 +147,14 @@ func newDeps(d Decider, c Catalog, r Runner, t Transcript) Deps {
 
 func TestStopsWhenReplySelected(t *testing.T) {
 	dec := &scriptedDecider{script: []Selection{
-		{Action: "sys/time"},
+		{Action: "sys@k/time"},
 		{Action: "reply", Args: map[string]any{"answer": "it is noon"}},
 	}}
-	cat := &fakeCatalog{seed: []Candidate{{Ref: "sys/time"}}}
+	cat := &fakeCatalog{seed: []Candidate{{Ref: "sys@k/time"}}}
 	run := &recordingRunner{}
 	tr := &memTranscript{}
 
-	out, err := Run(context.Background(), Task{Budget: 100}, baseConfig(), newDeps(dec, cat, run, tr))
+	out, err := Run(context.Background(), Job{Budget: 100}, baseConfig(), newDeps(dec, cat, run, tr))
 	if err != nil {
 		t.Fatalf("unexpected error: %v", err)
 	}
@@ -163,8 +167,8 @@ func TestStopsWhenReplySelected(t *testing.T) {
 	if out.Turns != 2 {
 		t.Fatalf("turns = %d, want 2", out.Turns)
 	}
-	if len(run.calls) != 1 || run.calls[0] != "sys/time" {
-		t.Fatalf("dispatched calls = %v, want [sys/time]", run.calls)
+	if len(run.calls) != 1 || run.calls[0] != "sys@k/time" {
+		t.Fatalf("dispatched calls = %v, want [sys@k/time]", run.calls)
 	}
 }
 
@@ -177,15 +181,12 @@ func TestBudgetRefusesThenContinues(t *testing.T) {
 	}}
 	cat := &fakeCatalog{
 		seed: []Candidate{{Ref: "expensive"}},
-		meta: map[string]struct {
-			price int
-			stats ActionStats
-		}{"expensive": {price: 100}},
+		read: map[string]Candidate{"expensive": {Ref: "expensive", Price: 100}},
 	}
 	run := &recordingRunner{}
 	tr := &memTranscript{}
 
-	out, err := Run(context.Background(), Task{Budget: 10}, baseConfig(), newDeps(dec, cat, run, tr))
+	out, err := Run(context.Background(), Job{Budget: 10}, baseConfig(), newDeps(dec, cat, run, tr))
 	if err != nil {
 		t.Fatalf("unexpected error: %v", err)
 	}
@@ -218,31 +219,73 @@ func TestBudgetSpendAccumulates(t *testing.T) {
 	}}
 	cat := &fakeCatalog{
 		seed: []Candidate{{Ref: "a"}, {Ref: "b"}},
-		meta: map[string]struct {
-			price int
-			stats ActionStats
-		}{"a": {price: 3}, "b": {price: 4}},
+		read: map[string]Candidate{"a": {Ref: "a", Price: 3}, "b": {Ref: "b", Price: 4}},
 	}
 	run := &recordingRunner{}
 	tr := &memTranscript{}
 
-	out, _ := Run(context.Background(), Task{Budget: 100}, baseConfig(), newDeps(dec, cat, run, tr))
+	out, _ := Run(context.Background(), Job{Budget: 100}, baseConfig(), newDeps(dec, cat, run, tr))
 	if out.Spent != 7 {
 		t.Fatalf("spent = %d, want 7", out.Spent)
 	}
 }
 
+func TestSpentIsTheReportedCharge(t *testing.T) {
+	// spent follows the kernel's settlement, not the quote: a failed call charges
+	// what its sub-work consumed, a moved quote charges nothing, and a call with no
+	// reported settlement (parked) counts at its price, which it may still draw.
+	dec := &scriptedDecider{script: []Selection{
+		{Action: "a"}, {Action: "b"}, {Action: "c"},
+		{Action: "reply", Args: map[string]any{"answer": "done"}},
+	}}
+	cat := &fakeCatalog{
+		seed: []Candidate{{Ref: "a"}, {Ref: "b"}, {Ref: "c"}},
+		read: map[string]Candidate{"a": {Ref: "a", Price: 5}, "b": {Ref: "b", Price: 4}, "c": {Ref: "c", Price: 3}},
+	}
+	run := &recordingRunner{
+		results: map[string]RunResult{"a": {TxID: "tx-a", Charge: 2}},
+		errs: map[string]error{
+			"a": errors.New("execution_failed"),
+			"b": fmt.Errorf("refused: %w", ErrTermsChanged),
+			"c": errors.New("timeout: parked"),
+		},
+	}
+	tr := &memTranscript{}
+	out, _ := Run(context.Background(), Job{Budget: 100}, baseConfig(), newDeps(dec, cat, run, tr))
+	if out.Spent != 2+0+3 {
+		t.Fatalf("spent = %d, want 5", out.Spent)
+	}
+	for _, m := range tr.msgs {
+		if m.Role == RoleTool && m.Action == "a" && (m.TxID != "tx-a" || !m.IsError) {
+			t.Fatalf("failed call record = %+v, want its tx_id kept with the error", m)
+		}
+	}
+}
+
+func TestEachDispatchHasItsOwnKey(t *testing.T) {
+	dec := &scriptedDecider{script: []Selection{
+		{Action: "a"}, {Action: "b"},
+		{Action: "reply", Args: map[string]any{"answer": "done"}},
+	}}
+	cat := &fakeCatalog{seed: []Candidate{{Ref: "a"}, {Ref: "b"}}}
+	run := &recordingRunner{}
+	Run(context.Background(), Job{Budget: 100}, baseConfig(), newDeps(dec, cat, run, &memTranscript{}))
+	if len(run.keys) != 2 || run.keys[0] == "" || run.keys[0] == run.keys[1] {
+		t.Fatalf("keys = %q, want two distinct non-empty run keys", run.keys)
+	}
+}
+
 func TestTurnCapHalts(t *testing.T) {
 	// The model keeps calling a free action forever; only the turn cap stops it.
-	dec := &loopingDecider{action: "sys/time"}
-	cat := &fakeCatalog{seed: []Candidate{{Ref: "sys/time"}}}
+	dec := &loopingDecider{action: "sys@k/time"}
+	cat := &fakeCatalog{seed: []Candidate{{Ref: "sys@k/time"}}}
 	run := &recordingRunner{}
 	tr := &memTranscript{}
 	cfg := baseConfig()
 	cfg.MaxTurns = 5
 	cfg.MaxRepeats = -1 // isolate the turn cap from the repeat guard
 
-	out, err := Run(context.Background(), Task{Budget: 100}, cfg, newDeps(dec, cat, run, tr))
+	out, err := Run(context.Background(), Job{Budget: 100}, cfg, newDeps(dec, cat, run, tr))
 	if err != nil {
 		t.Fatalf("unexpected error: %v", err)
 	}
@@ -273,7 +316,7 @@ func TestPersistentDecideErrorEndsRunAfterCap(t *testing.T) {
 	dec := &alwaysErrorDecider{}
 	cfg := baseConfig()
 	cfg.MaxDecideErrors = 2
-	out, err := Run(context.Background(), Task{Budget: 100}, cfg, newDeps(dec, &fakeCatalog{}, &recordingRunner{}, &memTranscript{}))
+	out, err := Run(context.Background(), Job{Budget: 100}, cfg, newDeps(dec, &fakeCatalog{}, &recordingRunner{}, &memTranscript{}))
 	if err != nil {
 		t.Fatalf("model failure should be a failed outcome, not a Go error: %v", err)
 	}
@@ -301,7 +344,7 @@ func (d *errorThenReplyDecider) Decide(_ context.Context, msgs []Message, _ []Ca
 func TestSingleDecideErrorRecovers(t *testing.T) {
 	dec := &errorThenReplyDecider{}
 	tr := &memTranscript{}
-	out, err := Run(context.Background(), Task{Budget: 100}, baseConfig(), newDeps(dec, &fakeCatalog{}, &recordingRunner{}, tr))
+	out, err := Run(context.Background(), Job{Budget: 100}, baseConfig(), newDeps(dec, &fakeCatalog{}, &recordingRunner{}, tr))
 	if err != nil {
 		t.Fatalf("run should recover, got %v", err)
 	}
@@ -321,7 +364,7 @@ func TestSingleDecideErrorRecovers(t *testing.T) {
 }
 
 func TestSteeringInjectedBeforeDecide(t *testing.T) {
-	steer := []Message{{Role: RoleUser, Content: "actually, use sys/time"}}
+	steer := []Message{{Role: RoleUser, Content: "actually, use sys@k/time"}}
 	dec := &scriptedDecider{script: []Selection{
 		{Action: "reply", Args: map[string]any{"answer": "ok"}},
 	}}
@@ -338,11 +381,11 @@ func TestSteeringInjectedBeforeDecide(t *testing.T) {
 		return steer
 	}
 
-	Run(context.Background(), Task{Budget: 100}, baseConfig(), deps)
+	Run(context.Background(), Job{Budget: 100}, baseConfig(), deps)
 	// the steering message must appear in the transcript the decider saw
 	found := false
 	for _, m := range dec.lastMsgs {
-		if m.Content == "actually, use sys/time" {
+		if m.Content == "actually, use sys@k/time" {
 			found = true
 		}
 	}
@@ -351,46 +394,33 @@ func TestSteeringInjectedBeforeDecide(t *testing.T) {
 	}
 }
 
-func TestWorkingSetEvictsLowestValue(t *testing.T) {
+func TestWorkingSetEvictsLeastRecent(t *testing.T) {
 	ws := newWorkingSet(2)
-	// proven-good
-	ws.put(Candidate{Ref: "good", Stats: ActionStats{Known: true, Uses: 10, Successes: 10, RatingCount: 5, RatingEstimate: 1.0}})
-	// persistent failer
-	ws.put(Candidate{Ref: "bad", Stats: ActionStats{Known: true, Uses: 10, Successes: 0, RatingCount: 5, RatingEstimate: 0.0}})
-	// untested (neutral) — adding this exceeds the cap of 2, so the lowest-value
-	// candidate (bad) must be evicted.
-	ws.put(Candidate{Ref: "new"})
+	ws.put(Candidate{Ref: "a"})
+	ws.put(Candidate{Ref: "b"})
+	ws.put(Candidate{Ref: "a"}) // refreshed: now the most recent
+	ws.put(Candidate{Ref: "c"}) // over the cap: the least recent (b) leaves
 
-	if _, ok := ws.by["bad"]; ok {
-		t.Fatal("bad (lowest value) should have been evicted")
+	if _, ok := ws.by["b"]; ok {
+		t.Fatal("b (least recently merged) should have been evicted")
 	}
-	if _, ok := ws.by["good"]; !ok {
-		t.Fatal("good (highest value) should be retained")
-	}
-	if len(ws.by) != 2 {
-		t.Fatalf("size = %d, want 2", len(ws.by))
+	if len(ws.by) != 2 || len(ws.order) != 2 {
+		t.Fatalf("size = %d/%d, want 2", len(ws.by), len(ws.order))
 	}
 }
 
-func TestCandidatesRankProvenFirstAndAlwaysPresent(t *testing.T) {
+func TestCandidatesAlwaysFirstThenMostRecent(t *testing.T) {
 	ws := newWorkingSet(10)
-	ws.put(Candidate{Ref: "proven", Price: 5, Stats: ActionStats{Known: true, Uses: 8, Successes: 8, RatingCount: 3, RatingEstimate: 0.9}})
-	ws.put(Candidate{Ref: "fresh", Price: 2})
+	ws.put(Candidate{Ref: "old"})
+	ws.put(Candidate{Ref: "new"})
+	ws.put(Candidate{Ref: "sys@k/lookup"}) // an always ref merged again is not listed twice
 
-	cfg := Config{Always: []Candidate{{Ref: "sys/lookup"}}}
-	cands := ws.candidates(cfg)
-	// Value-sorted: proven before fresh.
 	var order []string
-	for _, c := range cands {
+	for _, c := range ws.candidates(Config{Always: []Candidate{{Ref: "sys@k/lookup"}}}) {
 		order = append(order, c.Ref)
 	}
-	pi, fi := indexOf(order, "proven"), indexOf(order, "fresh")
-	if pi < 0 || fi < 0 || pi > fi {
-		t.Fatalf("proven should rank before fresh: %v", order)
-	}
-	// The always-offered candidate is present even though it was never put().
-	if indexOf(order, "sys/lookup") < 0 {
-		t.Fatalf("always candidate missing: %v", order)
+	if strings.Join(order, ",") != "sys@k/lookup,new,old" {
+		t.Fatalf("order = %v, want [sys@k/lookup new old]", order)
 	}
 }
 
@@ -405,54 +435,106 @@ func indexOf(s []string, v string) int {
 
 func TestParseLookup(t *testing.T) {
 	res := map[string]any{"results": []any{
-		map[string]any{"action": "sys/time", "description": "current time", "input_schema": map[string]any{"type": "object"}},
+		map[string]any{"action": "sys@k/time", "description": "current time", "input_schema": map[string]any{"type": "object"}},
 		map[string]any{"description": "no action ref — skipped"},
-		map[string]any{"action": "sys/web", "description": "fetch a page"},
+		map[string]any{"action": "sys@k/web", "description": "fetch a page"},
 	}}
-	got := parseLookup(res)
+	got := ParseLookup(res)
 	if len(got) != 2 {
 		t.Fatalf("parsed %d candidates, want 2", len(got))
 	}
-	if got[0].Ref != "sys/time" || got[1].Ref != "sys/web" {
+	if got[0].Ref != "sys@k/time" || got[1].Ref != "sys@k/web" {
 		t.Fatalf("refs = %q,%q", got[0].Ref, got[1].Ref)
 	}
 }
 
-func TestMergeEnrichesWithMeta(t *testing.T) {
+func TestMergeTakesAuthoritativeReadAndDropsEffects(t *testing.T) {
 	ws := newWorkingSet(10)
-	cat := &fakeCatalog{meta: map[string]struct {
-		price int
-		stats ActionStats
-	}{"sys/web": {price: 3, stats: ActionStats{Known: true, Uses: 4, Successes: 3}}}}
-	deps := Deps{Catalog: cat}
-	mergeCandidates(context.Background(), deps, ws, []Candidate{{Ref: "sys/web", Description: "fetch"}})
+	cat := &fakeCatalog{read: map[string]Candidate{
+		"sys@k/web":      {Ref: "sys@k/web", Price: 3, QuoteHash: "q1"},
+		"sys@k/transfer": {Ref: "sys@k/transfer", Effect: "transfer"},
+	}}
+	mergeCandidates(context.Background(), Deps{Catalog: cat}, ws,
+		[]Candidate{{Ref: "sys@k/web", Description: "fetch"}, {Ref: "sys@k/transfer"}})
 
-	c := ws.by["sys/web"]
-	if c.Price != 3 {
-		t.Fatalf("price = %d, want 3 (from Meta)", c.Price)
+	if c := ws.by["sys@k/web"]; c.Price != 3 || c.QuoteHash != "q1" {
+		t.Fatalf("sys@k/web = %+v, want the read's price and quote", c)
 	}
-	if !c.Stats.Known || c.Stats.Uses != 4 {
-		t.Fatalf("stats not enriched: %+v", c.Stats)
+	if _, ok := ws.by["sys@k/transfer"]; ok {
+		t.Fatal("an action with a value effect must not enter the working set")
 	}
+}
+
+func TestUnofferedActionIsNotDispatched(t *testing.T) {
+	// The model names an action it was never offered: the loop must feed that back
+	// instead of dispatching it at an unknown price.
+	dec := &scriptedDecider{script: []Selection{
+		{Action: "x/costly"},
+		{Action: "reply", Args: map[string]any{"answer": "ok"}},
+	}}
+	run := &recordingRunner{}
+	tr := &memTranscript{}
+	out, err := Run(context.Background(), Job{Budget: 100}, baseConfig(), newDeps(dec, &fakeCatalog{}, run, tr))
+	if err != nil || out.Status != StatusAnswered {
+		t.Fatalf("outcome = %+v, err = %v", out, err)
+	}
+	if len(run.calls) != 0 {
+		t.Fatalf("dispatched %v, want nothing", run.calls)
+	}
+	if !hasKind(tr.msgs, "decide-error") {
+		t.Fatal("unoffered selection was not fed back")
+	}
+}
+
+func TestQuotePinnedAndMovedTermsEvict(t *testing.T) {
+	// The candidate's quote travels with its dispatch; a moved quote evicts it, so
+	// a second selection of it is refused until a fresh read re-offers it.
+	dec := &scriptedDecider{script: []Selection{
+		{Action: "a"},
+		{Action: "a"},
+		{Action: "reply", Args: map[string]any{"answer": "ok"}},
+	}}
+	cat := &fakeCatalog{seed: []Candidate{{Ref: "a"}}, read: map[string]Candidate{"a": {Ref: "a", QuoteHash: "q-a"}}}
+	run := &recordingRunner{errs: map[string]error{"a": fmt.Errorf("refused: %w", ErrTermsChanged)}}
+	cfg := baseConfig()
+	cfg.MaxRepeats = -1
+	tr := &memTranscript{}
+	Run(context.Background(), Job{Budget: 100}, cfg, newDeps(dec, cat, run, tr))
+
+	if len(run.calls) != 1 || run.quotes[0] != "q-a" {
+		t.Fatalf("calls=%v quotes=%v, want one call pinned to q-a", run.calls, run.quotes)
+	}
+	if !hasKind(tr.msgs, "decide-error") {
+		t.Fatal("the evicted candidate's second selection should be refused")
+	}
+}
+
+func hasKind(msgs []Message, kind string) bool {
+	for _, m := range msgs {
+		if m.Kind == kind {
+			return true
+		}
+	}
+	return false
 }
 
 func TestLookupResultMergesIntoWorkingSet(t *testing.T) {
 	// A lookup dispatch must expand the offered refs on the next turn.
 	dec := &refCapturingDecider{script: []Selection{
-		{Action: "sys/lookup", Args: map[string]any{"query": "x"}},
+		{Action: "sys@k/lookup", Args: map[string]any{"query": "x"}},
 		{Action: "reply", Args: map[string]any{"answer": "done"}},
 	}}
 	cat := &fakeCatalog{seed: nil}
 	run := &recordingRunner{results: map[string]RunResult{
-		"sys/lookup": {Result: map[string]any{"results": []any{
-			map[string]any{"action": "sys/web", "description": "fetch"},
+		"sys@k/lookup": {Result: map[string]any{"results": []any{
+			map[string]any{"action": "sys@k/web", "description": "fetch"},
 		}}},
 	}}
 	tr := &memTranscript{}
-	Run(context.Background(), Task{Budget: 100}, baseConfig(), newDeps(dec, cat, run, tr))
+	Run(context.Background(), Job{Budget: 100}, baseConfig(), newDeps(dec, cat, run, tr))
 
-	if !dec.everOffered("sys/web") {
-		t.Fatalf("sys/web from lookup was never offered to decide; offered=%v", dec.allRefs)
+	if !dec.everOffered("sys@k/web") {
+		t.Fatalf("sys@k/web from lookup was never offered to decide; offered=%v", dec.allRefs)
 	}
 }
 
@@ -498,7 +580,7 @@ func TestMissingRequiredArgFedBack(t *testing.T) {
 	cfg.Tools = []Tool{{Name: "reply", InputSchema: map[string]any{
 		"type": "object", "required": []any{"answer"}}}}
 	tr := &memTranscript{}
-	out, err := Run(context.Background(), Task{Budget: 100}, cfg, newDeps(dec, &fakeCatalog{}, &recordingRunner{}, tr))
+	out, err := Run(context.Background(), Job{Budget: 100}, cfg, newDeps(dec, &fakeCatalog{}, &recordingRunner{}, tr))
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -520,22 +602,22 @@ func TestLookupResultTrimmedInTranscript(t *testing.T) {
 	// A lookup dispatch persists only ref+description+score (no schemas), while
 	// the working set retains the full candidate for the client to render.
 	dec := &scriptedDecider{script: []Selection{
-		{Action: "sys/lookup", Args: map[string]any{"query": "x"}},
+		{Action: "sys@k/lookup", Args: map[string]any{"query": "x"}},
 		{Action: "reply", Args: map[string]any{"answer": "done"}},
 	}}
 	run := &recordingRunner{results: map[string]RunResult{
-		"sys/lookup": {Result: map[string]any{"results": []any{
-			map[string]any{"action": "sys/web", "description": "fetch",
+		"sys@k/lookup": {Result: map[string]any{"results": []any{
+			map[string]any{"action": "sys@k/web", "description": "fetch",
 				"input_schema": map[string]any{"type": "object", "properties": map[string]any{"url": map[string]any{}}}},
 		}}},
 	}}
 	tr := &memTranscript{}
-	Run(context.Background(), Task{Budget: 100}, baseConfig(), newDeps(dec, &fakeCatalog{}, run, tr))
+	Run(context.Background(), Job{Budget: 100}, baseConfig(), newDeps(dec, &fakeCatalog{}, run, tr))
 
 	// find the persisted lookup tool-result
 	var lookupRes map[string]any
 	for _, m := range tr.msgs {
-		if m.Role == RoleTool && m.Action == "sys/lookup" {
+		if m.Role == RoleTool && m.Action == "sys@k/lookup" {
 			lookupRes = m.Result
 		}
 	}
@@ -544,7 +626,7 @@ func TestLookupResultTrimmedInTranscript(t *testing.T) {
 	}
 	results, _ := lookupRes["results"].([]any)
 	first, _ := results[0].(map[string]any)
-	if first["action"] != "sys/web" || first["description"] != "fetch" {
+	if first["action"] != "sys@k/web" || first["description"] != "fetch" {
 		t.Fatalf("trimmed result missing ref/desc: %v", first)
 	}
 	if _, hasSchema := first["input_schema"]; hasSchema {
@@ -569,7 +651,7 @@ func TestSubtaskOpensAndRollsUp(t *testing.T) {
 		{Action: "reply", Args: map[string]any{"answer": "final: X=42"}}, // root
 	}}
 	tr := &memTranscript{}
-	out, err := Run(context.Background(), Task{Budget: 100}, subtaskConfig(), newDeps(dec, &fakeCatalog{}, &recordingRunner{}, tr))
+	out, err := Run(context.Background(), Job{Budget: 100}, subtaskConfig(), newDeps(dec, &fakeCatalog{}, &recordingRunner{}, tr))
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -609,7 +691,8 @@ func TestSubtaskSharesTurnCap(t *testing.T) {
 	cfg.MaxTurns = 4
 	cfg.MaxRepeats = -1 // isolate the shared turn cap from the repeat guard
 	run := &recordingRunner{}
-	out, _ := Run(context.Background(), Task{Budget: 1000}, cfg, newDeps(dec, &fakeCatalog{}, run, &memTranscript{}))
+	cat := &fakeCatalog{seed: []Candidate{{Ref: "sys@k/time"}}}
+	out, _ := Run(context.Background(), Job{Budget: 1000}, cfg, newDeps(dec, cat, run, &memTranscript{}))
 	if out.Status != StatusFailed || out.Reason != "turn-cap" {
 		t.Fatalf("outcome = %+v, want failed/turn-cap", out)
 	}
@@ -632,7 +715,7 @@ func (d *loopingSubtaskDecider) Decide(_ context.Context, _ []Message, _ []Candi
 	if d.n == 1 {
 		return &Selection{Action: "subtask", Args: map[string]any{"instruction": "loop"}}, nil
 	}
-	return &Selection{Action: "sys/time"}, nil
+	return &Selection{Action: "sys@k/time"}, nil
 }
 
 // toolNamingDecider records the harness tools it is offered on each turn, opens a
@@ -659,7 +742,7 @@ func TestSubtaskChildNotOfferedSubtaskTool(t *testing.T) {
 	// The child of a subtask must NOT be offered the subtask tool — nesting is
 	// capped at one sublevel so a cloned subtask cannot re-delegate and spiral.
 	dec := &toolNamingDecider{}
-	out, err := Run(context.Background(), Task{Budget: 100}, subtaskConfig(), newDeps(dec, &fakeCatalog{}, &recordingRunner{}, &memTranscript{}))
+	out, err := Run(context.Background(), Job{Budget: 100}, subtaskConfig(), newDeps(dec, &fakeCatalog{}, &recordingRunner{}, &memTranscript{}))
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -715,7 +798,7 @@ func TestRepeatChallengeThenBackDown(t *testing.T) {
 	run := &recordingRunner{}
 	tr := &memTranscript{}
 
-	out, err := Run(context.Background(), Task{Budget: 100}, baseConfig(), newDeps(dec, cat, run, tr))
+	out, err := Run(context.Background(), Job{Budget: 100}, baseConfig(), newDeps(dec, cat, run, tr))
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -758,7 +841,7 @@ func TestParaphraseLoopIntercepted(t *testing.T) {
 	run := &recordingRunner{}
 	tr := &memTranscript{}
 
-	out, err := Run(context.Background(), Task{Budget: 1000}, baseConfig(), newDeps(dec, cat, run, tr))
+	out, err := Run(context.Background(), Job{Budget: 1000}, baseConfig(), newDeps(dec, cat, run, tr))
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -783,7 +866,7 @@ func TestRepeatLoopHardStops(t *testing.T) {
 	tr := &memTranscript{}
 	cfg := baseConfig() // MaxRepeats 0 → default 3
 
-	out, err := Run(context.Background(), Task{Budget: 1000}, cfg, newDeps(dec, cat, run, tr))
+	out, err := Run(context.Background(), Job{Budget: 1000}, cfg, newDeps(dec, cat, run, tr))
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -814,7 +897,7 @@ func TestRepeatChangeOfCourseResets(t *testing.T) {
 	run := &recordingRunner{}
 	tr := &memTranscript{}
 
-	out, err := Run(context.Background(), Task{Budget: 100}, baseConfig(), newDeps(dec, cat, run, tr))
+	out, err := Run(context.Background(), Job{Budget: 100}, baseConfig(), newDeps(dec, cat, run, tr))
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -843,7 +926,7 @@ func TestAlternationIsNotARepeat(t *testing.T) {
 	run := &recordingRunner{}
 	tr := &memTranscript{}
 
-	out, _ := Run(context.Background(), Task{Budget: 100}, baseConfig(), newDeps(dec, cat, run, tr))
+	out, _ := Run(context.Background(), Job{Budget: 100}, baseConfig(), newDeps(dec, cat, run, tr))
 	if out.Status != StatusAnswered {
 		t.Fatalf("outcome = %+v, want answered", out)
 	}
@@ -863,7 +946,7 @@ func TestReplyExemptFromRepeatGuard(t *testing.T) {
 		{Action: "reply", Args: map[string]any{"answer": "done"}},
 	}}
 	tr := &memTranscript{}
-	out, _ := Run(context.Background(), Task{Budget: 100}, baseConfig(), newDeps(dec, &fakeCatalog{}, &recordingRunner{}, tr))
+	out, _ := Run(context.Background(), Job{Budget: 100}, baseConfig(), newDeps(dec, &fakeCatalog{}, &recordingRunner{}, tr))
 	if out.Status != StatusAnswered || out.Turns != 1 {
 		t.Fatalf("outcome = %+v, want answered on turn 1", out)
 	}
@@ -886,7 +969,7 @@ func (d *bracketRepeatDecider) Decide(_ context.Context, msgs []Message, _ []Can
 		d.opened = true
 		return &Selection{Action: "subtask", Args: map[string]any{"instruction": "loop"}}, nil
 	}
-	return &Selection{Action: "sys/time", Args: map[string]any{"text": "same"}}, nil
+	return &Selection{Action: "sys@k/time", Args: map[string]any{"text": "same"}}, nil
 }
 
 func TestBracketRepeatIsolation(t *testing.T) {
@@ -898,7 +981,8 @@ func TestBracketRepeatIsolation(t *testing.T) {
 	run := &recordingRunner{}
 	tr := &memTranscript{}
 
-	out, err := Run(context.Background(), Task{Budget: 1000}, cfg, newDeps(dec, &fakeCatalog{}, run, tr))
+	cat := &fakeCatalog{seed: []Candidate{{Ref: "sys@k/time"}}}
+	out, err := Run(context.Background(), Job{Budget: 1000}, cfg, newDeps(dec, cat, run, tr))
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -923,15 +1007,15 @@ func TestBracketRepeatIsolation(t *testing.T) {
 func TestRepeatGuardDisabled(t *testing.T) {
 	// MaxRepeats < 0 disables the guard: a looping action runs every turn until the
 	// turn cap, exactly as before, with no challenge inserted.
-	dec := &paraphrasingDecider{action: "sys/time"}
-	cat := &fakeCatalog{seed: []Candidate{{Ref: "sys/time"}}}
+	dec := &paraphrasingDecider{action: "sys@k/time"}
+	cat := &fakeCatalog{seed: []Candidate{{Ref: "sys@k/time"}}}
 	run := &recordingRunner{}
 	tr := &memTranscript{}
 	cfg := baseConfig()
 	cfg.MaxTurns = 5
 	cfg.MaxRepeats = -1
 
-	out, _ := Run(context.Background(), Task{Budget: 1000}, cfg, newDeps(dec, cat, run, tr))
+	out, _ := Run(context.Background(), Job{Budget: 1000}, cfg, newDeps(dec, cat, run, tr))
 	if out.Status != StatusFailed || out.Reason != "turn-cap" {
 		t.Fatalf("outcome = %+v, want failed/turn-cap", out)
 	}

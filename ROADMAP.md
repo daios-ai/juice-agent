@@ -27,7 +27,7 @@ memories surface, irrelevant ones stay out.
 
 Three steps, all in the policy layer (`cmd/juice-agent/prompt.go`); the pure loop is untouched.
 
-1. **Embed the task.** At task start, embed the incoming prompt with one `sys/llm/embed` call.
+1. **Embed the task.** At task start, embed the incoming prompt with one `llm/embed` call.
 2. **Rank the memory entries.** `memory.md` is already a list of dated `## <stamp> — <taskID>`
    entries; each is a recall unit. Rank them by cosine similarity to the task embedding. Entry
    embeddings are cached in a small sidecar file (keyed by entry hash and embed model) so only new
@@ -39,7 +39,7 @@ Three steps, all in the policy layer (`cmd/juice-agent/prompt.go`); the pure loo
 
 The embedding-plus-cosine pattern already exists in the codebase — the maker's repetition trigger
 uses it — so this reuses proven code rather than adding a dependency. It is also the escalation
-`agent-design.md` §5c explicitly reserved: "escalate to a `sys/llm/embed` index only if a readable
+`agent-design.md` §5c explicitly reserved: "escalate to an `llm/embed` index only if a readable
 file stops scaling."
 
 Recall runs at task start and, optionally, when a subtask opens; per-turn recall adds cost for

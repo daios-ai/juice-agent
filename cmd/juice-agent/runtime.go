@@ -15,7 +15,7 @@ import (
 type Runtime struct {
 	exec  *Executor
 	chans map[string]channels.Channel
-	queue chan agent.Task
+	queue chan agent.Job
 	log   func(string, map[string]any)
 
 	wg      sync.WaitGroup
@@ -35,7 +35,7 @@ func NewRuntime(exec *Executor, chans []channels.Channel, concurrency int, log f
 	return &Runtime{
 		exec:  exec,
 		chans: chm,
-		queue: make(chan agent.Task, concurrency*8),
+		queue: make(chan agent.Job, concurrency*8),
 		log:   log,
 	}
 }
@@ -43,7 +43,7 @@ func NewRuntime(exec *Executor, chans []channels.Channel, concurrency int, log f
 // submit enqueues a task unless the runtime is shutting down. The maker's Enqueue
 // and every channel's producer funnel through here. A full queue drops with a log
 // line rather than blocking a worker (which would risk deadlock on shutdown).
-func (r *Runtime) submit(t agent.Task) {
+func (r *Runtime) submit(t agent.Job) {
 	r.mu.RLock()
 	defer r.mu.RUnlock()
 	if r.closing {
@@ -80,7 +80,7 @@ func (r *Runtime) worker(ctx context.Context) {
 	}
 }
 
-func (r *Runtime) run(ctx context.Context, t agent.Task) {
+func (r *Runtime) run(ctx context.Context, t agent.Job) {
 	ch := r.chans[t.Channel]
 	var steering func() []agent.Message
 	if ch != nil {
@@ -109,38 +109,37 @@ func (r *Runtime) Shutdown() {
 
 // kernelAdapter implements channels.Kernel over the juice client — the single
 // bridge from the kernel-free channels packages to the kernel. Every channel
-// receives it: the step channel as a channels.StepSource (the embedded subset),
+// receives it: the task channel as a channels.TaskSource (the embedded subset),
 // chat as the full channels.Kernel. It is the only place juice types are mapped
 // into channel terms, so adding a channel needs no new kernel code here.
 type kernelAdapter struct{ cl *juice.Client }
 
-func (a kernelAdapter) WaitingSteps(ctx context.Context) ([]channels.StepInfo, error) {
-	steps, err := a.cl.WaitingSteps(ctx)
+func (a kernelAdapter) WaitingTasks(ctx context.Context) ([]channels.TaskInfo, error) {
+	tasks, err := a.cl.WaitingTasks(ctx)
 	if err != nil {
 		return nil, err
 	}
-	out := make([]channels.StepInfo, 0, len(steps))
-	for _, s := range steps {
-		out = append(out, channels.StepInfo{
-			ID:             s.ID,
-			OwnerHandle:    s.OwnerHandle,
-			RequiredCaller: s.RequiredCallerHandle,
-			ActionRef:      s.ActionRef,
-			PartialArgs:    s.PartialArgs,
-			AllowedInput:   s.AllowedInput,
-			CreatedBy:      s.CreatedBy,
+	out := make([]channels.TaskInfo, 0, len(tasks))
+	for _, t := range tasks {
+		out = append(out, channels.TaskInfo{
+			ID:             t.ID,
+			Owner:          t.Owner,
+			RequiredCaller: t.RequiredCaller,
+			ActionRef:      t.ActionRef,
+			PartialArgs:    t.PartialArgs,
+			AllowedInput:   t.AllowedInput,
+			CreatedBy:      t.CreatedBy,
 		})
 	}
 	return out, nil
 }
 
-func (a kernelAdapter) CompleteStep(ctx context.Context, id string, args map[string]any) error {
-	_, err := a.cl.CompleteStep(ctx, id, args)
-	return err
+func (a kernelAdapter) CompleteTask(ctx context.Context, id string, args map[string]any) error {
+	return a.cl.CompleteTask(ctx, id, args)
 }
 
 func (a kernelAdapter) Run(ctx context.Context, action string, args map[string]any) (map[string]any, error) {
-	res, err := a.cl.Run(ctx, action, args)
+	res, err := a.cl.Run(ctx, action, args, "", "")
 	if err != nil {
 		return nil, err
 	}

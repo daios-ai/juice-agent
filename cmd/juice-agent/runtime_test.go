@@ -13,13 +13,13 @@ import (
 // captureChannel records deliveries and can inject one task at Start.
 type captureChannel struct {
 	name      string
-	seed      *agent.Task
+	seed      *agent.Job
 	mu        sync.Mutex
 	delivered map[string]agent.Outcome
 }
 
 func (c *captureChannel) Name() string { return c.name }
-func (c *captureChannel) Start(_ context.Context, submit func(agent.Task)) error {
+func (c *captureChannel) Start(_ context.Context, submit func(agent.Job)) error {
 	if c.seed != nil {
 		submit(*c.seed)
 	}
@@ -43,10 +43,10 @@ func (stubKernel) Decide(context.Context, []agent.Message, []agent.Candidate, []
 	return &agent.Selection{Action: "reply", Args: map[string]any{"answer": "done"}}, nil
 }
 func (stubKernel) Lookup(context.Context, string, int) ([]agent.Candidate, error) { return nil, nil }
-func (stubKernel) Meta(context.Context, string) (int, agent.ActionStats, error) {
-	return 0, agent.ActionStats{}, nil
+func (stubKernel) Read(_ context.Context, ref string) (agent.Candidate, error) {
+	return agent.Candidate{Ref: ref}, nil
 }
-func (stubKernel) Run(context.Context, string, map[string]any) (agent.RunResult, error) {
+func (stubKernel) Run(context.Context, string, map[string]any, string, string) (agent.RunResult, error) {
 	return agent.RunResult{}, nil
 }
 func (stubKernel) Chat(context.Context, []agent.Message) (string, error) { return "", nil }
@@ -62,7 +62,7 @@ func newExecutor(dir string) *Executor {
 		DataDir: dir,
 		RetryOK: func(error) bool { return false },
 		Loop: agent.Config{
-			ReplyTool: "reply", LookupAction: "sys/lookup", MaxTurns: 5,
+			ReplyTool: "reply", LookupAction: "sys@k/lookup", MaxTurns: 5,
 			Intrinsics: map[string]agent.Intrinsic{"reply": {
 				Handle: func(_ context.Context, a map[string]any) (map[string]any, bool, error) { return a, true, nil },
 			}},
@@ -71,7 +71,7 @@ func newExecutor(dir string) *Executor {
 }
 
 func TestRuntimeRoutesOutcomeBackToChannel(t *testing.T) {
-	ch := &captureChannel{name: "test", seed: &agent.Task{ID: "j1", Channel: "test", Budget: 10,
+	ch := &captureChannel{name: "test", seed: &agent.Job{ID: "j1", Channel: "test", Budget: 10,
 		Messages: []agent.Message{{Role: agent.RoleUser, Content: "hi"}}}}
 	rt := NewRuntime(newExecutor(t.TempDir()), []channels.Channel{ch}, 2, func(string, map[string]any) {})
 
@@ -109,5 +109,5 @@ func TestRuntimeSubmitDropsWhenClosing(t *testing.T) {
 	rt.Shutdown()
 	// Submitting after shutdown must not panic (send on closed channel) and must
 	// simply drop.
-	rt.submit(agent.Task{ID: "late"})
+	rt.submit(agent.Job{ID: "late"})
 }

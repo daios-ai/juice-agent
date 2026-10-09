@@ -1,16 +1,13 @@
-// Command juice-agent is the Juice agent daemon: it logs into a Juice kernel as a
-// user, watches its intake channels, and runs the pi-style loop over the kernel
-// action catalog to serve each task — paying for what it runs, rating its tools,
+// Command juice-agent is the Juice agent daemon: it acts as one login on a Juice
+// kernel, watches its intake channels, and runs the pi-style loop over the kernel
+// action catalog to serve each job — paying for what it runs, rating its tools,
 // and (optionally) publishing new actions to automate recurring work.
 package main
 
 import (
-	"bufio"
 	"context"
 	"encoding/json"
-	"errors"
 	"fmt"
-	"io"
 	"os"
 	"os/signal"
 	"strings"
@@ -22,9 +19,8 @@ import (
 	"github.com/daios-ai/juice-agent/channels"
 	"github.com/daios-ai/juice-agent/channels/chat"
 	httpchan "github.com/daios-ai/juice-agent/channels/http"
-	"github.com/daios-ai/juice-agent/channels/step"
+	"github.com/daios-ai/juice-agent/channels/task"
 	"github.com/daios-ai/juice-agent/juice"
-	"golang.org/x/term"
 )
 
 // version and commit are injected at build time via -ldflags (see Makefile).
@@ -34,11 +30,8 @@ var (
 )
 
 func main() {
-	// --password-stdin may appear anywhere; extract it before subcommand dispatch.
-	stdinPass := false
-	args := extractFlag(os.Args[1:], "--password-stdin", &stdinPass)
-
-	// The verb comes first; the agent's handle is the positional that follows it.
+	// The verb comes first; the agent's login is the positional that follows it.
+	args := os.Args[1:]
 	if len(args) == 0 {
 		usage()
 		os.Exit(2)
@@ -48,11 +41,11 @@ func main() {
 	var err error
 	switch cmd {
 	case "serve":
-		err = runServe(rest, stdinPass)
+		err = runServe(rest)
 	case "task":
-		err = runTask(rest, stdinPass)
+		err = runTask(rest)
 	case "bench":
-		err = runBench(rest, stdinPass)
+		err = runBench(rest)
 	case "version", "--version", "-v":
 		fmt.Printf("juice-agent %s (%s)\n", version, commit)
 		return
@@ -66,66 +59,50 @@ func main() {
 	}
 }
 
-// extractFlag removes every occurrence of a boolean flag from args, setting
-// *set if it was present. CLI parsing here is manual (no flag package), so this
-// keeps `--password-stdin` position-independent.
-func extractFlag(args []string, name string, set *bool) []string {
-	out := args[:0]
-	for _, a := range args {
-		if a == name {
-			*set = true
-			continue
-		}
-		out = append(out, a)
-	}
-	return out
-}
-
 func usage() {
 	fmt.Fprintln(os.Stderr, `usage:
-  juice-agent serve [handle]                  run the daemon (channels + worker pool)
-  juice-agent task <handle> "<prompt>"        run one task and print its outcome
-  juice-agent bench <handle> <suite.json>     run the experiment suite and write a report
+  juice-agent serve <login>                   run the daemon (channels + worker pool)
+  juice-agent task <login> "<prompt>"         run one job and print its outcome
+  juice-agent bench <login> <suite.json> [N]  run the experiment suite and write a report
   juice-agent version                         print version and commit
 
-Each agent lives in its own home under $JUICE_HOME/agent/agents/<handle>/ (JUICE_HOME default
-~/.juice), holding config.json, persona.md, knowledge.md, memory.md, and data/. Handles are bare;
-serve takes it as its argument, else AGENT_HANDLE, else agent.
-password (in precedence order): --password-stdin, AGENT_PASSWORD, AGENT_PASSWORD_FILE, or an
-interactive prompt when run in a terminal.`)
+A login is an account on a kernel, handle@kernel, held by the juice CLI:
+  juice kernel add <url> && juice auth login <handle>@<kernel>
+The agent's home is $JUICE_HOME/agents/<login>/ (JUICE_HOME default ~/.juice), holding an
+optional config.json, persona.md, knowledge.md, memory.md, and data/.`)
 }
 
-// setup does the shared startup: load config, authenticate, bootstrap the
-// intrinsic actions, and assemble the executor. It returns the executor, the
-// client, and the resolved loop config.
-func setup(ctx context.Context, log *logger, cliHandle string, stdinPass bool) (*Executor, *juice.Client, agent.Config, Config, error) {
-	cfg, err := ResolveConfig(cliHandle)
+// setup does the shared startup: resolve config, open the login's session,
+// check that it is the account the login names, and assemble the executor. It
+// returns the executor, the client, and the resolved config.
+func setup(ctx context.Context, log *logger, login string) (*Executor, *juice.Client, Config, error) {
+	cfg, err := ResolveConfig(login)
 	if err != nil {
-		return nil, nil, agent.Config{}, cfg, fmt.Errorf("config: %w", err)
-	}
-	if notice := legacyNotice(); notice != "" {
-		log.event("legacy-notice", map[string]any{"message": notice})
+		return nil, nil, cfg, fmt.Errorf("config: %w", err)
 	}
 	if err := cfg.EnsureHome(); err != nil {
-		return nil, nil, agent.Config{}, cfg, fmt.Errorf("ensure home %s: %w", cfg.Home, err)
+		return nil, nil, cfg, fmt.Errorf("ensure home %s: %w", cfg.Home, err)
 	}
-	password, err := resolvePassword(cfg.Handle, stdinPass)
+	cl, err := juice.New(login, juiceHome())
 	if err != nil {
-		return nil, nil, agent.Config{}, cfg, err
-	}
-	cl := juice.New(cfg.ServerURL, cfg.Handle, password)
-	if err := cl.Login(ctx); err != nil {
-		return nil, nil, agent.Config{}, cfg, fmt.Errorf("login as %s: %w", cfg.Handle, err)
+		return nil, nil, cfg, err
 	}
 	self, err := cl.Me(ctx)
 	if err != nil {
-		return nil, nil, agent.Config{}, cfg, fmt.Errorf("identify self: %w", err)
+		return nil, nil, cfg, fmt.Errorf("identify %s: %w", login, err)
 	}
-	log.event("login", map[string]any{"handle": self.Handle, "available": self.Available})
+	// The credential file's name is a label; the account behind it is the
+	// principal it records. A renamed or recreated account must not be served
+	// under memory and a home that belong to another.
+	if self.Address != login || (cl.Principal() != "" && self.ID != cl.Principal()) {
+		return nil, nil, cfg, fmt.Errorf("the session for %s belongs to %s (principal %s): run juice auth login %s",
+			login, self.Address, self.ID, login)
+	}
+	log.event("login", map[string]any{"login": login, "available": self.Available})
 
-	maker, err := NewMaker(cfg.DataDir, cfg.makerConfig(), cl, cl, log.event)
+	maker, err := NewMaker(cfg.DataDir, cfg.makerConfig(), cl, cl, cl.Sys("tinygo/compile"), log.event)
 	if err != nil {
-		return nil, nil, agent.Config{}, cfg, fmt.Errorf("maker: %w", err)
+		return nil, nil, cfg, fmt.Errorf("maker: %w", err)
 	}
 
 	// Harness tools: plain-named, intercepted, never registered on the platform.
@@ -138,22 +115,21 @@ func setup(ctx context.Context, log *logger, cliHandle string, stdinPass bool) (
 	loopCfg := agent.Config{
 		ReplyTool:      "reply",
 		SubtaskTool:    "subtask",
-		LookupAction:   "sys/lookup",
+		LookupAction:   cl.Sys("lookup"),
 		Tools:          []agent.Tool{replyTool(), subtaskTool(), publishTool()},
-		Always:         []agent.Candidate{lookupCandidate()},
+		Always:         []agent.Candidate{lookupCandidate(cl.Sys("lookup"))},
 		MaxTurns:       cfg.MaxTurns,
 		MaxRepeats:     cfg.MaxRepeats,
 		CandidateLimit: cfg.CandidateLimit,
 		LookupLimit:    cfg.LookupLimit,
 		Intrinsics:     intrinsics,
 	}
-	log.event("bootstrap", map[string]any{"handle": self.Handle, "tools": []string{"reply", "subtask", "publish"}})
-	prompter := LoadPrompter(self.Handle, "reply", cfg.personaPath(), cfg.knowledgePath())
+	prompter := LoadPrompter(login, "reply", cfg.personaPath(), cfg.knowledgePath())
 	var mem *Memory
-	if cfg.Memory.Enabled {
-		mem = NewMemory(cfg.memoryPath(), cfg.Memory.MemoryBytes, cl)
+	if cfg.MemoryBytes > 0 {
+		mem = NewMemory(cfg.memoryPath(), cfg.MemoryBytes, cl, "kernel="+cl.KernelKey()+" principal="+cl.Principal(), log.event)
 	}
-	log.event("identity", map[string]any{"handle": self.Handle, "home": cfg.Home, "memory": cfg.Memory.Enabled})
+	log.event("identity", map[string]any{"login": login, "home": cfg.Home, "memory": mem != nil})
 
 	exec := &Executor{
 		Kernel:       cl,
@@ -168,20 +144,19 @@ func setup(ctx context.Context, log *logger, cliHandle string, stdinPass bool) (
 		Memory:       mem,
 		Log:          log.event,
 	}
-	return exec, cl, loopCfg, cfg, nil
+	return exec, cl, cfg, nil
 }
 
-// runServe serves as args[0], or as the default agent when no handle is given.
-func runServe(args []string, stdinPass bool) error {
-	handle := ""
-	if len(args) > 0 {
-		handle = args[0]
+// runServe serves as the login in args[0].
+func runServe(args []string) error {
+	if len(args) != 1 {
+		return fmt.Errorf("usage: juice-agent serve <login>")
 	}
 	log := newLogger()
 	runCtx, cancel := context.WithCancel(context.Background())
 	defer cancel()
 
-	exec, cl, _, cfg, err := setup(runCtx, log, handle, stdinPass)
+	exec, cl, cfg, err := setup(runCtx, log, args[0])
 	if err != nil {
 		return err
 	}
@@ -212,25 +187,25 @@ func runServe(args []string, stdinPass bool) error {
 	return nil
 }
 
-// runTask runs one task as args[0] with the prompt in args[1].
-func runTask(args []string, stdinPass bool) error {
-	if len(args) < 2 || strings.TrimSpace(args[1]) == "" {
-		return fmt.Errorf(`usage: juice-agent task <handle> "<prompt>"`)
+// runTask runs one job as the login in args[0] with the prompt in args[1].
+func runTask(args []string) error {
+	if len(args) != 2 || strings.TrimSpace(args[1]) == "" {
+		return fmt.Errorf(`usage: juice-agent task <login> "<prompt>"`)
 	}
-	handle, prompt := args[0], args[1]
+	login, prompt := args[0], args[1]
 	log := newLogger()
 	ctx := context.Background()
-	exec, _, _, cfg, err := setup(ctx, log, handle, stdinPass)
+	exec, _, cfg, err := setup(ctx, log, login)
 	if err != nil {
 		return err
 	}
-	task := agent.Task{
+	job := agent.Job{
 		ID:       "cli-" + time.Now().Format("20060102-150405"),
 		Channel:  "cli",
 		Budget:   cfg.DefaultBudget,
 		Messages: []agent.Message{{Role: agent.RoleUser, Content: prompt}},
 	}
-	out, err := exec.Execute(ctx, task, nil)
+	out, err := exec.Execute(ctx, job, nil)
 	if err != nil {
 		return err
 	}
@@ -239,35 +214,29 @@ func runTask(args []string, stdinPass bool) error {
 	return enc.Encode(out)
 }
 
-// chatHandle is the sender the chat channel claims; the generic step channel
-// excludes it so the two partition the agent's steps without overlap.
-const chatHandle = "chat"
-
 // buildChannels constructs the enabled intake surfaces from config. One
-// kernelAdapter is the single kernel bridge shared by every channel: the step
-// channel takes it as a channels.StepSource, chat as the full channels.Kernel. A
-// dedicated service channel (chat) claims its own steps, so its sender handle is
-// excluded from the step channel. Adding a channel is one case here plus a package
-// under channels/ (see requirements §10).
+// kernelAdapter is the single kernel bridge shared by every channel: the task
+// channel takes it as a channels.TaskSource, chat as the full channels.Kernel. A
+// dedicated service channel (chat) claims the tasks its service owns, so that
+// owner is excluded from the task channel. Adding a channel is one case here plus
+// a package under channels/ (see requirements §10).
 func buildChannels(cfg Config, cl *juice.Client, log func(string, map[string]any)) []channels.Channel {
 	k := kernelAdapter{cl: cl}
 	var out []channels.Channel
 	var exclude []string
 	chatOn := cfg.Channels.Chat != nil && cfg.Channels.Chat.Enabled
 	if chatOn {
-		exclude = append(exclude, chatHandle)
+		exclude = append(exclude, cl.Address("chat"))
 	}
 	if hc := cfg.Channels.HTTP; hc != nil && hc.Addr != "" {
 		out = append(out, httpchan.NewHTTP(hc.Addr, cfg.DefaultBudget))
 	}
-	if sc := cfg.Channels.Step; sc != nil {
-		interval := time.Duration(sc.PollSeconds) * time.Second
-		out = append(out, step.NewStep(k, interval, cfg.DefaultBudget, cfg.Handle, exclude...))
-	}
+	interval := time.Duration(cfg.Channels.Task.PollSeconds) * time.Second
+	out = append(out, task.New(k, interval, cfg.DefaultBudget, cfg.Login, exclude...))
 	if chatOn {
 		cc := cfg.Channels.Chat
-		out = append(out, chat.New(k, channels.ServiceConfig{
-			Handle:          cfg.Handle,
+		out = append(out, chat.New(k, cl.Address("chat"), channels.ServiceConfig{
+			Address:         cfg.Login,
 			Interval:        time.Duration(cc.PollSeconds) * time.Second,
 			Budget:          cfg.DefaultBudget,
 			DataDir:         cfg.DataDir,
@@ -290,40 +259,6 @@ func channelNames(cs []channels.Channel) []string {
 		out = append(out, c.Name())
 	}
 	return out
-}
-
-// resolvePassword reads the daemon's password by a precedence chain, from
-// non-interactive to interactive (a bare --password flag is intentionally not
-// offered — it would leak via shell history and /proc/<pid>/cmdline). Secrets
-// never live in config.
-func resolvePassword(handle string, stdinFlag bool) (string, error) {
-	if stdinFlag {
-		line, err := bufio.NewReader(os.Stdin).ReadString('\n')
-		if err != nil && !errors.Is(err, io.EOF) {
-			return "", fmt.Errorf("reading --password-stdin: %w", err)
-		}
-		return strings.TrimRight(line, "\r\n"), nil
-	}
-	if p := os.Getenv("AGENT_PASSWORD"); p != "" {
-		return p, nil
-	}
-	if f := os.Getenv("AGENT_PASSWORD_FILE"); f != "" {
-		b, err := os.ReadFile(f)
-		if err != nil {
-			return "", fmt.Errorf("reading AGENT_PASSWORD_FILE: %w", err)
-		}
-		return strings.TrimSpace(string(b)), nil
-	}
-	if fd := int(os.Stdin.Fd()); term.IsTerminal(fd) {
-		fmt.Fprintf(os.Stderr, "Password for %s: ", handle)
-		b, err := term.ReadPassword(fd)
-		fmt.Fprintln(os.Stderr)
-		if err != nil {
-			return "", fmt.Errorf("reading password: %w", err)
-		}
-		return strings.TrimSpace(string(b)), nil
-	}
-	return "", fmt.Errorf("no password: use --password-stdin, set AGENT_PASSWORD or AGENT_PASSWORD_FILE, or run in a terminal")
 }
 
 // logger writes structured JSON log lines to stderr (stdout stays reserved for

@@ -31,16 +31,16 @@ type Executor struct {
 	Loop         agent.Config
 	RateTasks    bool
 	Maker        *Maker
-	Prompter     *Prompter        // assembles the per-task system prompt (persona/knowledge/memory)
-	Memory       *Memory          // learned cross-task memory; nil disables it
-	Enqueue      func(agent.Task) // where maker-proposed synthesis tasks go
+	Prompter     *Prompter       // assembles the per-task system prompt (persona/knowledge/memory)
+	Memory       *Memory         // learned cross-task memory; nil disables it
+	Enqueue      func(agent.Job) // where maker-proposed synthesis tasks go
 	Log          func(event string, fields map[string]any)
 }
 
 // Execute runs one task to completion and returns its outcome. Errors from the
 // loop are recorded but not returned as failures of Execute itself unless the
 // transcript cannot be opened; a decide error becomes a failed outcome.
-func (e *Executor) Execute(ctx context.Context, task agent.Task, steering func() []agent.Message) (agent.Outcome, error) {
+func (e *Executor) Execute(ctx context.Context, task agent.Job, steering func() []agent.Message) (agent.Outcome, error) {
 	logf := e.Log
 	if logf == nil {
 		logf = func(string, map[string]any) {}
@@ -105,7 +105,7 @@ func (e *Executor) retryOK() func(error) bool {
 }
 
 // Chatter summarises a conversation (used by compaction). Implemented by the
-// juice client over sys/llm/chat.
+// juice client over llm/chat.
 type Chatter interface {
 	Chat(ctx context.Context, messages []agent.Message) (string, error)
 }
@@ -138,6 +138,8 @@ func (d retryDecider) Decide(ctx context.Context, msgs []agent.Message, catalog 
 
 // retryRunner wraps an agent.Runner: it retries only transport-level failures,
 // never a kernel call that ran and failed (that is a result fed to the model).
+// Every attempt carries the dispatch's key, so a retry after a lost reply is
+// answered with the first run's outcome instead of running the action again.
 type retryRunner struct {
 	inner   agent.Runner
 	policy  RetryPolicy
@@ -145,10 +147,10 @@ type retryRunner struct {
 	sleep   func(time.Duration)
 }
 
-func (r retryRunner) Run(ctx context.Context, action string, args map[string]any) (agent.RunResult, error) {
+func (r retryRunner) Run(ctx context.Context, action string, args map[string]any, quoteHash, key string) (agent.RunResult, error) {
 	var last error
 	for attempt := 0; attempt <= r.policy.MaxRetries; attempt++ {
-		res, err := r.inner.Run(ctx, action, args)
+		res, err := r.inner.Run(ctx, action, args, quoteHash, key)
 		if err == nil || !r.retryOK(err) {
 			return res, err
 		}

@@ -58,8 +58,9 @@ func (p *Prompter) Build(memoryDigest string) agent.Message {
 	if s := strings.TrimSpace(memoryDigest); s != "" {
 		b.WriteString("\n# Memory (what you learned from past tasks)\n" + s + "\n")
 	}
-	b.WriteString("\n# Operating\nPrefer actions with a proven track record; try an untested one " +
-		"only when nothing proven fits. For a multi-step sub-problem, open the subtask tool with a " +
+	b.WriteString("\n# Operating\nYou can run only the actions offered to you; run lookup to find more. " +
+		"Prefer actions whose record shows successful use; try one with no record only when nothing " +
+		"recorded fits. For a multi-step sub-problem, open the subtask tool with a " +
 		"specific instruction — it works in its own scope and returns only its result. Stay within " +
 		"your credit budget. When you have the answer, select the " + reply + " tool.")
 	return agent.Message{Role: agent.RoleSystem, Kind: "system", Content: strings.TrimSpace(b.String())}
@@ -79,23 +80,51 @@ func readFileOrEmpty(path string) string {
 // Memory is the agent's durable, legible cross-task memory: a Markdown file it
 // appends a task summary to when a task settles and reloads into the system
 // prompt before the next one. It is byte-bounded; over budget the oldest entries
-// are folded into a digest via one sys/llm/chat call. This is the middle path
+// are folded into a digest via one llm/chat call. This is the middle path
 // between pi (no automatic cross-task memory) and a semantic store — accumulation
 // is automatic, the result stays human-readable.
+//
+// Every entry's heading carries the identity it was learned under — the kernel's
+// key and the account's principal id (ecosystem standard §4) — and only entries
+// under the current identity are loaded or compacted, so what was learned about
+// another kernel or account never reaches the prompt as if it were about this one.
 type Memory struct {
-	path    string
-	bytes   int
-	chatter Chatter
+	path     string
+	bytes    int
+	chatter  Chatter
+	identity string
+	log      func(string, map[string]any)
 
-	mu sync.Mutex
+	mu     sync.Mutex
+	warned bool
 }
 
-// NewMemory builds a Memory backed by path with the given byte budget.
-func NewMemory(path string, bytes int, chatter Chatter) *Memory {
-	if bytes <= 0 {
-		bytes = 65536
+// NewMemory builds a Memory backed by path with the given byte budget, writing
+// and reading entries under identity.
+func NewMemory(path string, bytes int, chatter Chatter, identity string, log func(string, map[string]any)) *Memory {
+	if log == nil {
+		log = func(string, map[string]any) {}
 	}
-	return &Memory{path: path, bytes: bytes, chatter: chatter}
+	return &Memory{path: path, bytes: bytes, chatter: chatter, identity: identity, log: log}
+}
+
+// own reports whether an entry is this identity's: a heading entry must carry
+// it; text before the first heading is the operator's and always kept.
+func (m *Memory) own(entry string) bool {
+	head, _, _ := strings.Cut(entry, "\n")
+	return !strings.HasPrefix(head, "## ") || strings.Contains(head, m.identity)
+}
+
+// partition splits a memory file into this identity's entries and the others.
+func (m *Memory) partition(content string) (mine, other []string) {
+	for _, e := range splitEntries(content) {
+		if m.own(e) {
+			mine = append(mine, e)
+		} else {
+			other = append(other, e)
+		}
+	}
+	return mine, other
 }
 
 // Digest returns the current memory contents to inject into the system prompt
@@ -110,14 +139,19 @@ func (m *Memory) Digest() string {
 	if err != nil {
 		return ""
 	}
-	return strings.TrimSpace(string(b))
+	mine, other := m.partition(string(b))
+	if len(other) > 0 && !m.warned {
+		m.warned = true
+		m.log("memory_other_identity", map[string]any{"omitted": len(other)})
+	}
+	return strings.TrimSpace(strings.Join(mine, ""))
 }
 
 // Update summarises a finished task into a dated entry and appends it, compacting
 // if the file grows past the byte budget. Best-effort: any failure is swallowed —
 // a memory hiccup must never fail the task. stamp is an injected timestamp label
 // (supplied by the caller so this stays deterministic in tests).
-func (m *Memory) Update(ctx context.Context, stamp string, task agent.Task, out agent.Outcome, msgs []agent.Message) {
+func (m *Memory) Update(ctx context.Context, stamp string, task agent.Job, out agent.Outcome, msgs []agent.Message) {
 	if m == nil || m.chatter == nil {
 		return
 	}
@@ -125,7 +159,7 @@ func (m *Memory) Update(ctx context.Context, stamp string, task agent.Task, out 
 	if strings.TrimSpace(entry) == "" {
 		return
 	}
-	block := "## " + stamp + " — " + task.ID + "\n" + strings.TrimSpace(entry) + "\n\n"
+	block := "## " + stamp + " " + m.identity + " — " + task.ID + "\n" + strings.TrimSpace(entry) + "\n\n"
 
 	m.mu.Lock()
 	defer m.mu.Unlock()
@@ -138,7 +172,7 @@ func (m *Memory) Update(ctx context.Context, stamp string, task agent.Task, out 
 }
 
 // summarise asks the model to distil the finished task into a few terse notes.
-func (m *Memory) summarise(ctx context.Context, task agent.Task, out agent.Outcome, msgs []agent.Message) string {
+func (m *Memory) summarise(ctx context.Context, task agent.Job, out agent.Outcome, msgs []agent.Message) string {
 	var b strings.Builder
 	b.WriteString("Summarise this finished task into 2-4 terse bullet points: what was asked, what " +
 		"you did (name the actions used), the outcome, and anything worth remembering for similar " +
@@ -164,12 +198,12 @@ func (m *Memory) summarise(ctx context.Context, task agent.Task, out agent.Outco
 	return reply
 }
 
-// compact folds the older half of the memory into a digest, keeping recent
-// entries verbatim, when the file exceeds its byte budget. On failure it returns
-// the input unchanged (the file may stay over budget until the next update, which
-// is preferable to losing memory).
+// compact folds the older half of this identity's entries into a digest, keeping
+// recent entries verbatim and other identities' entries untouched, when the file
+// exceeds its byte budget. On failure it returns the input unchanged (the file may
+// stay over budget until the next update, which is preferable to losing memory).
 func (m *Memory) compact(ctx context.Context, combined string) string {
-	entries := splitEntries(combined)
+	entries, other := m.partition(combined)
 	if len(entries) <= 1 {
 		return combined
 	}
@@ -194,7 +228,8 @@ func (m *Memory) compact(ctx context.Context, combined string) string {
 	if err != nil || strings.TrimSpace(summary) == "" {
 		return combined
 	}
-	return "## digest (older tasks, condensed)\n" + strings.TrimSpace(summary) + "\n\n" + recent
+	return strings.Join(other, "") + "## digest " + m.identity + " (older entries, condensed)\n" +
+		strings.TrimSpace(summary) + "\n\n" + recent
 }
 
 // splitEntries splits a memory file into blocks, each beginning at a "## "

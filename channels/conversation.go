@@ -11,14 +11,14 @@ import (
 // convTurn is one persisted visible turn: a role (user or assistant) and its text.
 // Only the conversation the room actually sees is stored — the incoming messages
 // and the agent's posted answers — never the agent's tool calls, lookups, or
-// reasoning (those live in the per-task transcript, not here).
+// reasoning (those live in the per-job transcript, not here).
 type convTurn struct {
 	Role string `json:"role"` // "user" | "assistant"
 	Text string `json:"text"`
 }
 
 // convStore persists a bounded window of recent conversation turns per session so
-// each new task can be seeded with the room's recent history — the conversation
+// each new job can be seeded with the room's recent history — the conversation
 // continuity of design §4. It mirrors cursorStore: a per-session JSON map under the
 // data dir, written atomically (temp + rename). A non-positive window disables it,
 // so newConvStore returns nil and every method is nil-safe.
@@ -31,7 +31,7 @@ type convStore struct {
 
 // newConvStore opens (or starts) the store at path, keeping the last window turns
 // per session. window <= 0 returns nil — the feature is off and callers treat a nil
-// store as "no context" (single-message tasks, as before).
+// store as "no context" (single-message jobs, as before).
 func newConvStore(path string, window int) *convStore {
 	if window <= 0 {
 		return nil
@@ -44,7 +44,7 @@ func newConvStore(path string, window int) *convStore {
 }
 
 // seed returns the session's stored turns as role-tagged messages, oldest first, to
-// prepend to a new task's Messages. A nil store (disabled) or an empty history
+// prepend to a new job's Messages. A nil store (disabled) or an empty history
 // returns nil.
 func (c *convStore) seed(key string) []agent.Message {
 	if c == nil {

@@ -50,8 +50,8 @@ func TestRateTaskMechanicalZeroForFailures(t *testing.T) {
 
 func TestRateTaskJudgesSuccessfulCalls(t *testing.T) {
 	msgs := []agent.Message{
-		{Role: agent.RoleTool, Action: "sys/time", TxID: "tx-0"},
-		{Role: agent.RoleTool, Action: "sys/web", TxID: "tx-1"},
+		{Role: agent.RoleTool, Action: "sys@k/time", TxID: "tx-0"},
+		{Role: agent.RoleTool, Action: "sys@k/web", TxID: "tx-1"},
 	}
 	judgment := map[string]any{"ratings": []any{
 		map[string]any{"index": float64(0), "rating": float64(1), "note": "gave the time"},

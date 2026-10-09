@@ -1,5 +1,5 @@
 // Package http is a Juice-independent intake channel: a local HTTP endpoint that
-// accepts tasks (POST /task) and serves their outcomes (GET /task/{id}). It exists
+// accepts jobs (POST /task) and serves their outcomes (GET /task/{id}). It exists
 // so the agent can be driven without going through the kernel at all. It satisfies
 // channels.Channel and needs no kernel access.
 package http
@@ -22,7 +22,7 @@ type HTTP struct {
 	defaultBudget int
 
 	srv    *http.Server
-	submit func(agent.Task)
+	submit func(agent.Job)
 	seq    int64
 
 	// Addr, once Start returns, is the actually-bound address (useful when addr
@@ -34,7 +34,7 @@ type HTTP struct {
 	done     map[string]chan struct{}
 }
 
-// NewHTTP builds an HTTP channel bound to addr, stamping tasks with defaultBudget
+// NewHTTP builds an HTTP channel bound to addr, stamping jobs with defaultBudget
 // when a request omits one.
 func NewHTTP(addr string, defaultBudget int) *HTTP {
 	return &HTTP{addr: addr, defaultBudget: defaultBudget,
@@ -43,7 +43,7 @@ func NewHTTP(addr string, defaultBudget int) *HTTP {
 
 func (h *HTTP) Name() string { return "http" }
 
-func (h *HTTP) Start(_ context.Context, submit func(agent.Task)) error {
+func (h *HTTP) Start(_ context.Context, submit func(agent.Job)) error {
 	h.submit = submit
 	mux := http.NewServeMux()
 	mux.HandleFunc("/task", h.handleTask)
@@ -80,7 +80,7 @@ func (h *HTTP) handleTask(w http.ResponseWriter, r *http.Request) {
 	h.done[id] = make(chan struct{})
 	h.mu.Unlock()
 
-	h.submit(agent.Task{ID: id, Channel: "http", Budget: budget,
+	h.submit(agent.Job{ID: id, Channel: "http", Budget: budget,
 		Messages: []agent.Message{{Role: agent.RoleUser, Content: req.Prompt}}})
 
 	writeJSON(w, http.StatusAccepted, map[string]string{"task_id": id})
@@ -100,16 +100,16 @@ func (h *HTTP) handleOutcome(w http.ResponseWriter, r *http.Request) {
 		writeJSON(w, http.StatusAccepted, map[string]string{"status": "running"})
 		return
 	}
-	http.Error(w, "unknown task", http.StatusNotFound)
+	http.Error(w, "unknown job", http.StatusNotFound)
 }
 
-// Deliver records a task's outcome and wakes any waiter.
-func (h *HTTP) Deliver(taskID string, out agent.Outcome) {
+// Deliver records a job's outcome and wakes any waiter.
+func (h *HTTP) Deliver(jobID string, out agent.Outcome) {
 	h.mu.Lock()
-	h.outcomes[taskID] = out
-	if ch, ok := h.done[taskID]; ok {
+	h.outcomes[jobID] = out
+	if ch, ok := h.done[jobID]; ok {
 		close(ch)
-		delete(h.done, taskID)
+		delete(h.done, jobID)
 	}
 	h.mu.Unlock()
 }

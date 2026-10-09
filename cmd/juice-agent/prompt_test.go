@@ -15,14 +15,14 @@ func TestPromptBuildIncludesSectionsWhenPresent(t *testing.T) {
 		Handle:    "research",
 		ReplyTool: "reply",
 		Persona:   "Be terse and formal.",
-		Knowledge: "Juice actions are owner/name.",
+		Knowledge: "Juice actions are owner@kernel/name.",
 	}
-	msg := p.Build("Last time I used sys/time for clocks.")
+	msg := p.Build("Last time I used sys@k/time for clocks.")
 	if msg.Role != agent.RoleSystem || msg.Kind != "system" {
 		t.Fatalf("role/kind = %q/%q", msg.Role, msg.Kind)
 	}
 	for _, want := range []string{"research", "\"reply\"", "Be terse and formal.",
-		"Juice actions are owner/name.", "Last time I used sys/time", "# Persona", "# Knowledge", "# Memory"} {
+		"Juice actions are owner@kernel/name.", "Last time I used sys@k/time", "# Persona", "# Knowledge", "# Memory"} {
 		if !strings.Contains(msg.Content, want) {
 			t.Fatalf("prompt missing %q:\n%s", want, msg.Content)
 		}
@@ -70,13 +70,13 @@ func (c *echoChatter) Chat(_ context.Context, msgs []agent.Message) (string, err
 	return c.reply, nil
 }
 
-func memTask() (agent.Task, agent.Outcome, []agent.Message) {
-	task := agent.Task{ID: "t1", Messages: []agent.Message{{Role: agent.RoleUser, Content: "what time is it"}}}
+func memTask() (agent.Job, agent.Outcome, []agent.Message) {
+	task := agent.Job{ID: "t1", Messages: []agent.Message{{Role: agent.RoleUser, Content: "what time is it"}}}
 	out := agent.Outcome{Status: agent.StatusAnswered}
 	msgs := []agent.Message{
 		{Role: agent.RoleUser, Content: "what time is it"},
-		{Role: agent.RoleAssistant, Action: "sys/time"},
-		{Role: agent.RoleTool, Action: "sys/time", TxID: "tx1"},
+		{Role: agent.RoleAssistant, Action: "sys@k/time"},
+		{Role: agent.RoleTool, Action: "sys@k/time", TxID: "tx1"},
 	}
 	return task, out, msgs
 }
@@ -84,7 +84,7 @@ func memTask() (agent.Task, agent.Outcome, []agent.Message) {
 func TestMemoryUpdateAppendsEntryAndDigestReadsIt(t *testing.T) {
 	dir := t.TempDir()
 	path := filepath.Join(dir, "memory.md")
-	m := NewMemory(path, 65536, &echoChatter{reply: "- asked the time; used sys/time; answered"})
+	m := NewMemory(path, 65536, &echoChatter{reply: "- asked the time; used sys@k/time; answered"}, "kernel=K principal=P", nil)
 
 	if m.Digest() != "" {
 		t.Fatal("digest should be empty before any update")
@@ -93,13 +93,13 @@ func TestMemoryUpdateAppendsEntryAndDigestReadsIt(t *testing.T) {
 	m.Update(context.Background(), "2026-07-10 01:00", task, out, msgs)
 
 	dig := m.Digest()
-	if !strings.Contains(dig, "sys/time") || !strings.Contains(dig, "t1") {
+	if !strings.Contains(dig, "sys@k/time") || !strings.Contains(dig, "t1") {
 		t.Fatalf("memory digest missing content:\n%s", dig)
 	}
 	// The summariser must have been shown the transcript (the action it used).
 	// (echoChatter recorded the last prompt.)
 	data, _ := os.ReadFile(path)
-	if !strings.Contains(string(data), "## 2026-07-10 01:00 — t1") {
+	if !strings.Contains(string(data), "## 2026-07-10 01:00 kernel=K principal=P — t1") {
 		t.Fatalf("entry heading missing:\n%s", data)
 	}
 }
@@ -117,7 +117,7 @@ func TestMemoryCompactsWhenOverBudget(t *testing.T) {
 	dir := t.TempDir()
 	path := filepath.Join(dir, "memory.md")
 	// Tiny budget so a couple of entries trigger compaction.
-	m := NewMemory(path, 200, &echoChatter{reply: "a reasonably long summary line that consumes bytes across entries"})
+	m := NewMemory(path, 200, &echoChatter{reply: "a reasonably long summary line that consumes bytes across entries"}, "kernel=K principal=P", nil)
 
 	task, out, msgs := memTask()
 	for i := 0; i < 6; i++ {
@@ -132,5 +132,33 @@ func TestMemoryCompactsWhenOverBudget(t *testing.T) {
 	}
 	if len(data) > 200*3 {
 		t.Fatalf("memory grew unbounded (%d bytes) despite compaction", len(data))
+	}
+}
+
+func TestMemoryKeepsOtherIdentitiesOutOfDigestAndCompaction(t *testing.T) {
+	dir := t.TempDir()
+	path := filepath.Join(dir, "memory.md")
+	foreign := "## 2026-01-01 00:00 kernel=OTHER principal=Q — old\n- learned on another kernel\n\n"
+	os.WriteFile(path, []byte("operator note\n"+foreign), 0o600)
+	var logged []string
+	m := NewMemory(path, 300, &echoChatter{reply: "a reasonably long summary line that consumes bytes across entries"},
+		"kernel=K principal=P", func(ev string, _ map[string]any) { logged = append(logged, ev) })
+
+	dig := m.Digest()
+	if !strings.Contains(dig, "operator note") || strings.Contains(dig, "another kernel") {
+		t.Fatalf("digest = %q, want the operator's note and not the other identity's entry", dig)
+	}
+	m.Digest()
+	if len(logged) != 1 || logged[0] != "memory_other_identity" {
+		t.Fatalf("logged = %v, want one memory_other_identity event", logged)
+	}
+	task, out, msgs := memTask()
+	for i := 0; i < 6; i++ {
+		task.ID = "job-" + string(rune('a'+i))
+		m.Update(context.Background(), "2026-07-10 01:00", task, out, msgs)
+	}
+	data, _ := os.ReadFile(path)
+	if !strings.Contains(string(data), foreign) {
+		t.Fatalf("compaction must leave the other identity's entry verbatim:\n%s", data)
 	}
 }

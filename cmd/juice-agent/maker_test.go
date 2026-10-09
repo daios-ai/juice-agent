@@ -37,8 +37,8 @@ func indexOf(s, sub string) int {
 	return -1
 }
 
-func makeTask(id, prompt string) agent.Task {
-	return agent.Task{ID: id, Channel: "http", Budget: 100,
+func makeTask(id, prompt string) agent.Job {
+	return agent.Job{ID: id, Channel: "http", Budget: 100,
 		Messages: []agent.Message{{Role: agent.RoleUser, Content: prompt}}}
 }
 
@@ -46,7 +46,7 @@ func TestMakerTriggersAfterRepeats(t *testing.T) {
 	dir := t.TempDir()
 	emb := fixedEmbedder{vecs: map[string][]float64{"pirate": {1, 0, 0}}}
 	cfg := MakerConfig{Enabled: true, MinRepeats: 3, Window: 50, Budget: 40, Threshold: 0.9}
-	m, err := NewMaker(dir, cfg, emb, nil, nil)
+	m, err := NewMaker(dir, cfg, emb, nil, "sys@k/tinygo/compile", nil)
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -77,7 +77,7 @@ func TestMakerTriggersAfterRepeats(t *testing.T) {
 
 func TestMakerDisabledNeverTriggers(t *testing.T) {
 	dir := t.TempDir()
-	m, _ := NewMaker(dir, MakerConfig{Enabled: false, MinRepeats: 1}, fixedEmbedder{}, nil, nil)
+	m, _ := NewMaker(dir, MakerConfig{Enabled: false, MinRepeats: 1}, fixedEmbedder{}, nil, "sys@k/tinygo/compile", nil)
 	if s := m.Observe(context.Background(), makeTask("1", "x"), agent.Outcome{}); s != nil {
 		t.Fatal("disabled maker must not trigger")
 	}
@@ -97,7 +97,7 @@ func (p *fakePublisher) CreateWasmAction(_ context.Context, _, _ string, _ int, 
 func (p *fakePublisher) EnableAction(_ context.Context, _ string) error { p.enabled = true; return nil }
 func (p *fakePublisher) SetPublic(_ context.Context, _ string) error    { p.madePublic = true; return nil }
 func (p *fakePublisher) DeleteAction(_ context.Context, _ string) error { p.deleted = true; return nil }
-func (p *fakePublisher) Run(_ context.Context, _ string, _ map[string]any) (agent.RunResult, error) {
+func (p *fakePublisher) Run(_ context.Context, _ string, _ map[string]any, _, _ string) (agent.RunResult, error) {
 	p.runs++
 	return agent.RunResult{}, p.runErr
 }
@@ -105,7 +105,7 @@ func (p *fakePublisher) Run(_ context.Context, _ string, _ map[string]any) (agen
 func TestPublishIntrinsicSuccess(t *testing.T) {
 	dir := t.TempDir()
 	pub := &fakePublisher{}
-	m, _ := NewMaker(dir, MakerConfig{Enabled: true}, fixedEmbedder{}, pub, nil)
+	m, _ := NewMaker(dir, MakerConfig{Enabled: true}, fixedEmbedder{}, pub, "sys@k/tinygo/compile", nil)
 	intr := m.PublishIntrinsic()
 	res, terminal, err := intr.Handle(context.Background(), map[string]any{
 		"name": "thing", "artifact": "BASE64", "description": "d",
@@ -134,7 +134,7 @@ func TestPublishIntrinsicSuccess(t *testing.T) {
 func TestPublishIntrinsicDeletesOnTestFailure(t *testing.T) {
 	dir := t.TempDir()
 	pub := &fakePublisher{runErr: errors.New("schema violation")}
-	m, _ := NewMaker(dir, MakerConfig{Enabled: true}, fixedEmbedder{}, pub, nil)
+	m, _ := NewMaker(dir, MakerConfig{Enabled: true}, fixedEmbedder{}, pub, "sys@k/tinygo/compile", nil)
 	intr := m.PublishIntrinsic()
 	res, _, _ := intr.Handle(context.Background(), map[string]any{
 		"name": "thing", "artifact": "B64",
@@ -153,7 +153,7 @@ func TestPublishIntrinsicDeletesOnTestFailure(t *testing.T) {
 
 func TestMakerConcurrentObserveNoCorruption(t *testing.T) {
 	dir := t.TempDir()
-	m, _ := NewMaker(dir, MakerConfig{Enabled: false, Window: 1000}, fixedEmbedder{}, nil, nil)
+	m, _ := NewMaker(dir, MakerConfig{Enabled: false, Window: 1000}, fixedEmbedder{}, nil, "sys@k/tinygo/compile", nil)
 	const n = 40
 	var wg sync.WaitGroup
 	for i := 0; i < n; i++ {

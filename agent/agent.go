@@ -9,8 +9,10 @@ package agent
 
 import (
 	"context"
+	"crypto/rand"
+	"encoding/hex"
+	"errors"
 	"fmt"
-	"sort"
 	"strings"
 )
 
@@ -44,28 +46,24 @@ type Message struct {
 	Bracket string `json:"bracket,omitempty"`
 }
 
-// ActionStats is an action's kernel track record (GET /v1/stats/{id}). Known is
-// false when no stats row was fetched (an untested action), so callers can
-// distinguish "zero uses" from "unknown".
-type ActionStats struct {
-	Uses            int     `json:"uses"`
-	Successes       int     `json:"successes"`
-	Failures        int     `json:"failures"`
-	LatencyEstimate float64 `json:"latency_estimate"`
-	RatingEstimate  float64 `json:"rating_estimate"`
-	RatingCount     int     `json:"rating_count"`
-	Known           bool    `json:"-"`
-}
-
-// Candidate is a callable action in the working set: its owner/name ref, the
-// contract fields lookup returns, its price (the subtree bound), and its stats.
+// Candidate is a callable action in the working set: its address, the contract
+// fields an authoritative read returns (Catalog.Read), its price, the quote_hash
+// that pins those terms on dispatch, its value effect if any, and the kernel's
+// evidence about it.
 type Candidate struct {
 	Ref         string         `json:"ref"`
 	Description string         `json:"description"`
 	InputSchema map[string]any `json:"input_schema,omitempty"`
 	Price       int            `json:"price"`
-	Stats       ActionStats    `json:"stats"`
+	QuoteHash   string         `json:"quote_hash,omitempty"`
+	Effect      string         `json:"effect,omitempty"`
+	Evidence    map[string]any `json:"evidence,omitempty"`
 }
+
+// ErrTermsChanged is the Runner's report that a pinned quote no longer holds: the
+// action's terms moved after the job read them, and the kernel refused the call
+// before locking any funds.
+var ErrTermsChanged = errors.New("terms changed")
 
 // Selection is one model turn extracted by the Decider: the chosen action, its
 // args, and an optional natural-language message. Args are validated later — a
@@ -77,31 +75,39 @@ type Selection struct {
 	Message string         `json:"message,omitempty"`
 }
 
-// RunResult is the outcome of dispatching a tool call through Runner.
+// RunResult is the outcome of dispatching a tool call through Runner. TxID and
+// Charge are the settlement the kernel reported (Charge is what left the agent);
+// a failed call returns them alongside its error. An empty TxID means no
+// settlement was reported.
 type RunResult struct {
 	Result map[string]any
 	TxID   string
+	Charge int
 }
 
 // Decider performs one model round-trip: given the conversation, the catalog
-// candidates (with descriptions/schemas/stats to render), and the harness tools,
+// candidates (with descriptions, schemas, prices and evidence to render), and the harness tools,
 // it returns the next selection. Implemented by the juice client over
-// sys/llm/chat (it builds the tool list itself and extracts a JSON selection).
+// llm/chat (it builds the tool list itself and extracts a JSON selection).
 type Decider interface {
 	Decide(ctx context.Context, messages []Message, catalog []Candidate, tools []Tool) (*Selection, error)
 }
 
-// Catalog discovers actions and reads their metadata. Lookup ranks active
-// actions for a query (sys/lookup); Meta fetches an action's price and stats.
+// Catalog discovers actions and reads their terms. Lookup ranks callable actions
+// for a query (the lookup native; its rows are indicative); Read returns one
+// action's authoritative terms.
 type Catalog interface {
 	Lookup(ctx context.Context, query string, limit int) ([]Candidate, error)
-	Meta(ctx context.Context, ref string) (price int, stats ActionStats, err error)
+	Read(ctx context.Context, ref string) (Candidate, error)
 }
 
-// Runner dispatches a tool call: POST /v1/run on the action. A kernel-level
-// failure (the action ran and failed, or was rejected) is returned as an error.
+// Runner dispatches a tool call: POST /v1/run on the action, pinned to quoteHash
+// and named by key when non-empty. A repeat under the same key answers with the
+// first run's outcome, so a retried dispatch never runs twice. A kernel-level
+// failure (the action ran and failed, or was rejected) is returned as an error; a
+// moved quote as ErrTermsChanged.
 type Runner interface {
-	Run(ctx context.Context, action string, args map[string]any) (RunResult, error)
+	Run(ctx context.Context, action string, args map[string]any, quoteHash, key string) (RunResult, error)
 }
 
 // Transcript is the durable, possibly-compacted working memory. Append persists
@@ -125,16 +131,17 @@ type Intrinsic struct {
 	Handle func(ctx context.Context, args map[string]any) (result map[string]any, terminal bool, err error)
 }
 
-// Task is one unit of work: a transcript seed, an originating channel, and a
-// credit budget bounding total spend.
-type Task struct {
+// Job is one unit of the agent's work: a transcript seed, an originating
+// channel, and a credit budget bounding total spend. (A kernel task, D6, is what
+// a channel turns into a Job; the two are distinct.)
+type Job struct {
 	ID       string
 	Channel  string
 	Messages []Message
 	Budget   int
 }
 
-// Status is a task's terminal disposition.
+// Status is a job's terminal disposition.
 type Status string
 
 const (
@@ -153,7 +160,7 @@ type Outcome struct {
 }
 
 // Tool is a plain-named harness capability offered to the model alongside the
-// catalog's owner/name actions. Unlike an action it is not registered anywhere
+// catalog's actions (addressed owner@kernel/name). Unlike an action it is not registered anywhere
 // on the platform — the harness intercepts its selection (see Intrinsic). Names
 // never contain "/", so they are unambiguous against action refs.
 type Tool struct {
@@ -168,9 +175,9 @@ type Tool struct {
 type Config struct {
 	ReplyTool      string      // the terminal tool's name (e.g. "reply")
 	SubtaskTool    string      // the bracket-opening tool's name (e.g. "subtask"); "" disables brackets
-	LookupAction   string      // the discovery action ref (e.g. "sys/lookup")
+	LookupAction   string      // the discovery action's address (e.g. "sys@work/lookup")
 	Tools          []Tool      // harness tools rendered to the model each turn
-	Always         []Candidate // catalog candidates always offered (e.g. sys/lookup)
+	Always         []Candidate // catalog candidates always offered (e.g. lookup); never evicted
 	MaxTurns       int
 	CandidateLimit int
 	LookupLimit    int
@@ -197,31 +204,31 @@ type Deps struct {
 	Log        func(event string, fields map[string]any)
 }
 
-// counters are the per-task budgets shared by every frame (root and brackets) so
-// a subtask tree totals at most MaxTurns turns and task.Budget credits — the
+// counters are the per-job budgets shared by every frame (root and brackets) so
+// a subtask tree totals at most MaxTurns turns and job.Budget credits — the
 // bound is the shared counter, not a per-frame cap.
 type counters struct {
 	turns int
 	spent int
 }
 
-// Run executes one task to completion via the root loop frame (§4). Subtasks
+// Run executes one job to completion via the root loop frame (§4). Subtasks
 // (§4b) recurse into brackets that share the same counters and roll up to a
 // single result in the parent chat. The stop rule keys off the *selection* (the
 // reply tool), never a provider stop reason; the primary runaway rail is
-// economic (priced calls prepaid against task.Budget), the secondary the turn cap.
-func Run(ctx context.Context, task Task, cfg Config, deps Deps) (Outcome, error) {
+// economic (priced calls prepaid against job.Budget), the secondary the turn cap.
+func Run(ctx context.Context, job Job, cfg Config, deps Deps) (Outcome, error) {
 	logf := deps.Log
 	if logf == nil {
 		logf = func(string, map[string]any) {}
 	}
-	for _, m := range task.Messages {
+	for _, m := range job.Messages {
 		if err := deps.Transcript.Append(ctx, m); err != nil {
 			return Outcome{Status: StatusFailed}, err
 		}
 	}
 	cnt := &counters{}
-	res, status, reason, err := runFrame(ctx, cfg, deps, task.Budget, cnt, 0, logf)
+	res, status, reason, err := runFrame(ctx, cfg, deps, job.Budget, cnt, 0, logf)
 	out := Outcome{Status: status, Reason: reason, Spent: cnt.spent, Turns: cnt.turns}
 	if status == StatusAnswered {
 		out.Answer = res
@@ -237,9 +244,6 @@ func Run(ctx context.Context, task Task, cfg Config, deps Deps) (Outcome, error)
 // this frame's model view; its records are teed to the shared durable store.
 func runFrame(ctx context.Context, cfg Config, deps Deps, budget int, cnt *counters, depth int, logf func(string, map[string]any)) (map[string]any, Status, string, error) {
 	ws := newWorkingSet(cfg.CandidateLimit)
-	for _, c := range cfg.Always {
-		ws.put(c)
-	}
 	if seed, err := deps.Catalog.Lookup(ctx, promptOf(deps.Transcript.Messages()), cfg.LookupLimit); err == nil {
 		mergeCandidates(ctx, deps, ws, seed)
 	}
@@ -403,9 +407,23 @@ func runFrame(ctx context.Context, cfg Config, deps Deps, budget int, cnt *count
 			}
 			progressed(sel.Action)
 
-		// catalog action → dispatch (budget-gated).
+		// catalog action → dispatch (budget-gated). Only an offered candidate is
+		// dispatched: its price is what the budget gate charges, so an action the
+		// model names from elsewhere would escape the gate.
 		default:
-			price := ws.priceOf(sel.Action)
+			cand, ok := ws.offered(cfg, sel.Action)
+			if !ok {
+				over, aerr := feedback(fmt.Sprintf("%q is not one of the offered tools or actions. Select one "+
+					"that is offered, or run %q to find more.", sel.Action, cfg.LookupAction))
+				if aerr != nil {
+					return nil, StatusFailed, "", aerr
+				}
+				if over {
+					return exhausted("decide-error: unoffered action " + sel.Action)
+				}
+				continue
+			}
+			price := cand.Price
 			if cnt.spent+price > budget {
 				if err := deps.Transcript.Append(ctx, Message{Role: RoleUser, Kind: "budget",
 					Content: fmt.Sprintf("Budget exceeded: %q costs %d but only %d credits remain. "+
@@ -415,11 +433,19 @@ func runFrame(ctx context.Context, cfg Config, deps Deps, budget int, cnt *count
 				logf("budget_refusal", map[string]any{"action": sel.Action, "price": price, "remaining": budget - cnt.spent})
 				continue
 			}
-			rr, rerr := deps.Runner.Run(ctx, sel.Action, sel.Args)
-			cnt.spent += price
+			rr, rerr := deps.Runner.Run(ctx, sel.Action, sel.Args, cand.QuoteHash, runKey())
+			charge := price // no settlement reported: the call may still draw its price
+			switch {
+			case rr.TxID != "":
+				charge = rr.Charge
+			case errors.Is(rerr, ErrTermsChanged):
+				charge = 0          // refused before any funds were locked
+				ws.drop(sel.Action) // re-offered only after a fresh read
+			}
+			cnt.spent += charge
 			result := rr.Result
 			if sel.Action == cfg.LookupAction && rerr == nil {
-				mergeCandidates(ctx, deps, ws, parseLookup(rr.Result))
+				mergeCandidates(ctx, deps, ws, ParseLookup(rr.Result))
 				result = trimLookup(rr.Result)
 			}
 			if err := deps.Transcript.Append(ctx, Message{
@@ -429,7 +455,7 @@ func runFrame(ctx context.Context, cfg Config, deps Deps, budget int, cnt *count
 				return nil, StatusFailed, "", err
 			}
 			progressed(sel.Action)
-			logf("dispatch", map[string]any{"action": sel.Action, "price": price, "tx_id": rr.TxID, "error": rerr != nil})
+			logf("dispatch", map[string]any{"action": sel.Action, "price": price, "charge": charge, "tx_id": rr.TxID, "error": rerr != nil})
 		}
 	}
 }
@@ -470,24 +496,27 @@ func errText(err error) string {
 	return err.Error()
 }
 
-// mergeCandidates enriches each new candidate with its price and stats (via
-// Catalog.Meta) and folds it into the working set. Refs already present are
-// refreshed, not duplicated.
+// mergeCandidates replaces each lookup row with the action's authoritative read
+// (Catalog.Read) and folds it into the working set; refs already present are
+// refreshed. A row whose read fails is dropped, and so is an action with a value
+// effect: it moves the caller's own balance beyond its price, so the budget gate,
+// which charges the price, could not bound it.
 func mergeCandidates(ctx context.Context, deps Deps, ws *workingSet, cs []Candidate) {
 	for _, c := range cs {
 		if c.Ref == "" {
 			continue
 		}
-		if price, stats, err := deps.Catalog.Meta(ctx, c.Ref); err == nil {
-			c.Price, c.Stats = price, stats
+		full, err := deps.Catalog.Read(ctx, c.Ref)
+		if err != nil || full.Effect != "" {
+			continue
 		}
-		ws.put(c)
+		ws.put(full)
 	}
 }
 
-// parseLookup extracts candidates from a sys/lookup result object
+// ParseLookup extracts candidates from a lookup result object
 // ({"results":[{action, description, input_schema, ...}]}).
-func parseLookup(res map[string]any) []Candidate {
+func ParseLookup(res map[string]any) []Candidate {
 	raw, _ := res["results"].([]any)
 	out := make([]Candidate, 0, len(raw))
 	for _, r := range raw {
@@ -506,10 +535,12 @@ func parseLookup(res map[string]any) []Candidate {
 	return out
 }
 
-// workingSet is the bounded, stats-ranked set of candidate actions offered to
-// the model each turn. It caps at limit, evicting the lowest-value candidates.
+// workingSet is the bounded set of candidate actions offered to the model each
+// turn, most recently merged last. It caps at limit by evicting the least
+// recently merged candidate; the always-offered candidates sit outside it.
 type workingSet struct {
 	limit int
+	order []string
 	by    map[string]Candidate
 }
 
@@ -520,57 +551,62 @@ func newWorkingSet(limit int) *workingSet {
 	return &workingSet{limit: limit, by: map[string]Candidate{}}
 }
 
+// put adds or refreshes c as the most recent candidate, evicting the oldest
+// when over the limit.
 func (w *workingSet) put(c Candidate) {
+	w.drop(c.Ref)
 	w.by[c.Ref] = c
-	if len(w.by) <= w.limit {
+	w.order = append(w.order, c.Ref)
+	if len(w.order) > w.limit {
+		delete(w.by, w.order[0])
+		w.order = w.order[1:]
+	}
+}
+
+func (w *workingSet) drop(ref string) {
+	if _, ok := w.by[ref]; !ok {
 		return
 	}
-	// Evict the single lowest-value candidate (deterministic tie-break by ref).
-	worst, worstVal := "", 0.0
-	first := true
-	for ref, cand := range w.by {
-		v := value(cand)
-		if first || v < worstVal || (v == worstVal && ref > worst) {
-			worst, worstVal, first = ref, v, false
+	delete(w.by, ref)
+	for i, r := range w.order {
+		if r == ref {
+			w.order = append(w.order[:i], w.order[i+1:]...)
+			break
 		}
 	}
-	delete(w.by, worst)
 }
 
-func (w *workingSet) priceOf(ref string) int {
+// offered returns the candidate the model may dispatch under ref: a working-set
+// member or an always-offered candidate.
+func (w *workingSet) offered(cfg Config, ref string) (Candidate, bool) {
 	if c, ok := w.by[ref]; ok {
-		return c.Price
+		return c, true
 	}
-	return 0 // always-refs / intrinsics are zero-price natives
+	return always(cfg, ref)
 }
 
-// candidates returns the working-set actions to offer this turn, value-sorted
-// (best first) so the client renders the most promising tools at the top, with
-// the always-offered candidates guaranteed present regardless of eviction.
+// candidates returns what the model is offered this turn: the always-offered
+// candidates, then the working set from most to least recent.
 func (w *workingSet) candidates(cfg Config) []Candidate {
-	merged := map[string]Candidate{}
-	for ref, c := range w.by {
-		merged[ref] = c
-	}
-	for _, c := range cfg.Always {
-		if _, ok := merged[c.Ref]; !ok {
-			merged[c.Ref] = c
+	out := append([]Candidate{}, cfg.Always...)
+	for i := len(w.order) - 1; i >= 0; i-- {
+		if _, dup := always(cfg, w.order[i]); !dup {
+			out = append(out, w.by[w.order[i]])
 		}
 	}
-	out := make([]Candidate, 0, len(merged))
-	for _, c := range merged {
-		out = append(out, c)
-	}
-	sort.Slice(out, func(i, j int) bool {
-		if vi, vj := value(out[i]), value(out[j]); vi != vj {
-			return vi > vj
-		}
-		return out[i].Ref < out[j].Ref // deterministic tie-break
-	})
 	return out
 }
 
-// trimLookup rewrites a sys/lookup result to carry only ref + description +
+func always(cfg Config, ref string) (Candidate, bool) {
+	for _, c := range cfg.Always {
+		if c.Ref == ref {
+			return c, true
+		}
+	}
+	return Candidate{}, false
+}
+
+// trimLookup rewrites a lookup result to carry only ref + description +
 // score per candidate, dropping the schemas that bloat the transcript.
 func trimLookup(res map[string]any) map[string]any {
 	raw, _ := res["results"].([]any)
@@ -630,15 +666,10 @@ func missingRequired(schema map[string]any, args map[string]any) string {
 	return ""
 }
 
-// value scores a candidate for eviction and stats-line ranking: a
-// Laplace-smoothed success rate plus a rating prior. Unknown stats sit at a
-// neutral ~1.0, a proven-good action scores higher, a persistent failer lower.
-func value(c Candidate) float64 {
-	s := c.Stats
-	succ := float64(s.Successes+1) / float64(s.Uses+2)
-	rating := 0.5
-	if s.RatingCount > 0 {
-		rating = s.RatingEstimate
-	}
-	return succ + rating
+// runKey names one dispatch for the kernel (external_key): random, so no two
+// dispatches share it, and fixed across that dispatch's retries.
+func runKey() string {
+	b := make([]byte, 16)
+	_, _ = rand.Read(b)
+	return hex.EncodeToString(b)
 }

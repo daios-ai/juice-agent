@@ -2,184 +2,132 @@ package juice
 
 import (
 	"context"
-	"crypto/sha256"
-	"encoding/base64"
 	"encoding/json"
 	"errors"
 	"io"
 	"net/http"
 	"net/http/httptest"
+	"os"
+	"path/filepath"
 	"strings"
 	"testing"
 
 	"github.com/daios-ai/juice-agent/agent"
 )
 
-// fakeKernel is a minimal httptest kernel: it drives the PKCE handshake and
-// routes the handful of endpoints the client uses to canned JSON.
+// fakeKernel is a minimal httptest kernel routing the endpoints the client uses
+// to canned JSON. It accepts one access token and one refresh token at a time.
 type fakeKernel struct {
-	token       string            // current access token the authed check accepts
-	refreshTok  string            // current refresh token the refresh endpoint accepts
-	refreshOK   bool              // when false, refresh is rejected (revoked)
-	logins      int               // completed authorize+exchange handshakes
-	refreshes   int               // completed refresh exchanges
-	challenges  map[string]string // code -> pending code_challenge
-	requireAuth bool
-	runResults  map[string]map[string]any // action -> result
-	lastRunArgs map[string]any
-	rated       map[string]any
-	lastUpdate  map[string]any   // last PUT /v1/actions/{id} body
-	connectors  []map[string]any // returned under /v1/me connectors
-	lastGrant   map[string]any   // last POST /v1/grants body
+	token      string // the access token the authed check accepts
+	refreshTok string // the refresh token the refresh endpoint accepts
+	refreshes  int
+	authDown   bool // the refresh endpoint answers 503
+
+	runResults map[string]map[string]any // action -> result
+	runErrs    map[string]map[string]any // action -> error body
+	lastRun    map[string]any            // last POST /v1/run body
+	actions    map[string]map[string]any // ref -> GET /v1/actions?ref= row
+	rated      map[string]any
+	lastAction struct {
+		method, query string
+		body          map[string]any
+	}
+	connectors []map[string]any
+	lastGrant  map[string]any
+	tasks      []map[string]any
+	completed  map[string]any // task id -> completion body
 }
 
 func newFakeKernel() *fakeKernel {
-	return &fakeKernel{token: "tok-123", refreshTok: "ref-123", refreshOK: true, requireAuth: true,
-		challenges: map[string]string{}, runResults: map[string]map[string]any{}, rated: map[string]any{}}
+	return &fakeKernel{token: "tok-1", refreshTok: "ref-1",
+		runResults: map[string]map[string]any{}, runErrs: map[string]map[string]any{},
+		actions: map[string]map[string]any{}, rated: map[string]any{}, completed: map[string]any{}}
+}
+
+func readBody(r *http.Request) map[string]any {
+	var m map[string]any
+	b, _ := io.ReadAll(r.Body)
+	json.Unmarshal(b, &m)
+	return m
 }
 
 func (f *fakeKernel) handler() http.Handler {
 	mux := http.NewServeMux()
-
-	// PKCE: authorize stores the challenge under a one-time code; the token
-	// exchange verifies S256(code_verifier) against it and issues the pair.
-	mux.HandleFunc("/v1/auth/authorize", func(w http.ResponseWriter, r *http.Request) {
-		var req struct {
-			Handle        string `json:"handle"`
-			Password      string `json:"password"`
-			CodeChallenge string `json:"code_challenge"`
+	authed := func(h http.HandlerFunc) http.HandlerFunc {
+		return func(w http.ResponseWriter, r *http.Request) {
+			if r.Header.Get("Authorization") != "Bearer "+f.token {
+				writeJSON(w, 401, map[string]string{"error": "unauthenticated", "code": "unauthenticated"})
+				return
+			}
+			h(w, r)
 		}
-		body, _ := io.ReadAll(r.Body)
-		json.Unmarshal(body, &req)
-		if strings.HasPrefix(req.Handle, "@") || req.CodeChallenge == "" {
-			writeJSON(w, 400, map[string]string{"error": "sigil handle or missing challenge", "code": "invalid_input"})
-			return
-		}
-		code := "code-1"
-		f.challenges[code] = req.CodeChallenge
-		writeJSON(w, 200, map[string]string{"redirect": "?code=" + code})
-	})
-
-	mux.HandleFunc("/v1/auth/token", func(w http.ResponseWriter, r *http.Request) {
-		var req struct {
-			Code         string `json:"code"`
-			CodeVerifier string `json:"code_verifier"`
-		}
-		body, _ := io.ReadAll(r.Body)
-		json.Unmarshal(body, &req)
-		sum := sha256.Sum256([]byte(req.CodeVerifier))
-		if f.challenges[req.Code] != base64.RawURLEncoding.EncodeToString(sum[:]) {
-			writeJSON(w, 401, map[string]string{"error": "bad verifier", "code": "unauthenticated"})
-			return
-		}
-		delete(f.challenges, req.Code)
-		f.logins++
-		writeJSON(w, 200, map[string]string{"access_token": f.token, "refresh_token": f.refreshTok})
-	})
-
+	}
 	mux.HandleFunc("/v1/auth/refresh", func(w http.ResponseWriter, r *http.Request) {
-		var req struct {
-			RefreshToken string `json:"refresh_token"`
+		if f.authDown {
+			writeJSON(w, 503, map[string]string{"error": "unavailable", "code": "internal"})
+			return
 		}
-		body, _ := io.ReadAll(r.Body)
-		json.Unmarshal(body, &req)
-		if !f.refreshOK || req.RefreshToken != f.refreshTok {
+		if readBody(r)["refresh_token"] != f.refreshTok {
 			writeJSON(w, 401, map[string]string{"error": "revoked", "code": "unauthenticated"})
 			return
 		}
 		f.refreshes++
+		f.refreshTok = "ref-rotated"
 		writeJSON(w, 200, map[string]string{"access_token": f.token, "refresh_token": f.refreshTok})
 	})
-
-	authed := func(w http.ResponseWriter, r *http.Request) bool {
-		if !f.requireAuth {
-			return true
-		}
-		if r.Header.Get("Authorization") != "Bearer "+f.token {
-			writeJSON(w, 401, map[string]string{"error": "unauthenticated", "code": "unauthenticated"})
-			return false
-		}
-		return true
-	}
-
-	mux.HandleFunc("/v1/run", func(w http.ResponseWriter, r *http.Request) {
-		if !authed(w, r) {
+	mux.HandleFunc("/v1/run", authed(func(w http.ResponseWriter, r *http.Request) {
+		f.lastRun = readBody(r)
+		action, _ := f.lastRun["action"].(string)
+		if e, ok := f.runErrs[action]; ok {
+			writeJSON(w, 409, e)
 			return
 		}
-		var req struct {
-			Action string         `json:"action"`
-			Args   map[string]any `json:"args"`
-		}
-		body, _ := io.ReadAll(r.Body)
-		json.Unmarshal(body, &req)
-		f.lastRunArgs = req.Args
-		res, ok := f.runResults[req.Action]
+		res, ok := f.runResults[action]
 		if !ok {
-			writeJSON(w, 400, map[string]string{"error": "action failed", "code": "execution_failed"})
+			writeJSON(w, 500, map[string]string{"error": "action failed", "code": "execution_failed"})
 			return
 		}
-		writeJSON(w, 200, map[string]any{"result": res, "tx_id": "tx-" + req.Action, "trace_id": "tr", "process_id": "pr"})
-	})
-
-	mux.HandleFunc("/v1/actions", func(w http.ResponseWriter, r *http.Request) {
-		if !authed(w, r) {
+		writeJSON(w, 200, map[string]any{"result": res, "tx_id": "tx-" + action, "charge": 3})
+	}))
+	mux.HandleFunc("/v1/actions", authed(func(w http.ResponseWriter, r *http.Request) {
+		if ref := r.URL.Query().Get("ref"); ref != "" && r.Method == http.MethodGet {
+			if row, ok := f.actions[ref]; ok {
+				writeJSON(w, 200, []any{row})
+			} else {
+				writeJSON(w, 200, []any{})
+			}
 			return
 		}
-		name := r.URL.Query().Get("name")
-		writeJSON(w, 200, []map[string]any{
-			{"id": "act-" + name, "action": "sys/" + name, "price": 7, "active": true, "visibility": "local", "name": name},
-		})
-	})
-
-	mux.HandleFunc("/v1/actions/", func(w http.ResponseWriter, r *http.Request) {
-		if !authed(w, r) {
+		f.lastAction.method, f.lastAction.query, f.lastAction.body = r.Method, r.URL.RawQuery, readBody(r)
+		writeJSON(w, 200, map[string]any{"id": "act-1", "action": "agent@k/x"})
+	}))
+	mux.HandleFunc("/v1/actions/enable", authed(func(w http.ResponseWriter, r *http.Request) {
+		f.lastAction.method, f.lastAction.query, f.lastAction.body = r.Method+" enable", "", readBody(r)
+		writeJSON(w, 200, []any{})
+	}))
+	mux.HandleFunc("/v1/transactions/", authed(func(w http.ResponseWriter, r *http.Request) {
+		f.rated[strings.TrimSuffix(strings.TrimPrefix(r.URL.Path, "/v1/transactions/"), "/rate")] = readBody(r)
+		writeJSON(w, 200, map[string]any{})
+	}))
+	mux.HandleFunc("/v1/me", authed(func(w http.ResponseWriter, r *http.Request) {
+		writeJSON(w, 200, map[string]any{"id": "u1", "address": "agent@k", "available": 500, "connectors": f.connectors})
+	}))
+	mux.HandleFunc("/v1/grants", authed(func(w http.ResponseWriter, r *http.Request) {
+		f.lastGrant = readBody(r)
+		writeJSON(w, 200, map[string]any{})
+	}))
+	mux.HandleFunc("/v1/tasks", authed(func(w http.ResponseWriter, r *http.Request) {
+		if r.URL.Query().Get("status") != "waiting" {
+			writeJSON(w, 400, map[string]string{"error": "want status=waiting", "code": "invalid_input"})
 			return
 		}
-		if r.Method == http.MethodPut {
-			body, _ := io.ReadAll(r.Body)
-			json.Unmarshal(body, &f.lastUpdate)
-		}
-		writeJSON(w, 200, map[string]any{"id": strings.TrimPrefix(r.URL.Path, "/v1/actions/")})
-	})
-
-	mux.HandleFunc("/v1/stats/", func(w http.ResponseWriter, r *http.Request) {
-		if !authed(w, r) {
-			return
-		}
-		writeJSON(w, 200, map[string]any{
-			"uses": 10, "successes": 9, "failures": 1, "rating_count": 4,
-			"latency_estimate": 12.5, "rating_estimate": 0.75,
-		})
-	})
-
-	mux.HandleFunc("/v1/transactions/", func(w http.ResponseWriter, r *http.Request) {
-		if !authed(w, r) {
-			return
-		}
-		body, _ := io.ReadAll(r.Body)
-		var req map[string]any
-		json.Unmarshal(body, &req)
-		f.rated[strings.TrimSuffix(strings.TrimPrefix(r.URL.Path, "/v1/transactions/"), "/rate")] = req
-		writeJSON(w, 200, map[string]any{"rating": req["rating"]})
-	})
-
-	mux.HandleFunc("/v1/me", func(w http.ResponseWriter, r *http.Request) {
-		if !authed(w, r) {
-			return
-		}
-		writeJSON(w, 200, map[string]any{"id": "u1", "handle": "agent", "available": 500, "locked": 0,
-			"connectors": f.connectors})
-	})
-
-	mux.HandleFunc("/v1/grants", func(w http.ResponseWriter, r *http.Request) {
-		if !authed(w, r) {
-			return
-		}
-		body, _ := io.ReadAll(r.Body)
-		json.Unmarshal(body, &f.lastGrant)
-		writeJSON(w, 200, map[string]any{"status": "granted"})
-	})
-
+		writeJSON(w, 200, f.tasks)
+	}))
+	mux.HandleFunc("/v1/tasks/", authed(func(w http.ResponseWriter, r *http.Request) {
+		id := strings.TrimSuffix(strings.TrimPrefix(r.URL.Path, "/v1/tasks/"), "/complete")
+		f.completed[id] = readBody(r)
+		writeJSON(w, 200, map[string]any{"result": map[string]any{}, "tx_id": "tx-" + id})
+	}))
 	return mux
 }
 
@@ -189,122 +137,230 @@ func writeJSON(w http.ResponseWriter, status int, v any) {
 	json.NewEncoder(w).Encode(v)
 }
 
+// writeRecords writes the juice CLI's client records for login agent@k under a
+// temp $JUICE_HOME: the kernel's endpoint and key, and the login's credentials.
+func writeRecords(t *testing.T, endpoint string, cred map[string]any) string {
+	t.Helper()
+	home := t.TempDir()
+	if err := os.MkdirAll(filepath.Join(home, "client", "credentials"), 0o700); err != nil {
+		t.Fatal(err)
+	}
+	cfg := map[string]any{"current": "", "kernels": map[string]any{
+		"k": map[string]any{"endpoint": endpoint, "public_key": "KEY"}}}
+	b, _ := json.Marshal(cfg)
+	os.WriteFile(filepath.Join(home, "client", "config.json"), b, 0o600)
+	if cred != nil {
+		b, _ = json.Marshal(cred)
+		os.WriteFile(filepath.Join(home, "client", "credentials", "agent@k.json"), b, 0o600)
+	}
+	return home
+}
+
+// startFake starts f and returns a client for agent@k holding tok-1/ref-1.
 func startFake(t *testing.T, f *fakeKernel) *Client {
 	t.Helper()
 	srv := httptest.NewServer(f.handler())
 	t.Cleanup(srv.Close)
-	return New(srv.URL, "agent", "pw")
-}
-
-func TestLoginAndAuthHeader(t *testing.T) {
-	f := newFakeKernel()
-	c := startFake(t, f)
-	if err := c.Login(context.Background()); err != nil {
-		t.Fatalf("login: %v", err)
-	}
-	// A subsequent authed call must succeed (token attached).
-	if _, err := c.Me(context.Background()); err != nil {
-		t.Fatalf("me after login: %v", err)
-	}
-	if f.logins != 1 {
-		t.Fatalf("logins = %d, want 1", f.logins)
-	}
-}
-
-func TestLazyLoginOn401(t *testing.T) {
-	f := newFakeKernel()
-	c := startFake(t, f)
-	// No explicit Login: the first Me hits 401; with no refresh token held the
-	// client falls back to the full PKCE login and retries.
-	self, err := c.Me(context.Background())
+	home := writeRecords(t, srv.URL, map[string]any{"token": "tok-1", "refresh_token": "ref-1", "principal_id": "u1"})
+	c, err := New("agent@k", home)
 	if err != nil {
-		t.Fatalf("me: %v", err)
+		t.Fatal(err)
 	}
-	if self.Handle != "agent" || self.Available != 500 {
-		t.Fatalf("self = %+v", self)
+	return c
+}
+
+func TestParseLogin(t *testing.T) {
+	h, k, err := ParseLogin("agent@work")
+	if err != nil || h != "agent" || k != "work" {
+		t.Fatalf("ParseLogin = %q %q %v", h, k, err)
 	}
-	if f.logins != 1 || f.refreshes != 0 {
-		t.Fatalf("logins=%d refreshes=%d, want 1/0", f.logins, f.refreshes)
+	for _, bad := range []string{"agent", "agent@", "@work", "a@b@c", "a/b@work", ".agent@work", "agent@wo rk", ""} {
+		if _, _, err := ParseLogin(bad); err == nil {
+			t.Errorf("ParseLogin(%q) accepted, want an error", bad)
+		}
 	}
 }
 
-func TestRefreshOn401(t *testing.T) {
+func TestNewReadsRecordsAndFormsAddresses(t *testing.T) {
+	c := startFake(t, newFakeKernel())
+	if c.Login() != "agent@k" || c.KernelKey() != "KEY" || c.Principal() != "u1" {
+		t.Fatalf("login=%q key=%q principal=%q", c.Login(), c.KernelKey(), c.Principal())
+	}
+	if c.Sys("llm/chat") != "sys@k/llm/chat" || c.Address("chat") != "chat@k" {
+		t.Fatalf("Sys=%q Address=%q", c.Sys("llm/chat"), c.Address("chat"))
+	}
+}
+
+func TestNewRefusesUnrecordedKernelAndMissingSession(t *testing.T) {
+	home := writeRecords(t, "http://x", nil)
+	if _, err := New("agent@other", home); err == nil || !strings.Contains(err.Error(), "juice kernel add") {
+		t.Fatalf("unrecorded kernel: err = %v", err)
+	}
+	if _, err := New("agent@k", home); !errors.Is(err, ErrNoSession) || !strings.Contains(err.Error(), "juice auth login agent@k") {
+		t.Fatalf("missing session: err = %v", err)
+	}
+}
+
+func TestRefreshOn401RotatesAndPersists(t *testing.T) {
 	f := newFakeKernel()
 	c := startFake(t, f)
-	if err := c.Login(context.Background()); err != nil {
-		t.Fatalf("login: %v", err)
-	}
-	// Expire the access token server-side; the held refresh token still rotates,
-	// so the retried call succeeds without a second full login.
-	f.token = "tok-456"
+	f.token = "tok-2" // the held token expired server-side
 	if _, err := c.Me(context.Background()); err != nil {
 		t.Fatalf("me after expiry: %v", err)
 	}
-	if f.logins != 1 || f.refreshes != 1 {
-		t.Fatalf("logins=%d refreshes=%d, want 1/1", f.logins, f.refreshes)
+	if f.refreshes != 1 {
+		t.Fatalf("refreshes = %d, want 1", f.refreshes)
+	}
+	cred := readCredentials(c.credPath)
+	if cred["token"] != "tok-2" || cred["refresh_token"] != "ref-rotated" || cred["principal_id"] != "u1" {
+		t.Fatalf("credential file after rotation = %v", cred)
 	}
 }
 
-func TestReLoginWhenRefreshRevoked(t *testing.T) {
+func TestRefreshAdoptsTokenAnotherProcessRotated(t *testing.T) {
 	f := newFakeKernel()
 	c := startFake(t, f)
-	if err := c.Login(context.Background()); err != nil {
-		t.Fatalf("login: %v", err)
-	}
-	// Expire the access token AND revoke the refresh token: the client must fall
-	// back to a full password login.
-	f.token = "tok-456"
-	f.refreshOK = false
+	f.token = "tok-3"
+	// Another process sharing the login already rotated and stored tok-3.
+	b, _ := json.Marshal(map[string]any{"token": "tok-3", "refresh_token": "ref-other", "principal_id": "u1"})
+	os.WriteFile(c.credPath, b, 0o600)
 	if _, err := c.Me(context.Background()); err != nil {
-		t.Fatalf("me after revocation: %v", err)
+		t.Fatalf("me: %v", err)
 	}
-	if f.logins != 2 {
-		t.Fatalf("logins = %d, want 2", f.logins)
+	if f.refreshes != 0 {
+		t.Fatalf("refreshes = %d, want 0 (the stored token is adopted)", f.refreshes)
 	}
 }
 
-func TestRunParsesResultAndTxID(t *testing.T) {
+func TestRefreshRefusesAnotherPrincipalsSession(t *testing.T) {
 	f := newFakeKernel()
-	f.runResults["sys/time"] = map[string]any{"unix": float64(1), "iso": "2026-07-10T00:00:00Z"}
 	c := startFake(t, f)
-	rr, err := c.Run(context.Background(), "sys/time", nil)
-	if err != nil {
-		t.Fatalf("run: %v", err)
+	f.token = "tok-3"
+	// A later login under the same label stored another account's session.
+	b, _ := json.Marshal(map[string]any{"token": "tok-3", "refresh_token": "ref-other", "principal_id": "u2"})
+	os.WriteFile(c.credPath, b, 0o600)
+	_, err := c.Me(context.Background())
+	if !errors.Is(err, ErrNoSession) || !strings.Contains(err.Error(), "restart juice-agent") {
+		t.Fatalf("err = %v, want a refusal naming the restart", err)
 	}
-	if rr.TxID != "tx-sys/time" {
-		t.Fatalf("tx_id = %q", rr.TxID)
+	if c.currentToken() != "tok-1" || f.refreshes != 0 {
+		t.Fatalf("token = %q refreshes = %d, want the old session kept and nothing rotated", c.currentToken(), f.refreshes)
 	}
-	if rr.Result["iso"] != "2026-07-10T00:00:00Z" {
-		t.Fatalf("result = %v", rr.Result)
+	if cred := readCredentials(c.credPath); cred["refresh_token"] != "ref-other" {
+		t.Fatalf("credential file rewritten: %v", cred)
+	}
+}
+
+func TestRevokedRefreshIsNoSession(t *testing.T) {
+	f := newFakeKernel()
+	c := startFake(t, f)
+	f.token, f.refreshTok = "tok-2", "ref-revoked"
+	_, err := c.Me(context.Background())
+	if !errors.Is(err, ErrNoSession) {
+		t.Fatalf("err = %v, want ErrNoSession", err)
+	}
+}
+
+func TestRefreshServerFailureIsRetryableNotNoSession(t *testing.T) {
+	f := newFakeKernel()
+	c := startFake(t, f)
+	f.token, f.authDown = "tok-2", true
+	_, err := c.Me(context.Background())
+	if errors.Is(err, ErrNoSession) || !IsRetryable(err) {
+		t.Fatalf("err = %v, want a retryable failure that keeps the session", err)
+	}
+}
+
+func TestRunPinsQuoteAndRecognisesMovedTerms(t *testing.T) {
+	f := newFakeKernel()
+	f.runResults["sys@k/time"] = map[string]any{"iso": "2026-07-10T00:00:00Z"}
+	f.runErrs["x@k/y"] = map[string]any{"error": "terms moved", "code": "terms_changed", "meta": map[string]any{"quote_hash": "q2"}}
+	c := startFake(t, f)
+
+	rr, err := c.Run(context.Background(), "sys@k/time", nil, "q1", "key-1")
+	if err != nil || rr.TxID != "tx-sys@k/time" || rr.Charge != 3 || rr.Result["iso"] != "2026-07-10T00:00:00Z" {
+		t.Fatalf("run = %+v, %v", rr, err)
+	}
+	if f.lastRun["quote_hash"] != "q1" || f.lastRun["external_key"] != "key-1" {
+		t.Fatalf("run body = %v, want quote_hash q1 and external_key key-1", f.lastRun)
+	}
+	if args, ok := f.lastRun["args"].(map[string]any); !ok || len(args) != 0 {
+		t.Fatalf("args = %v, want {} for nil args", f.lastRun["args"])
+	}
+	c.Run(context.Background(), "sys@k/time", nil, "", "")
+	if _, has := f.lastRun["quote_hash"]; has {
+		t.Fatal("an empty quote must not be sent")
+	}
+	if _, has := f.lastRun["external_key"]; has {
+		t.Fatal("an empty key must not be sent")
+	}
+
+	_, err = c.Run(context.Background(), "x@k/y", nil, "q1", "")
+	if !errors.Is(err, agent.ErrTermsChanged) {
+		t.Fatalf("err = %v, want agent.ErrTermsChanged", err)
+	}
+	var ke *KernelError
+	if !errors.As(err, &ke) || ke.Meta["quote_hash"] != "q2" {
+		t.Fatalf("meta not decoded: %+v", ke)
+	}
+}
+
+func TestRunFailureReturnsItsSettlement(t *testing.T) {
+	f := newFakeKernel()
+	f.runErrs["x@k/fail"] = map[string]any{"error": "boom", "code": "execution_failed",
+		"meta": map[string]any{"tx_id": "tx-f", "charge": 2}}
+	c := startFake(t, f)
+	rr, err := c.Run(context.Background(), "x@k/fail", nil, "", "")
+	if err == nil || rr.TxID != "tx-f" || rr.Charge != 2 {
+		t.Fatalf("run = %+v, %v, want the failure with tx-f charged 2", rr, err)
 	}
 }
 
 func TestRunFailureIsKernelError(t *testing.T) {
+	c := startFake(t, newFakeKernel())
+	_, err := c.Run(context.Background(), "does@k/not-exist", nil, "", "")
+	if Code(err) != "execution_failed" || IsRetryable(err) || errors.Is(err, agent.ErrTermsChanged) {
+		t.Fatalf("err = %v", err)
+	}
+}
+
+func TestLLMNativesUseKernelShapes(t *testing.T) {
 	f := newFakeKernel()
+	f.runResults["sys@k/llm/chat"] = map[string]any{"choices": []any{
+		map[string]any{"index": 0, "message": map[string]any{"role": "assistant", "content": "hello"}}}}
+	f.runResults["sys@k/llm/json"] = map[string]any{"value": map[string]any{"ok": true}}
+	f.runResults["sys@k/llm/embed"] = map[string]any{"data": []any{map[string]any{"index": 0, "embedding": []any{0.5, 1.0}}}}
 	c := startFake(t, f)
-	_, err := c.Run(context.Background(), "does/not-exist", nil)
-	if err == nil {
-		t.Fatal("expected error")
+	ctx := context.Background()
+	msgs := []agent.Message{{Role: agent.RoleUser, Content: "hi"}}
+
+	if got, err := c.Chat(ctx, msgs); err != nil || got != "hello" {
+		t.Fatalf("chat = %q, %v", got, err)
 	}
-	if Code(err) != "execution_failed" {
-		t.Fatalf("code = %q, want execution_failed", Code(err))
+	schema := map[string]any{"type": "object"}
+	if got, err := c.ChatJSON(ctx, msgs, schema); err != nil || got.(map[string]any)["ok"] != true {
+		t.Fatalf("json = %v, %v", got, err)
 	}
-	if IsRetryable(err) {
-		t.Fatal("execution_failed must not be retryable")
+	if _, ok := f.lastRun["args"].(map[string]any)["schema"]; !ok {
+		t.Fatalf("llm/json args = %v, want schema", f.lastRun["args"])
+	}
+	if got, err := c.Embed(ctx, "text"); err != nil || len(got) != 2 || got[1] != 1.0 {
+		t.Fatalf("embed = %v, %v", got, err)
+	}
+	if f.lastRun["args"].(map[string]any)["input"] != "text" {
+		t.Fatalf("llm/embed args = %v, want input", f.lastRun["args"])
 	}
 }
 
 func TestDecideRendersToolsAndExtractsSelection(t *testing.T) {
 	f := newFakeKernel()
-	// Decide runs sys/llm/chat; the model replies with prose wrapping a JSON
-	// selection, which the client must extract.
-	f.runResults["sys/llm/chat"] = map[string]any{
-		"message": map[string]any{"role": "assistant",
-			"content": `Sure, I'll search. {"action": "sys/web", "args": {"url": "x"}}`},
-	}
+	// The model replies with prose wrapping a JSON selection, which the client
+	// must extract.
+	f.runResults["sys@k/llm/chat"] = map[string]any{"choices": []any{map[string]any{"message": map[string]any{
+		"role": "assistant", "content": `Sure. {"action": "sys@k/web", "args": {"url": "x"}}`}}}}
 	c := startFake(t, f)
-	catalog := []agent.Candidate{{Ref: "sys/web", Description: "fetch a page", Price: 3,
-		Stats:       agent.ActionStats{Known: true, Uses: 4, Successes: 3},
+	catalog := []agent.Candidate{{Ref: "sys@k/web", Description: "fetch a page", Price: 3,
+		Evidence:    map[string]any{"local_experience": map[string]any{"uses": 4, "successes": 3}},
 		InputSchema: map[string]any{"type": "object", "properties": map[string]any{"url": map[string]any{"type": "string"}}, "required": []any{"url"}}}}
 	tools := []agent.Tool{{Name: "reply", Description: "finish", InputSchema: map[string]any{"type": "object",
 		"properties": map[string]any{"answer": map[string]any{"type": "string"}}, "required": []any{"answer"}}}}
@@ -313,15 +369,12 @@ func TestDecideRendersToolsAndExtractsSelection(t *testing.T) {
 	if err != nil {
 		t.Fatalf("decide: %v", err)
 	}
-	if sel.Action != "sys/web" || sel.Args["url"] != "x" {
+	if sel.Action != "sys@k/web" || sel.Args["url"] != "x" {
 		t.Fatalf("selection = %+v", sel)
 	}
-	// The rendered prompt (last chat message) must list both the tool and the
-	// catalog action with its stats.
-	msgs, _ := f.lastRunArgs["messages"].([]any)
-	last, _ := msgs[len(msgs)-1].(map[string]any)
-	prompt, _ := last["content"].(string)
-	for _, want := range []string{"reply", "answer (required)", "sys/web", "uses=4", "success=75%", "url (required)"} {
+	msgs, _ := f.lastRun["args"].(map[string]any)["messages"].([]any)
+	prompt, _ := msgs[len(msgs)-1].(map[string]any)["content"].(string)
+	for _, want := range []string{"reply", "answer (required)", "sys@k/web", "price=3", `"uses":4`, "url (required)"} {
 		if !strings.Contains(prompt, want) {
 			t.Fatalf("rendered prompt missing %q:\n%s", want, prompt)
 		}
@@ -344,28 +397,30 @@ func TestExtractJSON(t *testing.T) {
 	}
 }
 
-func TestLookupAndMeta(t *testing.T) {
+func TestLookupAndRead(t *testing.T) {
 	f := newFakeKernel()
-	f.runResults["sys/lookup"] = map[string]any{"results": []any{
-		map[string]any{"action": "sys/web", "description": "fetch", "input_schema": map[string]any{"type": "object"}},
+	f.runResults["sys@k/lookup"] = map[string]any{"results": []any{
+		map[string]any{"action": "sys@k/web", "description": "fetch", "price": 9},
 	}}
+	f.actions["sys@k/web"] = map[string]any{"action": "sys@k/web", "description": "fetch", "price": 7,
+		"quote_hash": "q-web", "effect": "", "evidence": map[string]any{"local_experience": map[string]any{"uses": 1}}}
+	f.actions["sys@k/transfer"] = map[string]any{"action": "sys@k/transfer", "effect": "transfer"}
 	c := startFake(t, f)
-	cands, err := c.Lookup(context.Background(), "fetch a page", 8)
-	if err != nil {
-		t.Fatalf("lookup: %v", err)
+	ctx := context.Background()
+
+	cands, err := c.Lookup(ctx, "fetch a page", 8)
+	if err != nil || len(cands) != 1 || cands[0].Ref != "sys@k/web" {
+		t.Fatalf("lookup = %+v, %v", cands, err)
 	}
-	if len(cands) != 1 || cands[0].Ref != "sys/web" {
-		t.Fatalf("candidates = %+v", cands)
+	got, err := c.Read(ctx, "sys@k/web")
+	if err != nil || got.Price != 7 || got.QuoteHash != "q-web" || got.Evidence["local_experience"] == nil {
+		t.Fatalf("read = %+v, %v", got, err)
 	}
-	price, stats, err := c.Meta(context.Background(), "sys/web")
-	if err != nil {
-		t.Fatalf("meta: %v", err)
+	if tr, _ := c.Read(ctx, "sys@k/transfer"); tr.Effect != "transfer" {
+		t.Fatalf("effect not read: %+v", tr)
 	}
-	if price != 7 {
-		t.Fatalf("price = %d, want 7", price)
-	}
-	if !stats.Known || stats.Uses != 10 || stats.Successes != 9 || stats.RatingEstimate != 0.75 {
-		t.Fatalf("stats = %+v", stats)
+	if _, err := c.Read(ctx, "nobody@k/none"); Code(err) != "not_found" {
+		t.Fatalf("unresolved ref: err = %v, want not_found", err)
 	}
 }
 
@@ -382,30 +437,42 @@ func TestRatePostsRatingAndNote(t *testing.T) {
 	}
 }
 
-func TestSetPublicSendsVisibility(t *testing.T) {
+func TestActionMutationsTargetByID(t *testing.T) {
 	f := newFakeKernel()
 	c := startFake(t, f)
-	if err := c.SetPublic(context.Background(), "act-1"); err != nil {
-		t.Fatalf("set public: %v", err)
+	ctx := context.Background()
+
+	if err := c.EnableAction(ctx, "act-1"); err != nil || f.lastAction.body["target"] != "act-1" {
+		t.Fatalf("enable: %v body=%v", err, f.lastAction.body)
 	}
-	if f.lastUpdate["visibility"] != "public" {
-		t.Fatalf("update body = %v, want visibility=public", f.lastUpdate)
+	if err := c.SetPublic(ctx, "act-1"); err != nil || f.lastAction.method != http.MethodPut ||
+		f.lastAction.body["target"] != "act-1" || f.lastAction.body["visibility"] != "public" {
+		t.Fatalf("set public: %v %+v", err, f.lastAction)
+	}
+	if err := c.DeleteAction(ctx, "act-1"); err != nil || f.lastAction.method != http.MethodDelete || f.lastAction.query != "target=act-1" {
+		t.Fatalf("delete: %v %+v", err, f.lastAction)
+	}
+	id, ref, err := c.CreateWasmAction(ctx, "x", "does x", 2, nil, nil, "AAA")
+	if err != nil || id != "act-1" || ref != "agent@k/x" || f.lastAction.body["kind"] != "wasm" {
+		t.Fatalf("create: %q %q %v %v", id, ref, err, f.lastAction.body)
 	}
 }
 
-func TestSplitRef(t *testing.T) {
-	owner, name, err := splitRef("sys/llm/decide")
-	if err != nil {
-		t.Fatalf("splitRef: %v", err)
+func TestTasksListAndComplete(t *testing.T) {
+	f := newFakeKernel()
+	f.tasks = []map[string]any{{"id": "t1", "action": "sys@k/sink", "owner": "alice@k", "required_caller": "agent@k",
+		"partial_args": map[string]any{"message": "hi"}, "status": "waiting"}}
+	c := startFake(t, f)
+	ctx := context.Background()
+	tasks, err := c.WaitingTasks(ctx)
+	if err != nil || len(tasks) != 1 || tasks[0].Owner != "alice@k" || tasks[0].RequiredCaller != "agent@k" {
+		t.Fatalf("tasks = %+v, %v", tasks, err)
 	}
-	if owner != "sys" || name != "llm/decide" {
-		t.Fatalf("got owner=%q name=%q", owner, name)
+	if err := c.CompleteTask(ctx, "t1", nil); err != nil {
+		t.Fatal(err)
 	}
-	// Sigil-prefixed refs are rejected, never stripped (kernel contract §13).
-	for _, bad := range []string{"@sys/llm/decide", "noslash", "/name", "owner/"} {
-		if _, _, err := splitRef(bad); err == nil {
-			t.Fatalf("expected error for malformed ref %q", bad)
-		}
+	if body, _ := f.completed["t1"].(map[string]any); body == nil || body["args"] == nil {
+		t.Fatalf("completion body = %v, want args {}", f.completed["t1"])
 	}
 }
 
@@ -418,7 +485,8 @@ func TestIsRetryable(t *testing.T) {
 		{&KernelError{Status: http.StatusTooManyRequests}, true},
 		{&KernelError{Status: 500, Code: "internal"}, true},
 		{&KernelError{Status: 503}, true},
-		{&KernelError{Code: "timeout", Status: 504}, true},
+		// A timeout parks the dispatched call; a new run would be a second call.
+		{&KernelError{Code: "timeout", Status: 504}, false},
 		// Model-output 500s are NOT retryable — the loop feeds them back instead.
 		{&KernelError{Status: 500, Code: "execution_failed"}, false},
 		{&KernelError{Status: 422, Code: "schema_violation"}, false},
@@ -436,33 +504,17 @@ func TestIsRetryable(t *testing.T) {
 	}
 }
 
-func TestConnectGrantPostsSelectorAndToken(t *testing.T) {
+func TestGrantsAndConnectors(t *testing.T) {
 	f := newFakeKernel()
+	f.connectors = []map[string]any{{"directory": "chat@k/msg", "actions": []map[string]any{{"action": "chat@k/msg/read"}}}}
 	c := startFake(t, f)
-	if err := c.ConnectGrant(context.Background(), "chat/msg", "key-abc"); err != nil {
-		t.Fatalf("connect grant: %v", err)
+	ctx := context.Background()
+	if err := c.ConnectGrant(ctx, "chat@k/msg", "key-abc"); err != nil || f.lastGrant["selector"] != "chat@k/msg" || f.lastGrant["token"] != "key-abc" {
+		t.Fatalf("grant: %v body=%v", err, f.lastGrant)
 	}
-	if f.lastGrant["selector"] != "chat/msg" || f.lastGrant["token"] != "key-abc" {
-		t.Fatalf("grant body = %v", f.lastGrant)
-	}
-}
-
-func TestMeDecodesConnectors(t *testing.T) {
-	f := newFakeKernel()
-	f.connectors = []map[string]any{{
-		"directory": "chat/msg",
-		"actions":   []map[string]any{{"action": "chat/msg/read"}, {"action": "chat/msg/message"}},
-	}}
-	c := startFake(t, f)
-	self, err := c.Me(context.Background())
-	if err != nil {
-		t.Fatalf("me: %v", err)
-	}
-	if len(self.Connectors) != 1 || self.Connectors[0].Directory != "chat/msg" {
-		t.Fatalf("connectors = %+v", self.Connectors)
-	}
-	if len(self.Connectors[0].Actions) != 2 || self.Connectors[0].Actions[0].Action != "chat/msg/read" {
-		t.Fatalf("connector actions = %+v", self.Connectors[0].Actions)
+	self, err := c.Me(ctx)
+	if err != nil || self.Address != "agent@k" || len(self.Connectors) != 1 || self.Connectors[0].Directory != "chat@k/msg" {
+		t.Fatalf("me = %+v, %v", self, err)
 	}
 }
 

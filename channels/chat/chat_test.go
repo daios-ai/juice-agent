@@ -15,11 +15,11 @@ var _ channels.ServiceActions = (*chatActions)(nil)
 // errGrant is the fake kernel's grant_required rejection.
 var errGrant = errors.New("grant required")
 
-// fakeKernel is an in-memory channels.Kernel. chat/msg/* actions fail with
+// fakeKernel is an in-memory channels.Kernel. msg/* actions fail with
 // errGrant until the chat/msg grant is connected, so the grant self-heal is
-// exercised; chat/register mints a canned key + verification step.
+// exercised; register mints a canned key + verification task.
 type fakeKernel struct {
-	steps      []channels.StepInfo
+	tasks      []channels.TaskInfo
 	connectors []string
 	messages   []any // chat/msg/read result payload
 	completed  map[string]bool
@@ -33,31 +33,31 @@ func newFakeKernel() *fakeKernel {
 
 func (f *fakeKernel) hasGrant() bool {
 	for _, d := range f.connectors {
-		if d == chatGrant {
+		if d == "chat@k/msg" {
 			return true
 		}
 	}
 	return false
 }
 
-func (f *fakeKernel) WaitingSteps(context.Context) ([]channels.StepInfo, error) {
-	return f.steps, nil
+func (f *fakeKernel) WaitingTasks(context.Context) ([]channels.TaskInfo, error) {
+	return f.tasks, nil
 }
-func (f *fakeKernel) CompleteStep(_ context.Context, id string, _ map[string]any) error {
+func (f *fakeKernel) CompleteTask(_ context.Context, id string, _ map[string]any) error {
 	f.completed[id] = true
 	return nil
 }
 func (f *fakeKernel) Run(_ context.Context, action string, _ map[string]any) (map[string]any, error) {
 	switch action {
-	case chatHandle + "/register":
+	case "chat@k/register":
 		f.registered++
-		return map[string]any{"api_key": "key-1", "step_id": "verify-1"}, nil
-	case chatHandle + "/msg/read":
+		return map[string]any{"api_key": "key-1", "task_id": "verify-1"}, nil
+	case "chat@k/msg/read":
 		if !f.hasGrant() {
 			return nil, errGrant
 		}
 		return map[string]any{"messages": f.messages}, nil
-	case chatHandle + "/msg/message":
+	case "chat@k/msg/message":
 		if !f.hasGrant() {
 			return nil, errGrant
 		}
@@ -75,7 +75,7 @@ func (f *fakeKernel) Transient(err error) bool     { return false }
 func (f *fakeKernel) GrantRequired(err error) bool { return errors.Is(err, errGrant) }
 
 func TestChatNewBuildsNamedService(t *testing.T) {
-	svc := New(newFakeKernel(), channels.ServiceConfig{Handle: "agent", Interval: time.Hour, Budget: 20, DataDir: t.TempDir()})
+	svc := New(newFakeKernel(), "chat@k", channels.ServiceConfig{Address: "agent@k", Interval: time.Hour, Budget: 20, DataDir: t.TempDir()})
 	if svc.Name() != "chat" {
 		t.Fatalf("Name() = %q, want chat", svc.Name())
 	}
@@ -83,11 +83,11 @@ func TestChatNewBuildsNamedService(t *testing.T) {
 
 func TestChatPendingFiltersChat(t *testing.T) {
 	fk := newFakeKernel()
-	fk.steps = []channels.StepInfo{
-		{ID: "d1", OwnerHandle: "chat", PartialArgs: map[string]any{"room": "r1"}},
-		{ID: "x1", OwnerHandle: "alice", PartialArgs: map[string]any{"message": "hi"}},
+	fk.tasks = []channels.TaskInfo{
+		{ID: "d1", Owner: "chat@k", PartialArgs: map[string]any{"room": "r1"}},
+		{ID: "x1", Owner: "alice", PartialArgs: map[string]any{"message": "hi"}},
 	}
-	a := &chatActions{k: fk, handle: "agent"}
+	a := &chatActions{k: fk, service: "chat@k", address: "agent@k"}
 	got, err := a.Pending(context.Background())
 	if err != nil {
 		t.Fatal(err)
@@ -102,11 +102,11 @@ func TestChatPendingFiltersChat(t *testing.T) {
 
 func TestChatReadParsesMessages(t *testing.T) {
 	fk := newFakeKernel()
-	fk.connectors = []string{chatGrant} // already granted
+	fk.connectors = []string{"chat@k/msg"} // already granted
 	fk.messages = []any{
 		map[string]any{"seq": float64(3), "from": "alice", "text": "hello"},
 	}
-	a := &chatActions{k: fk, handle: "agent"}
+	a := &chatActions{k: fk, service: "chat@k", address: "agent@k"}
 	msgs, err := a.Read(context.Background(), "r1", 0)
 	if err != nil {
 		t.Fatal(err)
@@ -118,7 +118,7 @@ func TestChatReadParsesMessages(t *testing.T) {
 
 func TestChatEnsureGrantProvisionsWhenAbsent(t *testing.T) {
 	fk := newFakeKernel() // no connectors
-	a := &chatActions{k: fk, handle: "agent"}
+	a := &chatActions{k: fk, service: "chat@k", address: "agent@k"}
 	if err := a.ensureGrant(context.Background()); err != nil {
 		t.Fatal(err)
 	}
@@ -126,17 +126,17 @@ func TestChatEnsureGrantProvisionsWhenAbsent(t *testing.T) {
 		t.Fatalf("register called %d times, want 1", fk.registered)
 	}
 	if !fk.completed["verify-1"] {
-		t.Fatal("verification step must be completed (activates the key)")
+		t.Fatal("verification task must be completed (activates the key)")
 	}
-	if fk.grants[chatGrant] != "key-1" {
-		t.Fatalf("grant token = %q, want key-1", fk.grants[chatGrant])
+	if fk.grants["chat@k/msg"] != "key-1" {
+		t.Fatalf("grant token = %q, want key-1", fk.grants["chat@k/msg"])
 	}
 }
 
 func TestChatEnsureGrantIdempotent(t *testing.T) {
 	fk := newFakeKernel()
-	fk.connectors = []string{chatGrant} // already connected
-	a := &chatActions{k: fk, handle: "agent"}
+	fk.connectors = []string{"chat@k/msg"} // already connected
+	a := &chatActions{k: fk, service: "chat@k", address: "agent@k"}
 	if err := a.ensureGrant(context.Background()); err != nil {
 		t.Fatal(err)
 	}
@@ -148,7 +148,7 @@ func TestChatEnsureGrantIdempotent(t *testing.T) {
 func TestChatReadReprovisionsOnGrantRequired(t *testing.T) {
 	fk := newFakeKernel() // no grant yet -> first read fails grant_required
 	fk.messages = []any{map[string]any{"seq": float64(1), "from": "alice", "text": "hey"}}
-	a := &chatActions{k: fk, handle: "agent"}
+	a := &chatActions{k: fk, service: "chat@k", address: "agent@k"}
 	msgs, err := a.Read(context.Background(), "r1", 0)
 	if err != nil {
 		t.Fatalf("read should self-heal the grant and succeed, got %v", err)

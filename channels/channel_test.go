@@ -2,22 +2,16 @@ package channels
 
 import "testing"
 
-func TestSameHandle(t *testing.T) {
-	cases := []struct {
-		a, b string
-		want bool
-	}{
-		{"agent", "agent", true},
-		{"agent", "alice", false},
-		// Handles are bare everywhere; a stray sigil is a different string, never
-		// stripped (kernel contract).
-		{"@agent", "agent", false},
-		{"", "", true},
-		{"a", "ab", false},
-	}
-	for _, c := range cases {
-		if got := SameHandle(c.a, c.b); got != c.want {
-			t.Errorf("SameHandle(%q,%q) = %v, want %v", c.a, c.b, got, c.want)
-		}
+// The generic service driver must satisfy the Channel contract every intake
+// surface shares, and Kernel must remain usable wherever a TaskSource is needed.
+var (
+	_ Channel    = (*Service)(nil)
+	_ TaskSource = Kernel(nil)
+)
+
+func TestServiceNameIsItsConfiguredName(t *testing.T) {
+	s := NewService(nil, ServiceConfig{Name: "svc", DataDir: t.TempDir()})
+	if s.Name() != "svc" {
+		t.Fatalf("Name() = %q, want svc", s.Name())
 	}
 }

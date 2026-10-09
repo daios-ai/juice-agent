@@ -23,7 +23,7 @@ func TestTranscriptPersistsAndReturnsMessages(t *testing.T) {
 		t.Fatal(err)
 	}
 	tr.Append(context.Background(), agent.Message{Role: agent.RoleUser, Content: "hello"})
-	tr.Append(context.Background(), agent.Message{Role: agent.RoleAssistant, Action: "sys/time"})
+	tr.Append(context.Background(), agent.Message{Role: agent.RoleAssistant, Action: "sys@k/time"})
 	if got := tr.Messages(); len(got) != 2 {
 		t.Fatalf("messages = %d, want 2", len(got))
 	}
@@ -71,7 +71,7 @@ func TestRecoverMarksInterruptedIdempotently(t *testing.T) {
 	// t3: mid-flight (last record is a tool call, not terminal).
 	tr, _ := OpenTranscript(dir, "t3", 0, nil)
 	tr.Append(context.Background(), agent.Message{Role: agent.RoleUser, Content: "do it"})
-	tr.Append(context.Background(), agent.Message{Role: agent.RoleAssistant, Action: "sys/time"})
+	tr.Append(context.Background(), agent.Message{Role: agent.RoleAssistant, Action: "sys@k/time"})
 	tr.Close()
 
 	// t4: finished (terminal outcome record).
@@ -111,7 +111,7 @@ func TestTranscriptChildIsolatesViewButSharesRecord(t *testing.T) {
 	if err != nil {
 		t.Fatal(err)
 	}
-	child.Append(ctx, agent.Message{Role: agent.RoleAssistant, Action: "sys/time"})
+	child.Append(ctx, agent.Message{Role: agent.RoleAssistant, Action: "sys@k/time"})
 	tr.Append(ctx, agent.Message{Role: agent.RoleTool, Action: "subtask", Result: map[string]any{"answer": "x"}})
 
 	// Parent view excludes the bracket's turns.
@@ -122,7 +122,7 @@ func TestTranscriptChildIsolatesViewButSharesRecord(t *testing.T) {
 	}
 	// The durable record has everything, and the bracket turns are tagged.
 	all := tr.All()
-	if len(all) != 4 { // root, seed(b1), sys/time(b1), subtask-rollup
+	if len(all) != 4 { // root, seed(b1), sys@k/time(b1), subtask-rollup
 		t.Fatalf("All() = %d records, want 4", len(all))
 	}
 	tagged := 0

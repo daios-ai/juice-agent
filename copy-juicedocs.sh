@@ -7,7 +7,7 @@ dest="juicedocs"
 
 mkdir -p "$dest"
 
-for f in requirements.md API.md; do
+for f in requirements.md API.md ecosystem-standard.md; do
     cp "$src/$f" "$dest/$f"
     echo "copied $src/$f -> $dest/$f"
 done

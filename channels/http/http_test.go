@@ -14,10 +14,10 @@ import (
 
 func TestHTTPChannelSubmitsAndDelivers(t *testing.T) {
 	h := NewHTTP(":0", 50) // addr unused; we drive handlers directly
-	var got agent.Task
+	var got agent.Job
 	var wg sync.WaitGroup
 	wg.Add(1)
-	h.submit = func(tk agent.Task) { got = tk; wg.Done() }
+	h.submit = func(tk agent.Job) { got = tk; wg.Done() }
 	h.outcomes = map[string]agent.Outcome{}
 	h.done = map[string]chan struct{}{}
 

@@ -18,11 +18,11 @@ import (
 // versioned JSON report. It is excluded from `go test ./...` (needs a real
 // kernel and LLM); it is the instrument for tracking competence across versions.
 // runBench runs the suite in args[1] as the agent in args[0], args[2] reps.
-func runBench(args []string, stdinPass bool) error {
+func runBench(args []string) error {
 	if len(args) < 2 {
-		return fmt.Errorf("usage: juice-agent bench <handle> <suite.json> [reps]")
+		return fmt.Errorf("usage: juice-agent bench <login> <suite.json> [reps]")
 	}
-	handle, suitePath := args[0], args[1]
+	login, suitePath := args[0], args[1]
 	reps := 5
 	if len(args) >= 3 {
 		if n, err := strconv.Atoi(args[2]); err == nil && n > 0 {
@@ -36,7 +36,7 @@ func runBench(args []string, stdinPass bool) error {
 
 	log := newLogger()
 	ctx := context.Background()
-	e, _, _, _, err := setup(ctx, log, handle, stdinPass)
+	e, _, _, err := setup(ctx, log, login)
 	if err != nil {
 		return err
 	}
@@ -44,7 +44,7 @@ func runBench(args []string, stdinPass bool) error {
 	// on so runs exercise the real post-task path.
 	e.Maker = nil
 
-	run := func(ctx context.Context, t agent.Task) (agent.Outcome, error) {
+	run := func(ctx context.Context, t agent.Job) (agent.Outcome, error) {
 		return e.Execute(ctx, t, nil)
 	}
 	rep := RunSuite(ctx, suite, reps, agentVersion(), run, time.Now)
@@ -157,7 +157,7 @@ type Report struct {
 
 // RunFunc executes one task and returns its outcome — supplied by the caller so
 // this stays decoupled from the juice client.
-type RunFunc func(ctx context.Context, t agent.Task) (agent.Outcome, error)
+type RunFunc func(ctx context.Context, t agent.Job) (agent.Outcome, error)
 
 // LoadSuite reads a suite JSON file.
 func LoadSuite(path string) (Suite, error) {
@@ -185,7 +185,7 @@ func RunSuite(ctx context.Context, s Suite, reps int, agentVersion string, run R
 		var succ, spent, turns int
 		var latency time.Duration
 		for i := 0; i < reps; i++ {
-			at := agent.Task{ID: task.ID + "-r" + strconv.Itoa(i), Channel: "bench", Budget: task.Budget,
+			at := agent.Job{ID: task.ID + "-r" + strconv.Itoa(i), Channel: "bench", Budget: task.Budget,
 				Messages: []agent.Message{{Role: agent.RoleUser, Content: task.Prompt}}}
 			start := now()
 			out, err := run(ctx, at)

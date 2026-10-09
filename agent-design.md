@@ -5,7 +5,7 @@ Status: design document
 Codename: `juice-agent`
 
 Revision 0.1.2 rewrites the turn primitive: the harness builds the tool list and drives selection
-via `sys/llm/chat` (JSON extracted), so plain-named tools (`reply`/`publish`/`subtask`) coexist with
+via `llm/chat` (JSON extracted), so plain-named tools (`reply`/`publish`/`subtask`) coexist with
 catalog actions and NO fake echo actions pollute the catalog (the `reply.wasm.b64` blob is gone).
 
 Revision 0.1.1 adds named-agent **identity** (`juice-agent serve <handle>`, §7), authored **persona +
@@ -19,24 +19,24 @@ a policy shell, driven by replaceable surfaces — with one substitution that ch
 downstream: **the tool set is not hand-coded; it is the Juice action catalog**, discovered at
 runtime and invoked uniformly through `Call()`.
 
-The daemon is an ordinary kernel client. It authenticates as a registered user (its *handle*, e.g.
-`agent`), and from that single fact inherits everything an agent needs:
+The daemon is an ordinary kernel client. It acts as one login, `handle@kernel` (e.g. `agent@work`),
+over the juice CLI's session for it, and from that single fact inherits everything an agent needs:
 
 | Need            | Kernel-native answer                                                          |
 | --------------- | ----------------------------------------------------------------------------- |
-| Reasoning       | `sys/llm/decide` / `sys/llm/chat`, called like any action                    |
-| Tools           | Active actions visible under `CanCall`, found via `sys/lookup`                |
+| Reasoning       | `sys@<kernel>/llm/chat` (and `/llm/json`, `/llm/embed`), called like any action |
+| Tools           | Active actions visible under `CanCall`, found via `sys@<kernel>/lookup`       |
 | Tool dispatch   | `POST /v1/run` — one primitive for every capability, local or federated        |
 | Budget          | Its wallet: every call is priced and prepaid; spend is bounded by balance      |
-| Address         | `agent` — reachable by steps, `sys/message`, and calls to actions it owns    |
+| Address         | `agent@work` — reachable by tasks, the `message` native, and its own actions  |
 | Accountability  | Every effect is a transaction: priced, receipted, attributed by the role law   |
 
 No special agent API exists on the kernel side, and none is needed: the kernel already speaks
 agent. Other agents (e.g. `chat`) are simply other users; the multi-agent system is emergent,
 mediated by the kernel, never orchestrated by a private protocol.
 
-**One binary, many named agents.** `juice-agent serve research` and `juice-agent serve triage` launch the same
-binary as two kernel users, each with its own **home** — a directory of config, persona/knowledge,
+**One binary, many named agents.** `juice-agent serve research@work` and `juice-agent serve triage@work`
+launch the same binary as two kernel accounts, each with its own **home** — a directory of config, persona/knowledge,
 and memory (§5c, §7). Being ordinary accounts, they coexist and address one another through the
 kernel. (pi runs processes under an orchestrator; here each agent is a named citizen of one kernel.)
 
@@ -101,7 +101,7 @@ run(task):
   cands = intrinsics ∪ Catalog.Lookup(task.prompt, k)     # seed the working set
   loop:
     inject queued steering messages                        # polled before every model call
-    sel = Decider.Decide(messages, candidates, tools)     # ONE sys/llm/chat round-trip, JSON extracted
+    sel = Decider.Decide(messages, candidates, tools)     # ONE llm/chat round-trip, JSON extracted
     if sel is error:            fail (after policy-layer retries)
     append sel to transcript                               # {role: assistant, tool:{action,args}}
 
@@ -115,17 +115,17 @@ run(task):
     spent += price(sel.action)
     append res to transcript                               # {role: tool, tool:{result}}
 
-    if sel.action == sys/lookup:                          # discovery is itself a tool call
+    if sel.action == lookup:                              # discovery is itself a tool call
         merge res.results into cands (bounded, recency-evicted)
 
     if turns == max_turns: fail(turn-cap)
 ```
 
-**Turn primitive.** Each turn is one `sys/llm/chat` call over the transcript plus a rendered tool
-list the harness builds itself: the catalog candidates (each with description, price, stats, and a
+**Turn primitive.** Each turn is one `llm/chat` call over the transcript plus a rendered tool
+list the harness builds itself: the catalog candidates (each with description, price, evidence, and a
 compact schema) followed by the plain-named **harness tools** (`reply`, `publish`, `subtask`). The
 model replies with a single JSON object `{action, args}`, which the client extracts with a
-balanced-brace parser. We do *not* use `sys/llm/decide`: it only offers `owner/name` refs (so
+balanced-brace parser. We do *not* use `llm/decide`: it only offers action references (so
 plain tool names can't be candidates) and, on Ollama, its grammar-constrained JSON corrupts copied
 strings (measured — timestamps garbled). Unconstrained chat + extraction is both more capable and
 higher-fidelity. Validation splits cleanly: harness-tool args get a required-keys check in-harness;
@@ -141,7 +141,7 @@ daemon offers and intercepts — never registered on the platform, so the catalo
 registry of real capabilities. Names never contain `/`, so they're unambiguous against action refs.
 Each has a schema only to standardise the args the model must supply.
 
-**Discovery is in-band.** `sys/lookup` sits permanently in the candidate set. The model expands
+**Discovery is in-band.** The lookup native sits permanently in the candidate set. The model expands
 its own tool set by selecting it — the harness runs it like any action and merges the results into
 the working set (bounded, e.g. 24 actions, evicted by recency) so the context stays disciplined.
 The working set is *per task* and starts fresh each run: what the agent can do is whatever the
@@ -155,7 +155,7 @@ stays session-agnostic (it just receives messages, §4). Only the *visible* turn
 incoming messages and the agent's posted answers — never the prior tool calls or reasoning.
 
 **Delegation to other agents** stays out of the loop (as in pi): to use another agent, call its
-published actions or park a step — the kernel is the orchestrator. *In-loop* decomposition is the
+published actions or park a task — the kernel is the orchestrator. *In-loop* decomposition is the
 `subtask` tool (§4b), which isolates context without an unbounded tree.
 
 ### The `reply` tool
@@ -206,8 +206,8 @@ daemon *is* unattended, so it takes both rails — but the primary one is econom
 1. **Budget (primary).** Every real tool call costs its advertised price, prepaid. A doom loop of
    priced calls halts on the task budget; the wallet bounds the daemon globally. This is a rail pi
    could not have: its tools were free.
-2. **Turn cap (secondary, default 32).** Required because zero-price actions (`sys/lookup`,
-   `sys/llm/*`, refused selections) escape the money rail. A configurable hard cap; hitting
+2. **Turn cap (secondary, default 32).** Required because zero-price actions (lookup,
+   the `llm/*` natives, refused selections) escape the money rail. A configurable hard cap; hitting
    it fails the task honestly with `reason = turn-cap`.
 3. **Repeat guard (§4c).** Catches the case the other two miss: a *free, succeeding* action selected
    over and over (a real observed failure — an agent posted the same chat message 31× and never
@@ -258,7 +258,7 @@ thrown: a task found at startup whose transcript lacks a terminal record is mark
 kernel requirements). Recovery is idempotent.
 
 **Compaction.** When a transcript nears the context budget, older turns are replaced by a summary
-written by `sys/llm/chat` using pi's fixed template (Goal / Constraints / Progress / Key
+written by `llm/chat` using pi's fixed template (Goal / Constraints / Progress / Key
 Decisions / Next Steps / Critical Context), keeping a recent tail verbatim and cutting only at
 turn boundaries. The kernel does not report token usage, so the trigger is a configurable byte
 budget — a proxy, chosen for legibility over precision.
@@ -272,38 +272,39 @@ requirements §10) — channel state for continuity, distinct from these agent m
 tool traces. Both stay legible files in pi's
 spirit (readable, greppable, diffable), not a semantic store.
 
-## 5b. Stats, ratings, and self-extension
+## 5b. Evidence, ratings, and self-extension
 
 Three kernel facilities that a naive port ignores; each becomes a concrete behaviour.
 
-**Stats-informed selection.** Every action carries `Stats` (`uses`, `successes`, `failures`,
-`latency_estimate`, `rating_estimate`, `rating_count`), readable at `GET /v1/stats/{id}`.
-`sys/lookup` already ranks by them, but the model must *see* them too. On every candidate merge the
-harness fetches each candidate's price and stats, and the client renders them inline in the tool
-list it builds each turn (`owner/name — desc; price=P uses=U success=93% rating=0.88; args: {…}`),
-so track record rides with the choice — no separate message.
+**Evidence-informed selection.** Every action read carries `evidence` — what this kernel recorded
+about it (`local_experience`: uses, successes, failures, latency, ratings), what its provider
+reports, and what other kernels observed — labelled by provenance and never summed or scored
+(kernel U39). Lookup rows are indicative, so on every candidate merge the harness reads each
+candidate authoritatively (`GET /v1/actions?ref=`) and keeps its price, `quote_hash` and evidence;
+the client renders this kernel's own record inline in the tool list it builds each turn
+(`owner@kernel/name — desc; price=P; record: {…}; args: {…}`), so track record rides with the
+choice — no separate message. The candidate's `quote_hash` travels with its dispatch, so the price
+the model saw is the price charged or the call is refused.
 
-Stats also drive **eviction**: when the working set exceeds `candidate_limit`, the lowest-value
-candidates are dropped (Laplace-smoothed success rate + rating prior; unknown ≈ neutral), so the
-bounded context keeps the actions most likely to work.
+Eviction is by recency: when the working set exceeds `candidate_limit`, the least recently merged
+candidate is dropped. Ranking by evidence would manufacture the opaque score the kernel refuses to
+compute.
 
-**Rating pass.** Only a transaction's `owner_user_id` may rate it — and the agent *is* the owner of
-every call it makes, so it is the rightful rater of all its tool use. After a task ends, a rating
+**Rating pass.** Only a transaction's payer may rate it (kernel D11) — and the agent pays for every
+call it makes, so it is the rightful rater of all its tool use. After a task ends, a rating
 pass (in the policy layer, never in the loop — mirroring the kernel law that execution must not rate)
-judges each dispatched call over the finished transcript with one `sys/llm/json` call and posts
+judges each dispatched call over the finished transcript with one `llm/json` call and posts
 `rating ∈ {0,1}` plus a one-line note per transaction (`POST /v1/transactions/{id}/rate`); a
 kernel-failed call is a mechanical `0`. Duplicate ratings are skipped. These notes are the agent's
 durable memory of tool quality, held not in a private store but in the kernel's own reputation
-system: they raise or lower `rating_estimate`, which feeds both `sys/lookup` and the stats line
-above. The agent's experience thus compounds into platform-visible reputation.
+system: they enter the action's evidence, which every later reader, this agent included, sees. The agent's experience thus compounds into platform-visible reputation.
 
 **Self-extension (the maker).** The agent can publish actions, exactly as `build.py` does. It keeps
 a legible task index (`data_dir/tasks.jsonl`: prompt, outcome, spent, actions used). After a task,
-a trigger fires when ≥`min_repeats` semantically similar prompts (cosine over `sys/llm/embed`)
-have recurred within a window *and* no catalog action covers them well (a `sys/lookup` score
-threshold). It then enqueues an internal **synthesis task** to the agent itself via a `self`
-channel. Synthesis runs in the ordinary loop, its candidate set including `sys/tinygo/compile` and
-the harness tool `publish`. `publish` implements `build.py`'s transactional publish: create private
+a trigger fires when ≥`min_repeats` semantically similar prompts (cosine over `llm/embed`) have
+recurred within a window. It then enqueues an internal **synthesis job** to the agent itself via a
+`self` channel. Synthesis runs in the ordinary loop with the harness tool `publish`; the job names
+the `sys@<kernel>/tinygo/compile` native, which the model offers itself through lookup. `publish` implements `build.py`'s transactional publish: create private
 → enable → run declared `test_inputs` → make public on pass, or delete and return diagnostics on
 fail. Once published, future repetitions find the new action through ordinary lookup — the
 automation loop closes without changing the daemon.
@@ -332,16 +333,16 @@ filesystem convention is normative in `requirements.md` §11.
 `system` message — role line + `persona.md` + `knowledge.md` + `memory.md` digest + the operating
 contract (decide protocol, budget, terminal action) — and prepends it. This is the builder 0.1's §5
 claimed but never wired. One builder, no per-model variation (the kernel is the one provider); the
-catalog isn't restated (decide already gets each candidate's schema/price, §5b carries stats). The
+catalog isn't restated (decide already gets each candidate's schema/price, §5b carries evidence). The
 loop is unchanged — it receives messages and never knows a prompt exists.
 
-**Learned memory.** After a task settles (alongside the rating pass, §5b), one `sys/llm/chat` call
+**Learned memory.** After a job settles (alongside the rating pass, §5b), one `llm/chat` call
 summarises what it did and learned into a dated `memory.md` entry; the next task loads `memory.md`
 into the system prompt, so the agent carries history forward. Update is best-effort (never fails the
 task) and lives in the policy layer. `memory.md` is byte-bounded (`memory_bytes`): over budget, §5's
 compaction folds the oldest entries into a digest. Representation is a summarised file, not an
 embedding store — the middle path between pi (no automatic memory) and OpenClaw (vectors + wiki);
-escalate to a `sys/llm/embed` index only if a readable file stops scaling. `memory.enabled=false`
+escalate to an `llm/embed` index only if a readable file stops scaling. `memory_bytes = 0`
 reverts to pi's strict stance.
 
 ## 6. Channels (intake abstraction)
@@ -359,63 +360,61 @@ Channel {
 
 Channels are deliberately **not** fixed to kernel-native transports. Planned implementations:
 
-- `step` — kernel-native: poll `GET /v1/steps?status=waiting` for steps addressed to `agent`
-  (`required_caller = agent`); the step's `partial_args` carry the request; completing the step
-  delivers the outcome, with the transaction obeying the role law. This makes `sys/message` and
-  any other agent (e.g. `chat`) an input channel with zero pairwise integration.
+- `task` — kernel-native: poll `GET /v1/tasks?status=waiting` for tasks addressed to the agent
+  (`required_caller = agent@work`); the task's `partial_args` carry the request; completing the task
+  delivers the outcome, with the transaction obeying the role law. This makes the `message` native
+  and any other agent (e.g. `chat@work`) an input channel with zero pairwise integration.
 - `http` — Juice-independent: a local HTTP endpoint accepting tasks directly.
-- `cli` — a one-shot dev surface (`juice-agent task "<prompt>"`), the analog of pi's print mode.
+- `cli` — a one-shot dev surface (`juice-agent task <login> "<prompt>"`), the analog of pi's print mode.
 
 More channels will follow; the decision of which channels a deployment enables is configuration,
 not architecture. The loop never knows which channel a task came from.
 
 ## 7. Daemon lifecycle and configuration
 
-`juice-agent serve [handle]` runs continuously: resolve the agent home from the handle → load
-config → authenticate as that handle (PKCE authorize + code exchange; in-memory refresh-token
-rotation on 401; full re-login on revocation) → assemble the harness tools (`reply`, `publish`, `subtask`), which are plain-named and
-intercepted, never registered on the platform, so startup makes no bootstrap round-trip for them (§4)
-→ load `persona.md` / `knowledge.md` / `memory.md` from the home and
-build the system prompt → run startup recovery (mark interrupted tasks) → start channels and the
-worker pool. Each task settles with the rating pass (§5b) and a best-effort **memory update** (§5c).
-`SIGTERM`/`SIGINT` drains as `juice serve` does: stop intake, let in-flight turns finish, persist,
-exit. There is no `juice-agent stop`.
+`juice-agent serve <login>` runs continuously: resolve the agent home from the login → load config
+→ open the login's session from the juice CLI's records and check that `GET /v1/me` answers as that
+login's account → assemble the harness tools (`reply`, `publish`, `subtask`), which are plain-named
+and intercepted, never registered on the platform, so startup makes no bootstrap round-trip for them
+(§4) → load `persona.md` / `knowledge.md` / `memory.md` from the home and build the system prompt →
+run startup recovery (mark interrupted jobs) → start channels and the worker pool. Each job settles
+with the rating pass (§5b) and a best-effort **memory update** (§5c). `SIGTERM`/`SIGINT` drains as
+`juice kernel serve` does: stop intake, let in-flight turns finish, persist, exit. There is no
+`juice-agent stop`.
 
-The verb comes first and the handle is the positional after it, so `juice-agent serve research` runs
-the daemon (`task`/`bench` take the handle the same way; a bare `juice-agent` prints usage). The
-handle comes from that positional, else `AGENT_HANDLE`, else `agent`; it names the home `$JUICE_HOME/agent/agents/<handle>/`. The home,
-its blank `persona.md`/`knowledge.md`/`memory.md`, and a dumped standard `config.json` (always with a
-step channel) are created (mode 0700) on first launch. The password is
-resolved by a precedence chain — `--password-stdin`, `AGENT_PASSWORD`, `AGENT_PASSWORD_FILE`, else an
-interactive no-echo prompt (`golang.org/x/term`) — never a bare `--password` flag.
+The design follows the ecosystem standard rather than inventing a credential model. A login,
+`handle@kernel`, is what every juice-family program names; the juice CLI obtains its session and
+keeps it in `$JUICE_HOME/client/credentials/<login>.json`, and the daemon reads and rotates that file
+under the same lock the CLI uses. The daemon therefore holds no password, offers no password flag or
+prompt, and needs no terminal library. An agent's home is `$JUICE_HOME/agents/<login>/`, so its
+memory, persona and transcripts survive any kernel; memory entries are tagged with the kernel key and
+principal id they were learned under, so memory about another kernel or account is never loaded as
+if it were about this one.
 
-Config is `config.json` — kernel-style: flat keys, safe defaults, rejected if invalid at startup, no
-committed secrets. It is layered: a component-level `$JUICE_HOME/agent/config.json` (host-wide
-defaults such as `server_url`) is overridden key-by-key by the per-agent `<home>/config.json`:
+Config is an optional `<home>/config.json` — kernel-style: flat keys, safe defaults, an unknown key
+rejected at startup, no secrets. The daemon never writes it, so defaults change with the binary:
 
 ```json
 {
-  "server_url": "http://localhost:4040",
   "default_budget": 100,
   "max_turns": 32,
   "concurrency": 4,
   "candidate_limit": 24,
   "compact_bytes": 262144,
+  "memory_bytes": 65536,
   "rate_tasks": true,
-  "memory": { "enabled": true, "memory_bytes": 65536 },
   "maker": { "enabled": false, "min_repeats": 3, "window": 50, "budget": 40 },
-  "channels": { "step": { "poll_seconds": 5 }, "http": { "addr": "" } }
+  "channels": { "task": { "poll_seconds": 5 }, "http": { "addr": "" } }
 }
 ```
 
-The handle, the fixed `persona.md`/`knowledge.md`/`memory.md` filenames, and the derived `<home>/data/`
-are not config keys. Transcripts and the maker's index live under `<home>/data/`; `memory.md` under
-the home. `memory.enabled=false` reverts to pi's strict stance (no automatic cross-task memory). The
-legacy cwd-relative layout (`./agent.json`, `AGENT_HOME`, `AGENT_CONFIG`) is a clean cut-over: if
-detected it is logged and ignored, not read.
+The login, the fixed `persona.md`/`knowledge.md`/`memory.md` filenames, and the derived
+`<home>/data/` are not config keys. Transcripts and the maker's index live under `<home>/data/`;
+`memory.md` under the home. `memory_bytes = 0` reverts to pi's strict stance (no automatic
+cross-job memory).
 
 Logging mirrors the kernel: structured lines to stderr, stdout reserved for resource payloads;
-required fields `time level event task_id channel turn action tx_id status duration_ms error`.
+required fields `time level event job channel turn action tx_id status duration_ms error`.
 Every turn logs the selection, price, and outcome; the ledger remains the financial ground truth.
 
 ## 8. Testing: three tiers
@@ -431,13 +430,13 @@ Every production file has its `_test.go`.
 **Flows (`flows/`).** End-to-end shell scripts against the *compiled* surface, exactly as
 `../juice/flows`: a `lib.sh` (start a real `juice serve` on a temp DB, start `juice-agent`, `assert_*`
 helpers) and `flows_agent.sh` under a `flows_test.sh` orchestrator. The kernel runs the **real LLM
-it ships with** — Ollama behind `sys/llm/*` — because that is the shipping configuration; there is
+it ships with** — Ollama behind the `llm/*` natives — because that is the shipping configuration; there is
 no fake model. Consequences:
 
 - *Mechanism flows* (`bootstrap`, `recovery`, `drain`) touch no model and are fully deterministic.
 - *LLM-in-the-loop flows* (`task`, `role_law`, `rating`, `maker`) assert robust **structural**
   properties — a task terminates as `answered`, the answer matches a shape (an ISO timestamp), a
-  step settles under the role law, a dispatched call is rated, the maker's repetition trigger fires
+  task settles under the role law, a dispatched call is rated, the maker's repetition trigger fires
   on real embeddings — not exact model text. They guard on `require_ollama` and *skip* (not fail)
   when the chat model is absent. Timeouts are generous (a real model takes tens of seconds/turn).
 - The **budget and turn-cap rails are code invariants**, proven exhaustively by `go test ./agent`;
@@ -449,17 +448,19 @@ no fake model. Consequences:
 
 ```text
 flow_bootstrap  daemon logs in and serves; no fake reply/publish rows in the catalog; restart      [no LLM]
+flow_init       first launch creates agents/<login>/ with blank files and no config; task channel on [no LLM]
+flow_no_session a login with no session, an unrecorded kernel, or a bare handle is refused         [no LLM]
+flow_task_channel a task addressed to the agent is completed; one addressed to another is left     [no LLM]
 flow_recovery   a mid-flight transcript at startup is marked interrupted, idempotently             [no LLM]
 flow_drain      SIGTERM drains in-flight work, persists, exits 0                                    [no LLM]
 flow_task       real task in via http; terminates answered; ISO answer; spend ≤ budget             [real LLM]
-flow_role_law   a step addressed to agent is picked up, worked, and completed under the role law   [real LLM]
+flow_role_law   a task addressed to the agent is picked up, worked, and completed under the role law   [real LLM]
 flow_rating     a dispatched tool call is rated 0/1 after the task, held in the kernel ledger       [real LLM]
 flow_maker      two similar requests trip the repetition trigger (real embeddings)                  [real LLM+embed]
 flow_persona    an agent whose persona.md demands a distinctive marker produces it in the answer    [real LLM]
-flow_named      juice-agent serve alice and serve bob launch as distinct kernel users (no reply/publish rows
-                in the catalog); a task addressed to alice is answered as alice                    [real LLM]
-flow_memory     after task 1 an entry lands in memory.md; task 2 (even across restart) loads it,
-                and the memory survives byte-bounded compaction                                      [real LLM]
+flow_named      serve alice@k and serve bob@k launch as distinct logins, each in its own home       [no LLM]
+flow_memory     after job 1 an identity-tagged entry lands in memory.md; job 2 (across restart)
+                loads it                                                                          [real LLM]
 ```
 
 Per project law, nothing is committed until unit tests and flows pass.
@@ -500,14 +501,14 @@ anecdote; with them, it is a measurement.
 
 **Relation to MCP.** An MCP server exposes typed, described, discoverable, remotely invokable
 capabilities (tools) to an LLM harness. An agent that publishes actions satisfies that definition
-exactly — action ↔ tool, `sys/lookup` ↔ `tools/list`, `POST /v1/run` ↔ `tools/call`, grants ↔ per-server
-auth, a `required_caller` step ↔ elicitation, the trace-scoped capability ↔ the server→client callback —
+exactly — action ↔ tool, lookup ↔ `tools/list`, `POST /v1/run` ↔ `tools/call`, grants ↔ per-server
+auth, a `required_caller` task ↔ elicitation, the trace-scoped capability ↔ the server→client callback —
 so at the interface level the correspondence is an inclusion, not an analogy: the kernel is the
 transport. It is however an embedding, not an isomorphism. Four kernel properties have no MCP image,
 and each removes a known MCP limitation: **symmetry** (every participant is both client and server under
 one identity; MCP fixes an asymmetric split), **global discovery** (one catalog replaces N×M pairwise
 configuration), **economics** (every call is priced and prepaid — the budget rail MCP lacks), and
-**durability/reputation** (steps are funded continuations; actions carry ledger-backed stats). The
+**durability/reputation** (tasks are funded continuations; actions carry ledger-backed evidence). The
 kernel's private actions (non-public rows, grant-gated) sharpen the picture: an agent whose public
 actions front a private toolbox is an MCP server *implemented by* an MCP client — the two roles MCP
 must run as separate processes collapse into one identity, with the public/private flag as the

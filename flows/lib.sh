@@ -2,55 +2,46 @@
 #
 # flows/lib.sh — integration harness for juice-agent flows.
 #
-# Drives ONLY compiled binaries: a real juice kernel wired to a REAL Ollama
-# (the LLM the kernel ships with, behind sys/llm/*), and the juice-agent daemon.
-# Bash cannot reach either in process, so a flow can never bypass the binary.
+# Drives ONLY compiled binaries: a real juice kernel wired to a REAL Ollama (the
+# LLM the kernel ships with, behind its llm/* natives), and the juice-agent
+# daemon. Bash cannot reach either in process, so a flow can never bypass the
+# binary.
+#
+# Booting a kernel, creating accounts, funding them and logging them in is the
+# kernel's own business, so this harness sources the kernel repository's flow
+# library ($JUICE_SRC/flows/lib.sh) for it and adds only what is the agent's:
+# starting the daemon as a login and talking to its HTTP channel. Each account
+# gets its own client home (its juice CLI records), which is the JUICE_HOME the
+# daemon then runs under — exactly as an operator's installation would be.
 #
 # Because a real model sits in the loop, LLM-dependent flows assert robust
-# structural properties (a task terminates, the ledger charges within budget, a
-# step settles under the role law) rather than exact model outputs. The economic
-# and turn-cap rails are code invariants proven exhaustively by `go test`; the
-# flows confirm the real integration, not the model's cleverness.
+# structural properties rather than exact model outputs; they skip (never fail)
+# when the chat model is absent.
 #
-# Requires: bash>=4, python3, curl, a running Ollama with the chat+embed models.
-# JUICE_BIN points at a compiled kernel.
+# Requires: bash>=4, python3, curl. JUICE_SRC is the kernel checkout (default
+# ../juice); JUICE_BIN its compiled binary (default $JUICE_SRC/juice).
 
 set -uo pipefail
 
-JUICE_BIN="${JUICE_BIN:-../juice/juice}"
 ROOT="$(cd "$(dirname "${BASH_SOURCE[0]}")/.." && pwd)"
 AGENTD="$ROOT/juice-agent"
+JUICE_SRC="${JUICE_SRC:-$ROOT/../juice}"
+JUICE="${JUICE_BIN:-$JUICE_SRC/juice}"
+[ -x "$AGENTD" ] || { echo "missing binary: $AGENTD (run 'make build')" >&2; exit 1; }
+# shellcheck source=/dev/null
+source "$JUICE_SRC/flows/lib.sh"
 
 OLLAMA_URL="${OLLAMA_URL:-http://localhost:11434}"
-CHAT_MODEL="${OLLAMA_CHAT_MODEL:-gemma4:26b}"
-EMBED_MODEL="${OLLAMA_EMBED_MODEL:-nomic-embed-text:latest}"
+CHAT_MODEL="${OLLAMA_CHAT_MODEL:-gemma4:26b}" # the model the kernel's shipped ollama endpoint binds
 
-for bin in "$JUICE_BIN" "$AGENTD"; do
-    [ -x "$bin" ] || { echo "missing binary: $bin (run 'make build')" >&2; exit 1; }
-done
-
-PASS=0; FAIL=0; SKIP=0
-ok()   { echo "  PASS: $1"; PASS=$((PASS+1)); }
-fail() { echo "  FAIL: $1 — $2"; FAIL=$((FAIL+1)); }
+SKIP=0
 skip() { echo "  SKIP: $1 — $2"; SKIP=$((SKIP+1)); }
 
-# require_ollama — true iff Ollama is up and the chat model is present. LLM flows
-# guard on this and skip (not fail) when the model isn't installed.
+# require_ollama — true iff Ollama is up and the chat model is present.
 require_ollama() {
     local tags; tags=$(curl -s "$OLLAMA_URL/api/tags" 2>/dev/null) || return 1
     echo "$tags" | python3 -c "import sys,json; ms=[m['name'] for m in json.load(sys.stdin).get('models',[])]; sys.exit(0 if '$CHAT_MODEL' in ms else 1)" 2>/dev/null
 }
-
-declare -a _PIDS=()
-RUNROOT="$(mktemp -d)"
-track() { _PIDS+=("$1"); }
-cleanup() {
-    for p in "${_PIDS[@]:-}"; do [ -n "$p" ] && kill -9 "$p" 2>/dev/null; done
-    rm -rf "$RUNROOT" 2>/dev/null
-}
-trap cleanup EXIT INT TERM
-
-new_dir() { mktemp -d -p "$RUNROOT"; }
 
 # wait_line file regex — wait up to 30s for regex in file; print capture group 1.
 wait_line() {
@@ -64,79 +55,58 @@ wait_line() {
 }
 
 # ---------------------------------------------------------------------------
-# kernel (wired to real Ollama)
+# kernel and accounts
 # ---------------------------------------------------------------------------
-# start_kernel dir — boot a juice kernel using the real LLM, login sys, fund it.
-# Sets KDB, KCFG, KHOME, KURL.
+# start_kernel dir — boot a kernel serving the play world under dir and log sys
+# in. Sets KDIR and DB; k/kj then run the juice CLI as sys.
 start_kernel() {
-    local dir="$1"
-    KDB="$dir/juice.db"; KCFG="$dir/juice.json"; KHOME="$dir/khome"
-    mkdir -p "$KHOME"
-    cat > "$KCFG" <<EOF
-{ "fee_bps": 0, "log_format": "json", "log_level": "info", "allow_local_sources": true,
-  "kernel_handle": "agent-test-kernel", "bootstrap_peers": [],
-  "native": { "llm": { "url": "$OLLAMA_URL", "chat_model": "$CHAT_MODEL", "embed_model": "$EMBED_MODEL" } } }
-EOF
-    JUICE_BOOTSTRAP_PASSWORD=sys-pass HOME="$KHOME" \
-        "$JUICE_BIN" --config "$KCFG" --db "$KDB" serve --addr 127.0.0.1:0 >"$dir/kernel.log" 2>&1 &
-    track $!
-    local addr; addr=$(wait_line "$dir/kernel.log" '"msg":"server.ready".*"addr":"\([^"]*\)"')
-    [ -n "$addr" ] || { echo "kernel did not start" >&2; cat "$dir/kernel.log" >&2; return 1; }
-    KURL="http://$addr"
-    k auth login sys --password sys-pass >/dev/null 2>&1
-    k admin deposit sys 100000 --reason flows >/dev/null 2>&1
+    KDIR="$1"; DB=$(kdb "$KDIR")
+    make_admin "$DB" "$KDIR/sys" fee_bps=0
 }
+k()  { j  "$DB" "$KDIR/sys" "$@"; }
+kj() { jj "$DB" "$KDIR/sys" "$@"; }
 
-# The CLI's base URL is --server only (no JUICE_SERVER env, no config fallback).
-k()  { HOME="$KHOME" "$JUICE_BIN" --server "$KURL" --config "$KCFG" --db "$KDB" "$@" 2>/dev/null; }
-kj() { HOME="$KHOME" "$JUICE_BIN" --server "$KURL" --config "$KCFG" --db "$KDB" --json "$@" 2>/dev/null; }
+# login handle — the account's login on the flow's kernel, handle@kernel.
+login() { echo "$1@$(kname "$DB")"; }
 
-# create_agent — register the agent user and fund it.
-create_agent() { create_user agent agent-pass; }
+# client_home handle — the juice-family root holding handle's CLI records.
+client_home() { echo "$KDIR/$1/.juice"; }
 
-# create_user handle password — register and fund a kernel user. `user create`
-# takes no email; the printed recovery phrase is discarded here.
+# create_user handle password — create, fund and log in an account; its records
+# land in client_home handle.
 create_user() {
-    k user create "$1" --password "$2" >/dev/null 2>&1
-    k admin deposit "$1" 100000 --reason flows >/dev/null 2>&1
+    make_user "$DB" "$KDIR/sys" "$KDIR/$1" "$1" "$2"
+    deposit "$DB" "$KDIR/sys" "$1" 100000000
 }
+create_agent() { create_user agent agent-pass; }
 
 # ---------------------------------------------------------------------------
 # agentd
 # ---------------------------------------------------------------------------
-# agent_home dir [handle] — echo an agent's home under JUICE_HOME=$dir. Handle
-# defaults to agent. Homes nest under the component's agents/ subtree
-# ($JUICE_HOME/agent/agents/<handle>).
-agent_home() {
-    local dir="$1" handle="${2:-agent}"
-    echo "$dir/agent/agents/$handle"
-}
+# agent_home [handle] — the daemon's home for handle's login (default agent).
+agent_home() { local h="${1:-agent}"; echo "$(client_home "$h")/agents/$(login "$h")"; }
 
-# start_agentd dir [cfg-fragment] — write the agent's config.json, launch the
-# agent daemon with JUICE_HOME=$dir, set ADATA and AHTTP. The temp dir is
-# JUICE_HOME so persona/knowledge/memory and data stay out of the repo; memory is
-# off by default (flows that test it enable it in their fragment).
+# start_agentd dir [cfg-fragment] — write the agent's optional config.json, launch
+# the daemon as agent's login, and set AGENTD_PID, ADATA and AHTTP. Memory is off
+# by default (flows that test it override memory_bytes in their fragment).
 start_agentd() {
-    local dir="$1" extra="${2:-}"
-    local home; home=$(agent_home "$dir")
+    local dir="$1" extra="${2:-}" home; home=$(agent_home)
     ADATA="$home/data"
     mkdir -p "$home"
-    cat > "$home/config.json" <<EOF
-{ "server_url": "$KURL",
-  "default_budget": 100, "max_turns": 12, "concurrency": 2,
-  "lookup_limit": 8, "candidate_limit": 12, "compact_bytes": 262144, "rate_tasks": true,
-  "memory": { "enabled": false },
-  "channels": { "http": { "addr": "127.0.0.1:0" }, "step": { "poll_seconds": 1 } }
+    cat > "$home/config.json" <<CFG
+{ "default_budget": 100, "max_turns": 12, "concurrency": 2,
+  "lookup_limit": 8, "candidate_limit": 12, "rate_tasks": true, "memory_bytes": 0,
+  "channels": { "http": { "addr": "127.0.0.1:0" }, "task": { "poll_seconds": 1 } }
   ${extra:+, $extra} }
-EOF
-    JUICE_HOME="$dir" AGENT_PASSWORD=agent-pass "$AGENTD" serve agent >"$dir/agentd.log" 2>&1 &
-    AGENTD_PID=$!; track "$AGENTD_PID"
+CFG
+    JUICE_HOME="$(client_home agent)" "$AGENTD" serve "$(login agent)" >"$dir/agentd.log" 2>&1 &
+    AGENTD_PID=$!; track_pid "$AGENTD_PID"
     local addr; addr=$(wait_line "$dir/agentd.log" '"event":"serving".*"http_addr":"\([^"]*\)"')
     [ -n "$addr" ] || { echo "agentd did not start" >&2; cat "$dir/agentd.log" >&2; return 1; }
     AHTTP="http://$addr"
 }
 
-# submit_http prompt [budget] — POST a task to agentd's http channel, echo task_id.
+# submit_http prompt [budget] — POST a job to agentd's http channel, echo its id.
 submit_http() {
     local prompt="$1" budget="${2:-0}"
     curl -sf -X POST "$AHTTP/task" -H 'Content-Type: application/json' \
@@ -144,8 +114,7 @@ submit_http() {
         | python3 -c "import sys,json; print(json.load(sys.stdin)['task_id'])" 2>/dev/null
 }
 
-# await_http task_id [timeout_s] — poll until the outcome is ready; echo its JSON.
-# The timeout is generous: a real model takes tens of seconds per turn.
+# await_http id [timeout_s] — poll until the outcome is ready; echo its JSON.
 await_http() {
     local id="$1" secs="${2:-300}" code
     local deadline=$(( $(date +%s) + secs ))
@@ -157,13 +126,24 @@ await_http() {
     done
 }
 
+# message to text — park a message task for to (a handle) as sys; echo its id.
+message() {
+    kj run "sys@$(kname "$DB")/message" "{\"to\":\"$(login "$1")\",\"message\":$(json_str "$2")}" \
+        | python3 -c "import sys,json; print(json.load(sys.stdin)['result']['task_id'])" 2>/dev/null
+}
+
+# await_task id [timeout_s] — wait until a task is done; echo its status.
+await_task() {
+    local id="$1" deadline=$(( $(date +%s) + ${2:-300} )) st=""
+    while [ "$(date +%s)" -lt "$deadline" ]; do
+        st=$(kj task show "$id" | jfield status); [ "$st" = "done" ] && break; sleep 0.5
+    done
+    echo "$st"
+}
+
 json_str() { python3 -c "import sys,json; print(json.dumps(sys.argv[1]))" "$1"; }
 jfield()   { python3 -c "import sys,json; print(json.loads(sys.stdin.read()).get(sys.argv[1],''))" "$1"; }
 afield()   { python3 -c "import sys,json; print(json.loads(sys.stdin.read()).get('answer',{}).get(sys.argv[1],''))" "$1"; }
 
-assert_eq()      { [ "$2" = "$3" ] && ok "$1" || fail "$1" "want [$2] got [$3]"; }
 assert_le()      { [ "$2" -le "$3" ] && ok "$1" || fail "$1" "want $2 <= $3"; }
-assert_contains(){ case "$3" in *"$2"*) ok "$1";; *) fail "$1" "want substring [$2] in [$3]";; esac; }
-assert_not_contains(){ case "$3" in *"$2"*) fail "$1" "should NOT contain [$2]";; *) ok "$1";; esac; }
-assert_nonempty(){ [ -n "$2" ] && ok "$1" || fail "$1" "expected non-empty"; }
 assert_match()   { echo "$3" | grep -qE "$2" && ok "$1" || fail "$1" "want /$2/ in [$3]"; }

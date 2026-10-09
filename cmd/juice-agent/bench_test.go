@@ -22,7 +22,7 @@ func TestCheckTypes(t *testing.T) {
 		{Check{Type: "contains", Value: "buenos"}, map[string]any{"answer": "Buenos días"}, true},
 		{Check{Type: "regex", Value: `^\d+$`}, map[string]any{"answer": "42"}, true},
 		{Check{Type: "regex", Value: `^\d+$`}, map[string]any{"answer": "4a2"}, false},
-		{Check{Type: "contains", Field: "city", Value: "web"}, map[string]any{"city": "sys/web"}, true},
+		{Check{Type: "contains", Field: "city", Value: "web"}, map[string]any{"city": "sys@k/web"}, true},
 	}
 	for i, c := range cases {
 		if got := c.check.Pass(c.answer); got != c.want {
@@ -41,7 +41,7 @@ func TestRunAggregatesMetrics(t *testing.T) {
 
 	// run alternates success/failure to give a 0.5 rate over 4 reps.
 	call := 0
-	run := func(_ context.Context, tk agent.Task) (agent.Outcome, error) {
+	run := func(_ context.Context, tk agent.Job) (agent.Outcome, error) {
 		call++
 		ans := "no"
 		if call%2 == 0 {

@@ -17,21 +17,15 @@ import (
 	"github.com/daios-ai/juice-agent/channels"
 )
 
-// chatHandle is the juice-ui chat service's user handle; it owns the doorbell steps
-// that notify members of new messages. Its member actions live in the msg/ folder
-// (chat/msg/read, chat/msg/message) under one grant selector (chatGrant); the open
-// chat/register sits outside that folder.
-const (
-	chatHandle = "chat"
-	chatGrant  = "chat/msg"
-)
-
-// New builds the chat channel: the generic Service driver configured with chat's
-// actions. cfg carries the poll interval, budget, data dir, context window,
-// loop-guard settings, and logger; Name is forced to "chat".
-func New(k channels.Kernel, cfg channels.ServiceConfig) *channels.Service {
+// New builds the chat channel over the chat service's account, service (e.g.
+// chat@work): it owns the doorbell tasks that notify members of new messages, and
+// its member actions live in its msg/ folder under one grant selector
+// (service/msg), with the open service/register beside it. cfg carries the agent's
+// address, poll interval, budget, data dir, context window, loop-guard settings,
+// and logger; Name is forced to "chat".
+func New(k channels.Kernel, service string, cfg channels.ServiceConfig) *channels.Service {
 	cfg.Name = "chat"
-	return channels.NewService(&chatActions{k: k, handle: cfg.Handle}, cfg)
+	return channels.NewService(&chatActions{k: k, service: service, address: cfg.Address}, cfg)
 }
 
 // chatActions implements channels.ServiceActions over chat's kernel actions, and
@@ -39,26 +33,27 @@ func New(k channels.Kernel, cfg channels.ServiceConfig) *channels.Service {
 // first-run, absent, or revoked grant self-heals lazily on the first grant_required
 // from a read or post. The mutex serializes concurrent provisioning.
 type chatActions struct {
-	k      channels.Kernel
-	handle string
-	mu     sync.Mutex
+	k       channels.Kernel
+	service string // the chat service's address, e.g. chat@work
+	address string // the agent's address: its chat username and message sender
+	mu      sync.Mutex
 }
 
-func (a *chatActions) Pending(ctx context.Context) ([]channels.StepInfo, error) {
-	steps, err := a.k.WaitingSteps(ctx)
+func (a *chatActions) Pending(ctx context.Context) ([]channels.TaskInfo, error) {
+	tasks, err := a.k.WaitingTasks(ctx)
 	if err != nil {
 		return nil, err
 	}
-	var out []channels.StepInfo
-	for _, s := range steps {
-		if s.OwnerHandle == chatHandle { // chat owns the doorbells; the agent is their required caller
+	var out []channels.TaskInfo
+	for _, s := range tasks {
+		if s.Owner == a.service { // the service owns the doorbells; the agent is their required caller
 			out = append(out, s)
 		}
 	}
 	return out, nil
 }
 
-func (a *chatActions) SessionKey(s channels.StepInfo) string {
+func (a *chatActions) SessionKey(s channels.TaskInfo) string {
 	room, _ := s.PartialArgs["room"].(string)
 	return room
 }
@@ -77,7 +72,7 @@ func (a *chatActions) Read(ctx context.Context, room string, after int64) ([]cha
 }
 
 func (a *chatActions) readOnce(ctx context.Context, room string, after int64) ([]channels.Msg, error) {
-	res, err := a.k.Run(ctx, chatHandle+"/msg/read", map[string]any{"room": room, "after": after})
+	res, err := a.k.Run(ctx, a.service+"/msg/read", map[string]any{"room": room, "after": after})
 	if err != nil {
 		return nil, err
 	}
@@ -104,12 +99,12 @@ func (a *chatActions) Post(ctx context.Context, room, text string) error {
 }
 
 func (a *chatActions) postOnce(ctx context.Context, room, text string) error {
-	_, err := a.k.Run(ctx, chatHandle+"/msg/message", map[string]any{"room": room, "text": text})
+	_, err := a.k.Run(ctx, a.service+"/msg/message", map[string]any{"room": room, "text": text})
 	return err
 }
 
-func (a *chatActions) Complete(ctx context.Context, stepID string) error {
-	return a.k.CompleteStep(ctx, stepID, nil)
+func (a *chatActions) Complete(ctx context.Context, taskID string) error {
+	return a.k.CompleteTask(ctx, taskID, nil)
 }
 
 func (a *chatActions) Transient(err error) bool { return a.k.Transient(err) }
@@ -117,9 +112,9 @@ func (a *chatActions) Transient(err error) bool { return a.k.Transient(err) }
 // ensureGrant makes sure the agent holds the chat/msg grant. It is idempotent: if
 // the agent already lists the chat/msg connector it returns at once. Otherwise it
 // runs the headless path the browser's "Connect to chat" button uses — register the
-// agent's handle for a pending key, complete the verification step (which the kernel
-// lets only the handle's owner do, proving identity), then attach the key as the
-// chat/msg grant.
+// agent's address for a pending key, complete the verification task (which the
+// kernel lets only the address's owner do, proving identity), then attach the key
+// as the msg grant.
 func (a *chatActions) ensureGrant(ctx context.Context) error {
 	a.mu.Lock()
 	defer a.mu.Unlock()
@@ -127,21 +122,21 @@ func (a *chatActions) ensureGrant(ctx context.Context) error {
 	if err != nil {
 		return err
 	}
-	if hasConnector(dirs, chatGrant) {
+	if hasConnector(dirs, a.service+"/msg") {
 		return nil // another caller (or a prior run) already connected it
 	}
-	reg, err := a.k.Run(ctx, chatHandle+"/register", map[string]any{"username": a.handle})
+	reg, err := a.k.Run(ctx, a.service+"/register", map[string]any{"username": a.address})
 	if err != nil {
 		return err
 	}
-	apiKey, stepID := asString(reg["api_key"]), asString(reg["step_id"])
-	if apiKey == "" || stepID == "" {
-		return fmt.Errorf("chat register: empty api_key or step_id")
+	apiKey, taskID := asString(reg["api_key"]), asString(reg["task_id"])
+	if apiKey == "" || taskID == "" {
+		return fmt.Errorf("chat register: empty api_key or task_id")
 	}
-	if err := a.k.CompleteStep(ctx, stepID, nil); err != nil { // owner completes -> activates the key
+	if err := a.k.CompleteTask(ctx, taskID, nil); err != nil { // owner completes -> activates the key
 		return err
 	}
-	return a.k.ConnectGrant(ctx, chatGrant, apiKey)
+	return a.k.ConnectGrant(ctx, a.service+"/msg", apiKey)
 }
 
 // hasConnector reports whether a held grant directory covers selector — the exact

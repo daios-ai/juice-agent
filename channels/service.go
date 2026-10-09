@@ -1,8 +1,8 @@
 // service.go is the generic notification-driven channel driver: the reference
 // every dedicated service channel (chat, and future services) reuses. It owns the
-// whole delivery state machine — poll the service's notification steps, read each
+// whole delivery state machine — poll the service's notification tasks, read each
 // conversation's new messages, submit them to the loop, post the reply, complete
-// the step — plus at-least-once semantics, the read cursor, the loop guard, and
+// the task — plus at-least-once semantics, the read cursor, the loop guard, and
 // the graceful fallback. All service-specific I/O sits behind ServiceActions, so
 // this package stays kernel-free like agent/; a new service is just an adapter.
 package channels
@@ -21,7 +21,7 @@ import (
 )
 
 // Msg is one message from a service read: a monotonic seq (the read cursor unit),
-// the sender handle, and the text.
+// the sender's address, and the text.
 type Msg struct {
 	Seq  int64
 	From string
@@ -32,35 +32,35 @@ type Msg struct {
 // supplies; the Service driver owns everything else. An adapter (in cmd, over the
 // juice client) implements it, keeping this package kernel-free.
 //
-//   - Pending lists the service's waiting notification steps addressed to the
+//   - Pending lists the service's waiting notification tasks addressed to the
 //     agent (e.g. chat doorbells), each carrying its conversation in PartialArgs.
-//   - SessionKey extracts the conversation a step belongs to (e.g. the room). It is
+//   - SessionKey extracts the conversation a task belongs to (e.g. the room). It is
 //     also the handle passed to Read/Post and the unit of serialization.
 //   - Read returns a conversation's messages newer than after (oldest first).
 //   - Post delivers a reply to a conversation.
-//   - Complete clears a notification step (re-arming the service's next ring).
+//   - Complete clears a notification task (re-arming the service's next ring).
 //   - Transient reports whether an error is worth retrying (vs. permanent). The
 //     adapter self-heals auth internally, so the driver never sees auth as a case.
 type ServiceActions interface {
-	Pending(ctx context.Context) ([]StepInfo, error)
-	SessionKey(StepInfo) string
+	Pending(ctx context.Context) ([]TaskInfo, error)
+	SessionKey(TaskInfo) string
 	Read(ctx context.Context, key string, after int64) ([]Msg, error)
 	Post(ctx context.Context, key, text string) error
-	Complete(ctx context.Context, stepID string) error
+	Complete(ctx context.Context, taskID string) error
 	Transient(err error) bool
 }
 
 // Service is the generic service-channel driver. It satisfies Channel.
 //
 // At-least-once: the per-conversation read cursor advances only after a reply is
-// successfully posted (in Deliver), never at read time — so a crash mid-task, or a
+// successfully posted (in Deliver), never at read time — so a crash mid-job, or a
 // transient post failure, re-reads and re-answers rather than dropping the message
-// (the accepted cost is a rare duplicate reply). One task per conversation at a
+// (the accepted cost is a rare duplicate reply). One job per conversation at a
 // time keeps a sender's messages ordered and non-interleaved.
 type Service struct {
 	name     string
 	acts     ServiceActions
-	handle   string // the agent's own handle, to skip its own messages
+	address  string // the agent's own address, to skip its own messages
 	interval time.Duration
 	budget   int
 	fallback string
@@ -69,21 +69,21 @@ type Service struct {
 	guard    *loopGuard // nil when the loop guard is disabled
 	log      func(string, map[string]any)
 
-	submit func(agent.Task)
+	submit func(agent.Job)
 	stop   chan struct{}
 	once   sync.Once
 
 	mu      sync.Mutex
-	pending map[string]route // taskID -> where the reply goes
-	active  map[string]bool  // conversations with a task in flight (one at a time)
+	pending map[string]route // jobID -> where the reply goes
+	active  map[string]bool  // conversations with a job in flight (one at a time)
 }
 
-// route is a submitted task's destination: the conversation, the step to complete
+// route is a submitted job's destination: the conversation, the task to complete
 // once the reply is posted, the cursor value to advance to on success, and the
 // incoming text (to record as the user turn once the reply is posted).
 type route struct {
 	session  string
-	stepID   string
+	taskID   string
 	maxSeq   int64
 	userText string
 }
@@ -97,15 +97,15 @@ type LoopConfig struct {
 	Cooldown time.Duration
 }
 
-// ServiceConfig parameterizes a Service. Name stamps each task's channel (and
-// names the cursor/conversation files); Handle is the agent's own handle; DataDir
+// ServiceConfig parameterizes a Service. Name stamps each job's channel (and
+// names the cursor/conversation files); Address is the agent's own address; DataDir
 // holds the persisted read cursor and conversation history; Fallback is posted when
-// a task yields no answer; ContextMessages is how many recent conversation turns to
+// a job yields no answer; ContextMessages is how many recent conversation turns to
 // seed as context (0 → default, < 0 disables); Now (tests) defaults to time.Now;
 // Log may be nil.
 type ServiceConfig struct {
 	Name            string
-	Handle          string
+	Address         string
 	Interval        time.Duration
 	Budget          int
 	DataDir         string
@@ -120,7 +120,7 @@ type ServiceConfig struct {
 // answer), so a user who asked a question gets a response instead of silence.
 const failureReply = "Sorry — I ran into a problem and couldn't answer that."
 
-// defaultContextMessages is the conversation window seeded into each task when a
+// defaultContextMessages is the conversation window seeded into each job when a
 // service does not set ContextMessages. A negative ContextMessages disables it.
 const defaultContextMessages = 20
 
@@ -140,7 +140,7 @@ func NewService(acts ServiceActions, cfg ServiceConfig) *Service {
 		window = defaultContextMessages
 	}
 	s := &Service{
-		name: cfg.Name, acts: acts, handle: cfg.Handle, interval: cfg.Interval,
+		name: cfg.Name, acts: acts, address: cfg.Address, interval: cfg.Interval,
 		budget: cfg.Budget, fallback: cfg.Fallback, log: cfg.Log,
 		cursors: newCursorStore(filepath.Join(cfg.DataDir, cfg.Name+"-cursors.json")),
 		conv:    newConvStore(filepath.Join(cfg.DataDir, cfg.Name+"-conversations.json"), window),
@@ -155,7 +155,7 @@ func NewService(acts ServiceActions, cfg ServiceConfig) *Service {
 
 func (s *Service) Name() string { return s.name }
 
-func (s *Service) Start(ctx context.Context, submit func(agent.Task)) error {
+func (s *Service) Start(ctx context.Context, submit func(agent.Job)) error {
 	s.submit = submit
 	go s.poll(ctx)
 	return nil
@@ -176,22 +176,22 @@ func (s *Service) poll(ctx context.Context) {
 	}
 }
 
-// scan turns each waiting notification step into work. A step whose conversation
-// is already busy is left for a later poll; a step with nothing to answer
+// scan turns each waiting notification task into work. A task whose conversation
+// is already busy is left for a later poll; a task with nothing to answer
 // (malformed, empty, or only the agent's own posts) is completed straight away;
-// otherwise, unless the loop guard suppresses the pair, it submits one task and
+// otherwise, unless the loop guard suppresses the pair, it submits one job and
 // marks the conversation busy. The read cursor is not advanced here for a
-// submitted task — Deliver advances it only after the reply is posted, so an
-// interrupted task re-answers rather than drops.
+// submitted job — Deliver advances it only after the reply is posted, so an
+// interrupted job re-answers rather than drops.
 func (s *Service) scan(ctx context.Context) {
-	steps, err := s.acts.Pending(ctx)
+	tasks, err := s.acts.Pending(ctx)
 	if err != nil {
 		return
 	}
-	for _, st := range steps {
+	for _, st := range tasks {
 		key := s.acts.SessionKey(st)
 		if key == "" {
-			_ = s.acts.Complete(ctx, st.ID) // malformed step: nothing to read
+			_ = s.acts.Complete(ctx, st.ID) // malformed task: nothing to read
 			continue
 		}
 		s.mu.Lock()
@@ -203,13 +203,13 @@ func (s *Service) scan(ctx context.Context) {
 		after := s.cursors.get(key)
 		msgs, err := s.acts.Read(ctx, key, after)
 		if err != nil {
-			if !s.acts.Transient(err) { // permanent (e.g. room gone): give up on this step
+			if !s.acts.Transient(err) { // permanent (e.g. room gone): give up on this task
 				s.log("service_read_failed", map[string]any{"channel": s.name, "session": key, "error": err.Error()})
 				_ = s.acts.Complete(ctx, st.ID)
 			}
-			continue // transient: leave the step waiting for the next poll
+			continue // transient: leave the task waiting for the next poll
 		}
-		fresh, maxSeq := freshFromOthers(msgs, after, s.handle)
+		fresh, maxSeq := freshFromOthers(msgs, after, s.address)
 		if len(fresh) == 0 { // only our own / already-read messages: nothing to say
 			s.cursors.set(key, maxSeq)
 			_ = s.acts.Complete(ctx, st.ID)
@@ -221,29 +221,29 @@ func (s *Service) scan(ctx context.Context) {
 			_ = s.acts.Complete(ctx, st.ID)
 			continue
 		}
-		taskID := s.name + "-" + st.ID
+		jobID := s.name + "-" + st.ID
 		prompt := renderMsgs(fresh)
 		// Seed the room's recent turns before the new message so the model has
-		// conversation context; seed is nil (single-message task) when disabled.
-		taskMsgs := append(s.conv.seed(key), agent.Message{Role: agent.RoleUser, Content: prompt})
+		// conversation context; seed is nil (single-message job) when disabled.
+		jobMsgs := append(s.conv.seed(key), agent.Message{Role: agent.RoleUser, Content: prompt})
 		s.mu.Lock()
 		s.active[key] = true
-		s.pending[taskID] = route{session: key, stepID: st.ID, maxSeq: maxSeq, userText: prompt}
+		s.pending[jobID] = route{session: key, taskID: st.ID, maxSeq: maxSeq, userText: prompt}
 		s.mu.Unlock()
-		s.submit(agent.Task{ID: taskID, Channel: s.name, Budget: s.budget, Messages: taskMsgs})
+		s.submit(agent.Job{ID: jobID, Channel: s.name, Budget: s.budget, Messages: jobMsgs})
 	}
 }
 
-// Deliver posts the task's reply and, on success, advances the read cursor and
-// completes the step (re-arming the next ring). It always posts something — the
-// answer, or the fallback when the task produced none — so a user is never left in
-// silence. On a transient post failure it leaves the step waiting and the cursor
+// Deliver posts the job's reply and, on success, advances the read cursor and
+// completes the task (re-arming the next ring). It always posts something — the
+// answer, or the fallback when the job produced none — so a user is never left in
+// silence. On a transient post failure it leaves the task waiting and the cursor
 // unadvanced, so the next poll re-answers (at-least-once); on a permanent failure
 // it gives up (complete + advance + log). Freeing the conversation always happens.
-func (s *Service) Deliver(taskID string, out agent.Outcome) {
+func (s *Service) Deliver(jobID string, out agent.Outcome) {
 	s.mu.Lock()
-	r, ok := s.pending[taskID]
-	delete(s.pending, taskID)
+	r, ok := s.pending[jobID]
+	delete(s.pending, jobID)
 	if ok {
 		delete(s.active, r.session)
 	}
@@ -256,7 +256,7 @@ func (s *Service) Deliver(taskID string, out agent.Outcome) {
 	if err := s.acts.Post(ctx, r.session, answer); err != nil {
 		if s.acts.Transient(err) {
 			s.log("service_post_retry", map[string]any{"channel": s.name, "session": r.session, "error": err.Error()})
-			return // leave the step + cursor; the next poll re-reads and re-answers
+			return // leave the task + cursor; the next poll re-reads and re-answers
 		}
 		// Permanent failure: give up. Nothing reached the room, so record nothing.
 		s.log("service_post_failed", map[string]any{"channel": s.name, "session": r.session, "error": err.Error()})
@@ -266,7 +266,7 @@ func (s *Service) Deliver(taskID string, out agent.Outcome) {
 		s.conv.append(r.session, r.userText, answer)
 	}
 	s.cursors.set(r.session, r.maxSeq)
-	_ = s.acts.Complete(ctx, r.stepID)
+	_ = s.acts.Complete(ctx, r.taskID)
 }
 
 // Steering is unused by service channels in v1.
@@ -275,7 +275,7 @@ func (s *Service) Steering(string) []agent.Message { return nil }
 func (s *Service) Stop() { s.once.Do(func() { close(s.stop) }) }
 
 // replyText is the text to post: the agent's answer, or the graceful fallback when
-// the task failed or produced an empty answer.
+// the job failed or produced an empty answer.
 func (s *Service) replyText(out agent.Outcome) string {
 	if out.Answer != nil {
 		if txt, ok := out.Answer["answer"].(string); ok && strings.TrimSpace(txt) != "" {
@@ -288,13 +288,13 @@ func (s *Service) replyText(out agent.Outcome) string {
 // freshFromOthers keeps messages newer than after not sent by the agent itself (so
 // it never answers its own posts), and returns the largest seq seen so the cursor
 // can advance past everything read.
-func freshFromOthers(msgs []Msg, after int64, handle string) (fresh []Msg, maxSeq int64) {
+func freshFromOthers(msgs []Msg, after int64, address string) (fresh []Msg, maxSeq int64) {
 	maxSeq = after
 	for _, m := range msgs {
 		if m.Seq > maxSeq {
 			maxSeq = m.Seq
 		}
-		if m.Seq > after && !SameHandle(m.From, handle) {
+		if m.Seq > after && m.From != address {
 			fresh = append(fresh, m)
 		}
 	}

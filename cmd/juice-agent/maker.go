@@ -14,7 +14,7 @@ import (
 )
 
 // Embedder produces embedding vectors (for repetition detection). Implemented
-// by the juice client over sys/llm/embed.
+// by the juice client over llm/embed.
 type Embedder interface {
 	Embed(ctx context.Context, text string) ([]float64, error)
 }
@@ -26,7 +26,7 @@ type Publisher interface {
 	EnableAction(ctx context.Context, id string) error
 	SetPublic(ctx context.Context, id string) error
 	DeleteAction(ctx context.Context, id string) error
-	Run(ctx context.Context, action string, args map[string]any) (agent.RunResult, error)
+	Run(ctx context.Context, action string, args map[string]any, quoteHash, key string) (agent.RunResult, error)
 }
 
 // MakerConfig governs self-extension.
@@ -61,6 +61,7 @@ type Maker struct {
 	path     string
 	embedder Embedder
 	pub      Publisher
+	compile  string // the tinygo/compile native's address, named in synthesis jobs
 	log      func(string, map[string]any)
 
 	mu     sync.Mutex
@@ -68,12 +69,13 @@ type Maker struct {
 }
 
 // NewMaker builds a Maker persisting its index under dir. embedder and pub may
-// be nil when the maker is disabled.
-func NewMaker(dir string, cfg MakerConfig, embedder Embedder, pub Publisher, log func(string, map[string]any)) (*Maker, error) {
+// be nil when the maker is disabled; compile is the tinygo/compile native's
+// address.
+func NewMaker(dir string, cfg MakerConfig, embedder Embedder, pub Publisher, compile string, log func(string, map[string]any)) (*Maker, error) {
 	if log == nil {
 		log = func(string, map[string]any) {}
 	}
-	m := &Maker{cfg: cfg, path: filepath.Join(dir, "tasks.jsonl"), embedder: embedder, pub: pub, log: log}
+	m := &Maker{cfg: cfg, path: filepath.Join(dir, "tasks.jsonl"), embedder: embedder, pub: pub, compile: compile, log: log}
 	if err := os.MkdirAll(dir, 0o755); err != nil {
 		return nil, err
 	}
@@ -84,7 +86,7 @@ func NewMaker(dir string, cfg MakerConfig, embedder Embedder, pub Publisher, log
 // Observe records a finished task and returns a synthesis task to enqueue when
 // the repetition trigger fires, or nil. Synthesis tasks (channel "self") are
 // themselves recorded but never re-trigger the maker.
-func (m *Maker) Observe(ctx context.Context, task agent.Task, out agent.Outcome) *agent.Task {
+func (m *Maker) Observe(ctx context.Context, task agent.Job, out agent.Outcome) *agent.Job {
 	prompt := taskPrompt(task)
 	rec := taskRecord{ID: task.ID, Prompt: prompt, Status: string(out.Status), Spent: out.Spent}
 	if m.cfg.Enabled && m.embedder != nil && task.Channel != "self" {
@@ -132,13 +134,14 @@ func (m *Maker) countSimilarLocked(rec taskRecord) int {
 
 // synthesisTask constructs the internal task that asks the agent to build and
 // publish an action automating the recurring request.
-func (m *Maker) synthesisTask(origin, prompt string) *agent.Task {
+func (m *Maker) synthesisTask(origin, prompt string) *agent.Job {
 	instr := "A request of this kind keeps recurring and no existing action serves it well:\n\n" +
 		prompt + "\n\nBuild a reusable Juice WASM action that handles this class of request. " +
-		"Write a TinyGo Handle, compile it with sys/tinygo/compile, then select the publish tool with " +
+		"Write a TinyGo Handle, compile it with " + m.compile + " (run lookup for it first, so it is offered), " +
+		"then select the publish tool with " +
 		"the compiled artifact, a kebab-case name, a description, typed input/output schemas, and a " +
 		"few distinct test_inputs. Publish only once it passes its tests, then finish with the reply tool."
-	return &agent.Task{
+	return &agent.Job{
 		ID:       "synth-" + origin,
 		Channel:  "self",
 		Budget:   m.cfg.Budget,
@@ -185,7 +188,7 @@ func (m *Maker) publish(ctx context.Context, args map[string]any) (map[string]an
 	passed := 0
 	for _, t := range tests {
 		input, _ := t.(map[string]any)
-		if _, err := m.pub.Run(ctx, ref, input); err != nil {
+		if _, err := m.pub.Run(ctx, ref, input, "", ""); err != nil {
 			_ = m.pub.DeleteAction(ctx, id)
 			return map[string]any{"status": "failure", "error": "test failed on input; fix and recompile",
 				"detail": err.Error()}, false, nil
@@ -201,7 +204,7 @@ func (m *Maker) publish(ctx context.Context, args map[string]any) (map[string]an
 
 // --- helpers ---------------------------------------------------------------
 
-func taskPrompt(t agent.Task) string {
+func taskPrompt(t agent.Job) string {
 	var b strings.Builder
 	for _, m := range t.Messages {
 		if (m.Role == agent.RoleUser || m.Role == agent.RoleSystem) && m.Content != "" {

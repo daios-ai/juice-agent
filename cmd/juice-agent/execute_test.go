@@ -12,6 +12,7 @@ import (
 	"time"
 
 	"github.com/daios-ai/juice-agent/agent"
+	"github.com/daios-ai/juice-agent/juice"
 )
 
 // fakeKernel implements the full Kernel interface with scripted
@@ -30,13 +31,19 @@ func (k *fakeKernel) Decide(_ context.Context, _ []agent.Message, _ []agent.Cand
 	k.i++
 	return &s, nil
 }
+
+// Lookup offers every action the script selects, so the loop may dispatch it.
 func (k *fakeKernel) Lookup(context.Context, string, int) ([]agent.Candidate, error) {
-	return nil, nil
+	var out []agent.Candidate
+	for _, s := range k.script {
+		out = append(out, agent.Candidate{Ref: s.Action})
+	}
+	return out, nil
 }
-func (k *fakeKernel) Meta(context.Context, string) (int, agent.ActionStats, error) {
-	return 0, agent.ActionStats{}, nil
+func (k *fakeKernel) Read(_ context.Context, ref string) (agent.Candidate, error) {
+	return agent.Candidate{Ref: ref}, nil
 }
-func (k *fakeKernel) Run(_ context.Context, action string, _ map[string]any) (agent.RunResult, error) {
+func (k *fakeKernel) Run(_ context.Context, action string, _ map[string]any, _, _ string) (agent.RunResult, error) {
 	return agent.RunResult{Result: map[string]any{"ran": action}, TxID: "tx-" + action}, nil
 }
 func (k *fakeKernel) Chat(context.Context, []agent.Message) (string, error) { return "summary", nil }
@@ -63,7 +70,7 @@ func replyIntrinsics() map[string]agent.Intrinsic {
 func TestExecutorRunsRatesAndRecordsOutcome(t *testing.T) {
 	dir := t.TempDir()
 	k := &fakeKernel{script: []agent.Selection{
-		{Action: "sys/time"},
+		{Action: "sys@k/time"},
 		{Action: "reply", Args: map[string]any{"answer": "noon"}},
 	}}
 	e := &Executor{
@@ -72,12 +79,12 @@ func TestExecutorRunsRatesAndRecordsOutcome(t *testing.T) {
 		Retry:   RetryPolicy{MaxRetries: 0},
 		RetryOK: func(error) bool { return false },
 		Loop: agent.Config{
-			ReplyTool: "reply", LookupAction: "sys/lookup",
-			Always: []agent.Candidate{{Ref: "sys/lookup"}}, MaxTurns: 10, Intrinsics: replyIntrinsics(),
+			ReplyTool: "reply", LookupAction: "sys@k/lookup",
+			Always: []agent.Candidate{{Ref: "sys@k/lookup"}}, MaxTurns: 10, Intrinsics: replyIntrinsics(),
 		},
 		RateTasks: true,
 	}
-	task := agent.Task{ID: "t1", Channel: "test", Budget: 100,
+	task := agent.Job{ID: "t1", Channel: "test", Budget: 100,
 		Messages: []agent.Message{{Role: agent.RoleUser, Content: "what time is it?"}}}
 
 	out, err := e.Execute(context.Background(), task, nil)
@@ -87,9 +94,9 @@ func TestExecutorRunsRatesAndRecordsOutcome(t *testing.T) {
 	if out.Status != agent.StatusAnswered || out.Answer["answer"] != "noon" {
 		t.Fatalf("outcome = %+v", out)
 	}
-	// The dispatched sys/time call must have been rated.
-	if k.rated["tx-sys/time"] != 1 {
-		t.Fatalf("expected sys/time rated 1, got %v", k.rated)
+	// The dispatched sys@k/time call must have been rated.
+	if k.rated["tx-sys@k/time"] != 1 {
+		t.Fatalf("expected sys@k/time rated 1, got %v", k.rated)
 	}
 	// The transcript file must end with a terminal outcome record.
 	data, _ := os.ReadFile(filepath.Join(dir, "t1.jsonl"))
@@ -102,17 +109,17 @@ func TestExecutorEnqueuesMakerSynthesis(t *testing.T) {
 	dir := t.TempDir()
 	k := &fakeKernel{}
 	maker, _ := NewMaker(dir, MakerConfig{Enabled: true, MinRepeats: 1, Window: 10, Budget: 40, Threshold: 0.5},
-		k, nil, nil)
-	var enqueued []agent.Task
+		k, nil, "sys@k/tinygo/compile", nil)
+	var enqueued []agent.Job
 	e := &Executor{
 		Kernel: k, DataDir: dir, RetryOK: func(error) bool { return false },
-		Loop: agent.Config{ReplyTool: "reply", LookupAction: "sys/lookup",
+		Loop: agent.Config{ReplyTool: "reply", LookupAction: "sys@k/lookup",
 			MaxTurns: 5, Intrinsics: replyIntrinsics()},
 		Maker:   maker,
-		Enqueue: func(tk agent.Task) { enqueued = append(enqueued, tk) },
+		Enqueue: func(tk agent.Job) { enqueued = append(enqueued, tk) },
 	}
 	// min_repeats=1 so a single occurrence triggers synthesis.
-	task := agent.Task{ID: "t1", Channel: "http", Budget: 50,
+	task := agent.Job{ID: "t1", Channel: "http", Budget: 50,
 		Messages: []agent.Message{{Role: agent.RoleUser, Content: "do a recurring thing"}}}
 	if _, err := e.Execute(context.Background(), task, nil); err != nil {
 		t.Fatal(err)
@@ -165,26 +172,47 @@ func TestRetryDeciderStopsOnNonRetryable(t *testing.T) {
 type flakyRunner struct {
 	failN int
 	calls int
+	keys  []string
 }
 
-func (r *flakyRunner) Run(_ context.Context, _ string, _ map[string]any) (agent.RunResult, error) {
+func (r *flakyRunner) Run(_ context.Context, _ string, _ map[string]any, _, key string) (agent.RunResult, error) {
 	r.calls++
+	r.keys = append(r.keys, key)
 	if r.calls <= r.failN {
 		return agent.RunResult{}, errors.New("network")
 	}
 	return agent.RunResult{Result: map[string]any{"ok": true}}, nil
 }
 
-func TestRetryRunnerRetriesTransport(t *testing.T) {
+func TestRetryRunnerRetriesTransportUnderOneKey(t *testing.T) {
 	r := &flakyRunner{failN: 1}
 	wrapped := retryRunner{inner: r, policy: RetryPolicy{MaxRetries: 3, BaseDelay: time.Millisecond},
 		retryOK: alwaysRetry, sleep: func(time.Duration) {}}
-	if _, err := wrapped.Run(context.Background(), "x", nil); err != nil {
+	if _, err := wrapped.Run(context.Background(), "x", nil, "", "key-1"); err != nil {
 		t.Fatalf("expected success, got %v", err)
 	}
-	if r.calls != 2 {
-		t.Fatalf("calls = %d, want 2", r.calls)
+	// Both attempts name the same run, so the kernel answers a repeat of a run
+	// that already committed with its first outcome rather than running it again.
+	if r.calls != 2 || r.keys[0] != "key-1" || r.keys[1] != "key-1" {
+		t.Fatalf("calls = %d keys = %q, want 2 attempts under key-1", r.calls, r.keys)
 	}
+}
+
+func TestRetryRunnerDoesNotRetryParkedRun(t *testing.T) {
+	calls := 0
+	parked := &juice.KernelError{Status: 504, Code: "timeout"}
+	wrapped := retryRunner{inner: runnerFunc(func() error { calls++; return parked }),
+		policy: RetryPolicy{MaxRetries: 3, BaseDelay: time.Millisecond}, retryOK: juice.IsRetryable, sleep: func(time.Duration) {}}
+	if _, err := wrapped.Run(context.Background(), "x", nil, "", "key-1"); err != parked || calls != 1 {
+		t.Fatalf("err = %v calls = %d, want the parked timeout returned after one attempt", err, calls)
+	}
+}
+
+// runnerFunc is a Runner answering every call with f's error.
+type runnerFunc func() error
+
+func (f runnerFunc) Run(context.Context, string, map[string]any, string, string) (agent.RunResult, error) {
+	return agent.RunResult{}, f()
 }
 
 func TestBackoffDoubles(t *testing.T) {
@@ -214,10 +242,10 @@ func (k *bracketKernel) Decide(_ context.Context, _ []agent.Message, _ []agent.C
 func (k *bracketKernel) Lookup(context.Context, string, int) ([]agent.Candidate, error) {
 	return nil, nil
 }
-func (k *bracketKernel) Meta(context.Context, string) (int, agent.ActionStats, error) {
-	return 0, agent.ActionStats{}, nil
+func (k *bracketKernel) Read(_ context.Context, ref string) (agent.Candidate, error) {
+	return agent.Candidate{Ref: ref}, nil
 }
-func (k *bracketKernel) Run(context.Context, string, map[string]any) (agent.RunResult, error) {
+func (k *bracketKernel) Run(context.Context, string, map[string]any, string, string) (agent.RunResult, error) {
 	return agent.RunResult{}, nil
 }
 func (k *bracketKernel) Chat(context.Context, []agent.Message) (string, error) { return "", nil }
@@ -233,7 +261,7 @@ func bracketExecutor(dir string) *Executor {
 		DataDir: dir,
 		RetryOK: func(error) bool { return false },
 		Loop: agent.Config{
-			ReplyTool: "reply", SubtaskTool: "subtask", LookupAction: "sys/lookup", MaxTurns: 10,
+			ReplyTool: "reply", SubtaskTool: "subtask", LookupAction: "sys@k/lookup", MaxTurns: 10,
 			Tools: []agent.Tool{
 				{Name: "reply", InputSchema: map[string]any{"type": "object", "required": []any{"answer"}}},
 				{Name: "subtask", InputSchema: map[string]any{"type": "object", "required": []any{"instruction"}}},
@@ -251,7 +279,7 @@ func TestConcurrentBracketTasksDoNotCrossTalk(t *testing.T) {
 		go func(i int) {
 			defer wg.Done()
 			e := bracketExecutor(dir) // independent kernel/counters per task
-			task := agent.Task{ID: "task-" + strconv.Itoa(i), Channel: "test", Budget: 100,
+			task := agent.Job{ID: "task-" + strconv.Itoa(i), Channel: "test", Budget: 100,
 				Messages: []agent.Message{{Role: agent.RoleUser, Content: "go"}}}
 			out, _ := e.Execute(context.Background(), task, nil)
 			results[i] = out
