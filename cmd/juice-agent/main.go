@@ -14,6 +14,9 @@ import (
 	"sync"
 	"syscall"
 	"time"
+	"unicode/utf8"
+
+	"golang.org/x/term"
 
 	"github.com/daios-ai/juice-agent/agent"
 	"github.com/daios-ai/juice-agent/channels"
@@ -59,17 +62,79 @@ func main() {
 	}
 }
 
-func usage() {
-	fmt.Fprintln(os.Stderr, `usage:
-  juice-agent serve <login>                   run the daemon (channels + worker pool)
-  juice-agent task <login> "<prompt>"         run one job and print its outcome
-  juice-agent bench <login> <suite.json> [N]  run the experiment suite and write a report
-  juice-agent version                         print version and commit
+// commands is the usage table: each command line as typed, and what it does.
+var commands = [][2]string{
+	{"serve <login>", "run the daemon (channels + worker pool)"},
+	{`task <login> "<prompt>"`, "run one job and print its outcome"},
+	{"bench <login> <suite.json> [N]", "run the experiment suite and write a report"},
+	{"version", "print version and commit"},
+}
 
-A login is an account on a kernel, handle@kernel, held by the juice CLI:
-  juice kernel add <url> && juice auth login <handle>@<kernel>
-The agent's home is $JUICE_HOME/agents/<login>/ (JUICE_HOME default ~/.juice), holding an
-optional config.json, persona.md, knowledge.md, memory.md, and data/.`)
+// usageNote follows the table. Paragraphs are unbroken so they wrap to any width;
+// indented lines are commands and stay as written.
+const usageNote = "A login is an account on a kernel, handle@kernel, held by the juice CLI:\n" +
+	"  juice kernel add <url>\n" +
+	"  juice auth login <handle>@<kernel>\n\n" +
+	"The agent's home is $JUICE_HOME/agents/<login>/ (JUICE_HOME default ~/.juice), holding an " +
+	"optional config.json, persona.md, knowledge.md, memory.md, and data/."
+
+func usage() { fmt.Fprint(os.Stderr, usageText(helpWidth(term.GetSize))) }
+
+// usageText renders the usage at width columns. Each command line stays whole, since a
+// wrapped command no longer pastes; its description wraps below it, indented.
+func usageText(width int) string {
+	var b strings.Builder
+	b.WriteString("usage:\n")
+	for _, c := range commands {
+		b.WriteString("  juice-agent " + c[0] + "\n      " + wrapText(c[1], width, 6) + "\n")
+	}
+	b.WriteString("\n" + wrapText(usageNote, width, 0) + "\n")
+	return b.String()
+}
+
+// maxHelpWidth is the column usage is written for, the conventional terminal width.
+const maxHelpWidth = 80
+
+// helpWidth is the column usage wraps at: stderr's width, where usage is printed, capped
+// at maxHelpWidth since long lines read worse even on a wide screen; maxHelpWidth when
+// stderr is not a terminal. size is term.GetSize, a parameter so the rule is testable
+// without a terminal.
+func helpWidth(size func(fd int) (width, height int, err error)) int {
+	if w, _, err := size(int(os.Stderr.Fd())); err == nil && w > 0 {
+		return min(w, maxHelpWidth)
+	}
+	return maxHelpWidth
+}
+
+// wrapText fills s to width columns, word by word, counting runes. Its first line is taken to start
+// at column indent, where the caller has already written the text before it, and every later line is
+// indented to match. A blank line or one starting with a space (a list, an aligned table) is kept as
+// written; a word longer than the room left stays whole on a line of its own.
+func wrapText(s string, width, indent int) string {
+	var b strings.Builder
+	for i, line := range strings.Split(s, "\n") {
+		if i > 0 {
+			b.WriteString("\n" + strings.Repeat(" ", indent))
+		}
+		if line == "" || line[0] == ' ' {
+			b.WriteString(line)
+			continue
+		}
+		col := indent
+		for j, word := range strings.Fields(line) {
+			n := utf8.RuneCountInString(word)
+			if j > 0 && col+1+n > width {
+				b.WriteString("\n" + strings.Repeat(" ", indent))
+				col = indent
+			} else if j > 0 {
+				b.WriteString(" ")
+				col++
+			}
+			b.WriteString(word)
+			col += n
+		}
+	}
+	return b.String()
 }
 
 // setup does the shared startup: resolve config, open the login's session,

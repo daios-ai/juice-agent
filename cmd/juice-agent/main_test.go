@@ -4,12 +4,14 @@ import (
 	"bytes"
 	"context"
 	"encoding/json"
+	"errors"
 	"net/http"
 	"net/http/httptest"
 	"os"
 	"path/filepath"
 	"strings"
 	"testing"
+	"unicode/utf8"
 
 	"github.com/daios-ai/juice-agent/channels"
 	"github.com/daios-ai/juice-agent/juice"
@@ -105,5 +107,66 @@ func TestSetupWithoutSessionNamesTheLoginCommand(t *testing.T) {
 	_, _, _, err := setup(context.Background(), newLogger(), "agent@k")
 	if err == nil || !strings.Contains(err.Error(), "juice auth login agent@k") {
 		t.Fatalf("err = %v", err)
+	}
+}
+
+func TestWrapText(t *testing.T) {
+	for _, tc := range []struct {
+		name, in      string
+		width, indent int
+		want          string
+	}{
+		{"fills to the width", "one two three four", 9, 0, "one two\nthree\nfour"},
+		{"counts runes, not bytes", "a — b — c", 5, 0, "a — b\n— c"},
+		{"indents what follows the first line", "one two three", 9, 4, "one\n    two\n    three"},
+		{"keeps blank and indented lines", "one two\n\n  x y z w\nthree", 7, 0, "one two\n\n  x y z w\nthree"},
+		{"keeps a long word whole", "a verylongword b", 5, 0, "a\nverylongword\nb"},
+	} {
+		if got := wrapText(tc.in, tc.width, tc.indent); got != tc.want {
+			t.Errorf("%s: wrapText(%q, %d, %d) = %q, want %q", tc.name, tc.in, tc.width, tc.indent, got, tc.want)
+		}
+	}
+}
+
+// TestHelpWidth: stderr's width capped at 80, and 80 when stderr is not a terminal.
+func TestHelpWidth(t *testing.T) {
+	for _, tc := range []struct {
+		name  string
+		width int
+		err   error
+		want  int
+	}{
+		{"narrow terminal", 60, nil, 60},
+		{"wide terminal is capped", 200, nil, maxHelpWidth},
+		{"not a terminal", 0, errors.New("not a terminal"), maxHelpWidth},
+		{"a terminal reporting no width", 0, nil, maxHelpWidth},
+	} {
+		got := helpWidth(func(fd int) (int, int, error) {
+			if fd != int(os.Stderr.Fd()) {
+				t.Fatalf("%s: queried fd %d, want stderr", tc.name, fd)
+			}
+			return tc.width, 24, tc.err
+		})
+		if got != tc.want {
+			t.Errorf("%s: width %d, want %d", tc.name, got, tc.want)
+		}
+	}
+}
+
+// TestUsageFitsWidth holds the usage to its width; every description line sits under
+// its command at the fixed indent.
+func TestUsageFitsWidth(t *testing.T) {
+	for _, width := range []int{maxHelpWidth, 50} {
+		text := usageText(width)
+		for _, line := range strings.Split(text, "\n") {
+			if n := utf8.RuneCountInString(line); n > width {
+				t.Errorf("width %d: line of %d columns: %q", width, n, line)
+			}
+		}
+		for _, c := range commands {
+			if !strings.Contains(text, "  juice-agent "+c[0]+"\n      ") {
+				t.Errorf("width %d: %q not followed by its indented description", width, c[0])
+			}
+		}
 	}
 }

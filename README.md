@@ -134,6 +134,9 @@ mv ~/.juice/agent/agents/agent ~/.juice/agents/agent@work
 
 ## Running
 
+`juice-agent` with no command prints its usage, wrapped to the terminal's width up to 80 columns
+(80 when not printed to a terminal); command lines are never broken, so they paste whole.
+
 ### As a daemon
 
 ```sh
@@ -259,6 +262,6 @@ make flows    # end-to-end against a real kernel + real Ollama (JUICE_SRC ?= ../
 
 The flows boot a kernel from the kernel checkout `JUICE_SRC` (its binary `JUICE_BIN`, default
 `$JUICE_SRC/juice`) through that checkout's own flow harness. Mechanism flows (bootstrap, init,
-no_session, recovery, drain, task_channel, named, session_identity) need no model; LLM flows (task, persona, rating,
+no_session, recovery, drain, task_channel, named, session_identity, usage) need no model; LLM flows (task, persona, rating,
 role_law, memory, maker) drive a real model and skip cleanly if Ollama or the chat model is
 unavailable.

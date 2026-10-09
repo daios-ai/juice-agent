@@ -406,7 +406,9 @@ input is `JUICE_HOME`.
 
 `juice-agent serve <login>` runs the daemon: the verb always comes first, and the login is the
 positional after it (`task` and `bench` take it as their first positional, the prompt or suite
-second). A bare `juice-agent` prints usage. Serving resolves the home from the login → creates the
+second). A bare `juice-agent` prints usage, wrapped to stderr's width up to 80
+columns (80 when stderr is not a terminal); each command line stays whole, its description wrapped
+below it. Serving resolves the home from the login → creates the
 home and blank files if absent → loads config → opens the session and verifies the account (above)
 → assembles the executor and the system prompt → runs startup recovery (mark interrupted jobs) →
 starts the enabled channels and the worker pool. Each job settles with the rating pass (§8) and a
@@ -470,7 +472,8 @@ offered-only dispatch, quote pinning and eviction on moved terms, `spent` from t
 a distinct run key per dispatch, subtask bracket roll-up and shared counters, compaction trigger,
 recovery idempotence. The channels cover the task channel's completion resend after a transient
 failure and its single attempt after a refusal. The product package additionally covers one run
-key across a dispatch's retries, a parked `timeout` returned without retry,
+key across a dispatch's retries, a parked `timeout` returned without retry, the usage text's
+wrapping and width rule (the terminal-size query passed in, so no terminal is needed),
 system-prompt assembly, the byte-bounded memory update with its identity filter, the rating pass,
 and the maker trigger, plus the §11 contract: login parsing and home resolution under `JUICE_HOME`,
 defaults with per-key overrides, rejection of unknown keys, the guaranteed task channel, home
@@ -487,13 +490,14 @@ action mutations by target id, and task listing and completion. Every production
 (`juice kernel serve`, through the kernel repository's own flow harness) with the **real Ollama the
 kernel ships with** (no fake model). Each account is created, funded and logged in with the juice
 CLI, and the daemon runs as that login over the CLI's records. Mechanism flows (`bootstrap`, `init`,
-`no_session`, `recovery`, `drain`, `task_channel`, `named`, `session_identity`) touch no model and are deterministic —
+`no_session`, `recovery`, `drain`, `task_channel`, `named`, `session_identity`, `usage`) touch no model and are deterministic —
 `init` asserts that a first launch creates `$JUICE_HOME/agents/<login>/` with blank
 `persona.md`/`knowledge.md`/`memory.md`, writes no `config.json`, still runs a task channel, and
 leaves pre-existing files untouched on relaunch; `no_session` asserts the three startup refusals;
 `named` asserts two agents serve as distinct logins; `session_identity` stores another account's
 session under the agent's login, forces a re-read by suspending the agent, and asserts the daemon
-still completes the agent's tasks as the agent. LLM flows (`task`, `persona`, `rating`,
+still completes the agent's tasks as the agent; `usage` runs the binary without a terminal and in a
+50-column pseudo-terminal (`script`) and asserts its usage fits each width. LLM flows (`task`, `persona`, `rating`,
 `role_law`, `memory`, `maker`) assert robust structural properties, not exact model text, and skip
 (never fail) when the chat model is absent. The budget and turn-cap rails
 are code invariants proven by `go test ./agent`; the flows assert the surviving invariants (spend

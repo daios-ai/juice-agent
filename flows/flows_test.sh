@@ -161,6 +161,18 @@ flow_named() {
     [ -d "$(agent_home alice)" ] && [ -d "$(agent_home bob)" ] && ok named.own_homes || fail named.own_homes "missing agent homes"
 }
 
+# widest file — the longest line on stdin, in columns.
+widest() { tr -d '\r' | awk '{ if (length > n) n = length } END { print n + 0 }'; }
+
+flow_usage() {
+    echo "=== FLOW usage (wraps to the terminal's width; no kernel) ==="
+    local out; out=$("$AGENTD" 2>&1)
+    assert_contains usage.printed "usage:" "$out"
+    assert_le usage.fits_80_without_terminal "$(echo "$out" | widest)" 80
+    command -v script >/dev/null || { skip usage.fits_terminal "script unavailable"; return; }
+    assert_le usage.fits_50_column_terminal "$(script -qec "stty cols 50; '$AGENTD'" /dev/null | widest)" 50
+}
+
 flow_session_identity() {
     echo "=== FLOW session_identity (a login relabelled to another account is not adopted) ==="
     local dir; dir=$(new_dir)
@@ -312,7 +324,7 @@ flow_memory() {
 }
 
 # Mechanism flows (no LLM) run first and fast; LLM flows (real Ollama) follow.
-ALL=(flow_bootstrap flow_init flow_no_session flow_recovery flow_drain flow_task_channel flow_named flow_session_identity
+ALL=(flow_bootstrap flow_init flow_no_session flow_recovery flow_drain flow_task_channel flow_named flow_session_identity flow_usage
      flow_task flow_persona flow_rating flow_role_law flow_memory flow_maker)
 
 if [ "$#" -gt 0 ]; then
