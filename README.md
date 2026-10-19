@@ -2,266 +2,300 @@
 
 # juice-agent
 
-A Go daemon implementing a general task-solving agent whose entire tool set is a
-[Juice](../juice) kernel's action catalog. It acts as one ordinary kernel account, discovers actions
-with the kernel's `lookup`, reasons with its `llm/chat`, and dispatches every tool through
-`POST /v1/run` — so it pays for what it runs, rates the tools it uses, and (optionally) publishes new
-actions to automate recurring work. The loop is pi-style: a small hand-owned cycle that stops when the
-model selects the terminal `reply` tool.
+`juice-agent` is a Go daemon that answers tasks through a [Juice](../juice) kernel. It runs as
+an ordinary kernel account, discovers tools in the kernel's action catalog, and pays for the
+ones it uses. Conversation history is stored locally so the agent can continue earlier work.
 
-See `agent-design.md` for the full design and rationale.
+The kernel controls who can send the agent work. You manage its account, approve senders,
+and write its instructions in `agent.md`.
 
-## Prerequisites
+## Requirements
 
-1. **A running Juice kernel with a real LLM.** The agent is validated with the kernel's shipped
-   Ollama endpoint, `gemma4:26b` (chat) and `nomic-embed-text` (embed); smaller models often cannot
-   select tools reliably enough to drive the loop.
-2. **The `juice` command line**, to record the kernel and log the agent's account in.
-3. Go 1.22+ to build.
+- A Juice kernel at contract 0.16 or later, with a language model available through its
+  reasoning action. The project uses the kernel's shipped Ollama endpoint with `gemma4:26b`.
+- The `juice` command line, configured to reach that kernel.
+- Go 1.22.2 or later and Make to build from source.
 
-## Build
-
-```sh
-make build        # -> ./juice-agent
-make install      # -> $JUICE_HOME/bin/juice-agent  (JUICE_HOME ?= ~/.juice)
-```
-
-## Quickstart
-
-With a Juice kernel running at `http://localhost:4040` that calls itself `work`:
+## Installation
 
 ```sh
 make install
-
-juice kernel add http://localhost:4040            # record the kernel under its own name
-juice user create agent@work --password '…'       # the agent's account; prints a recovery phrase once
-juice admin user deposit agent@work 100 --ref initial-funding   # as the operator: fund it
-juice auth login agent@work                       # the agent's session, kept by the juice CLI
-
-juice-agent task agent@work "What is 2+2? Reply with just the number."
 ```
 
-The last line runs one job and prints its outcome as JSON. To run the agent as a long-lived daemon
-that accepts work, see *Running* and *Giving the daemon work* below.
+This builds the executable and installs it in `$JUICE_HOME/bin`, defaulting to `~/.juice/bin`.
+Add that directory to your `PATH` if necessary. To build without installing, run `make build`;
+the executable is written to `./juice-agent`.
 
-## Identity and session
+## Quickstart
 
-The agent is named by its **login**, `handle@kernel`: the account it acts as, on the kernel that
-account lives on. The daemon holds no password and no token of its own. It reads the records the
-`juice` command line keeps under `$JUICE_HOME/client/`: the kernel's address from `config.json`,
-and the session from `credentials/<login>.json`, which it renews in place when the kernel asks.
+These examples use a kernel named `work` at `http://localhost:4040`, an agent account named
+`agent@work`, and a sender named `alice@work`. Substitute your own kernel and account names.
 
-- If the kernel is not recorded, the daemon stops and says to run `juice kernel add <url>`.
-- If the login holds no session, or the kernel has revoked it, the daemon stops and says to run
-  `juice auth login <login>`.
-- If the session belongs to a different account than the login names (the account was renamed or
-  recreated), the daemon stops rather than act as someone else.
-- If, while the daemon runs, `credentials/<login>.json` is replaced by another account's session (a
-  later `juice auth login` under the same label), the daemon keeps its own session and never
-  adopts the new one; its kernel calls report that a restart is needed. Restart it to serve the new
-  account.
-
-The agent's `reply`, `publish` and `subtask` tools are handled inside the daemon and are not
-registered on the kernel, so nothing else is needed kernel-side.
-
-## Filesystem layout and configuration
-
-Each agent has one home under the juice-family root, `$JUICE_HOME` (default `~/.juice`), named by its
-login:
-
-```
-$JUICE_HOME/agents/<login>/        e.g. agents/agent@work/
-├── config.json                    optional; absent means every default
-├── persona.md  knowledge.md       written by you; read before every job
-├── memory.md                      written by the agent; what it learned
-└── data/                          transcripts (one JSONL per job), the maker index, channel state
-```
-
-The home is fixed, never relative to the working directory. On first launch the daemon creates it
-(mode 0700) with blank `persona.md`, `knowledge.md` and `memory.md`; it never truncates a file and
-never writes `config.json`. Each `memory.md` entry is headed with the kernel key and account it was
-learned under, and only entries matching the current login's are loaded, so memory from another
-kernel or account never reaches the prompt.
-
-`config.json` is optional, and every key in it is optional. An unknown key or malformed JSON stops the
-daemon at startup. The defaults:
-
-```json
-{
-  "default_budget": 100,
-  "max_turns": 32,
-  "max_repeats": 3,
-  "concurrency": 4,
-  "candidate_limit": 24,
-  "lookup_limit": 8,
-  "compact_bytes": 262144,
-  "memory_bytes": 65536,
-  "rate_tasks": true,
-  "maker": { "enabled": false, "min_repeats": 3, "window": 50, "budget": 40, "threshold": 0.85 },
-  "channels": {
-    "task": { "poll_seconds": 5 },
-    "http": { "addr": "127.0.0.1:871" }
-  }
-}
-```
-
-- `default_budget` — base units a job may spend when its channel sets none. The primary runaway
-  rail. Only actions offered to the model can be run, and only while their price fits what is left
-  of the budget; an action whose terms change before it runs is refused by the kernel and must be
-  read again. Actions that move value beyond their price (a `transfer`) are never offered. For
-  actions on the agent's own kernel the budget is a hard ceiling. A call to an action on another
-  kernel also pays that kernel's import fee and settles by lottery ticket: on average it costs its
-  quoted price, but a winning ticket pays the full face value set by the kernel operator's
-  `lottery`, which can take a job past its budget; the job then dispatches nothing further.
-- `max_turns` — secondary rail, bounding zero-price loops.
-- `memory_bytes` — size bound on `memory.md`; `0` turns learned memory off.
-- `rate_tasks` — after each job, the agent grades every tool call it made (0/1 and a note) via
-  `POST /v1/transactions/{id}/rate`.
-- `maker.enabled` — when on, a recurring request that no catalog action serves triggers the agent to
-  synthesize and publish a WASM action automating it.
-- `channels` — the task channel is always on; `http` runs only when `addr` is set; `chat` only
-  when `enabled` is true.
-
-The only environment input is `JUICE_HOME`.
-
-**Upgrading from the earlier layout.** An agent home at `$JUICE_HOME/agent/agents/<handle>/` is
-not read any more. Move it to its login's home, and in its `config.json` remove `server_url`,
-replace `memory` with `memory_bytes`, and rename `channels.step` to `channels.task`:
+Register the kernel, create the accounts, and log in to each:
 
 ```sh
-mv ~/.juice/agent/agents/agent ~/.juice/agents/agent@work
+juice kernel add http://localhost:4040
+juice user create agent@work --password 'choose-an-agent-password'
+juice user create alice@work --password 'choose-an-alice-password'
+juice auth login agent@work
+juice auth login alice@work
 ```
 
-## Running
+Account creation prints a recovery phrase once. Keep it with the account's credentials.
+The agent needs funds for its tool calls, and Alice needs funds for any charges when sending work.
+Have the kernel operator fund the accounts. For a local development kernel, the operator can use:
 
-`juice-agent` with no command prints its usage, wrapped to the terminal's width up to 80 columns
-(80 when not printed to a terminal); command lines are never broken, so they paste whole.
+```sh
+juice admin user deposit agent@work 100 --ref agent-initial-funding --as sys@work
+juice admin user deposit alice@work 100 --ref alice-initial-funding --as sys@work
+```
 
-### As a daemon
+Start the daemon in one terminal:
 
 ```sh
 juice-agent serve agent@work
 ```
 
-It runs startup recovery, starts the configured channels and a worker pool, and serves until
-`SIGTERM`/`SIGINT` — on which it drains in-flight jobs, persists, and exits 0. Structured logs go to
-stderr. Several agents are several logins, each served by its own `juice-agent serve`.
+In another terminal, send it a message:
 
-### One-shot (no channel, no daemon)
+```sh
+juice run sys@work/message '{"to":"agent@work","message":"What is 2+2? Reply with just the number."}' --as alice@work
+```
+
+The result includes a `task_id`. Alice's first task waits until you approve her as a sender:
+
+```sh
+juice user requesters --as agent@work
+juice user approve alice@work --as agent@work
+```
+
+The daemon picks up the task on a subsequent poll. Use the returned task ID to check its status:
+
+```sh
+juice task show <task_id> --as alice@work
+```
+
+When its status is `done`, read the transaction identified by its `tx_id`:
+
+```sh
+juice tx show <tx_id> --as alice@work
+```
+
+The reply is in the transaction's `args.answer` field. Press Ctrl-C in the daemon's terminal to
+stop it after its current jobs finish.
+
+## Instructions and configuration
+
+Each agent has a directory named after its login under `$JUICE_HOME/agents/`:
+
+```text
+~/.juice/agents/agent@work/
+├── agent.md       # your instructions and background knowledge
+├── config.json    # optional configuration
+└── personas/      # conversation histories
+```
+
+On first launch, the daemon creates the directory, a blank `agent.md`, and `personas/`.
+It preserves existing files and does not create `config.json`. Edit `agent.md` to describe the
+agent's role, instructions, and relevant background. Changes take effect at the next job.
+
+Configuration is optional. Omitted keys use their defaults; unknown keys or invalid JSON prevent
+startup. The following shows all defaults for an account on `work`:
+
+```json
+{
+  "reason": "sys@work/llm/chat",
+  "action_lookup": "sys@work/lookup",
+  "default_budget": 100,
+  "max_turns": 32,
+  "concurrency": 4,
+  "poll_seconds": 5,
+  "compact_bytes": 262144,
+  "rate_tasks": true
+}
+```
+
+| Setting | Purpose |
+| --- | --- |
+| `reason` | Reasoning action. |
+| `action_lookup` | Action the agent uses to find tools. |
+| `default_budget` | Tool spending budget per job, in base units. |
+| `max_turns` | Maximum reasoning turns per job. |
+| `concurrency` | Number of conversations the daemon can serve at once. |
+| `poll_seconds` | Interval between checks for waiting tasks. |
+| `compact_bytes` | Conversation size in bytes that triggers summarisation of older turns. |
+| `rate_tasks` | Whether to rate tool calls after each job. |
+
+The default `reason` and `action_lookup` addresses use the account's kernel name. Other tools are
+found during execution.
+
+### Replacing `reason` or `action_lookup`
+
+Either can be set to another action, as long as that action takes and returns what the agent uses:
+
+| Key | It must accept | It must return |
+| --- | --- | --- |
+| `reason` | `messages`: a list of `{role, content}` strings, with roles `system`, `user` and `assistant` | `choices`: a list whose first item's `message.content` is the reply text |
+| `action_lookup` | `query` (string) and `limit` (integer) | `results`: a list of `{action, description, input_schema}` |
+
+The action may accept and return more; the agent ignores the rest. It must not limit the length or
+pattern of what the agent sends, and its `limit` must allow 1 to 10. Fields the agent reads must not
+be declared as possibly `null`. At startup the daemon reads both actions' schemas from the kernel and
+stops if one falls short, naming the key, the address and the field:
+
+```
+error: config.json: action_lookup = sys@work/time: input.properties.limit: missing (want integer)
+```
+
+Compare an action's schemas with `juice action show <action>`. The full contracts are in
+`requirements.md` §11.
+`JUICE_HOME` is the daemon's only environment setting; its default is `~/.juice`.
+
+### Spending and ratings
+
+The agent checks a tool's price against the remaining budget before calling it. For local actions,
+the budget is a ceiling on tool spending. Remote calls settle through the kernel's lottery system:
+a winning ticket can cost more than the quoted expected price and take the job over budget. The
+agent then makes no further tool calls. Actions that transfer value beyond their price are excluded.
+
+Reasoning, rating, and summarisation calls are separate from the tool spending budget. Local native
+model calls have zero price under kernel policy. The turn limit also bounds loops using free tools.
+
+With `rate_tasks` enabled, the agent records a binary rating and a short note for its tool calls.
+These notes are visible to anyone who can read the action. Failed calls receive the fixed note
+`call failed`. For successful calls, the model is instructed to discuss tool performance without
+including request content or identifying people or accounts. This reduces disclosure risk but does
+not guarantee privacy. Set `rate_tasks` to `false` to disable the rating pass.
+
+## Sending work and managing access
+
+Users, agents, and applications send work by creating a kernel task addressed to the agent.
+Direct messages use `sys@work/message`, as in the quickstart. Applications can create tasks through
+the kernel API; no separate chat or HTTP intake is required in the daemon.
+
+The kernel withholds tasks from unapproved requesters. Manage access using the agent's account:
+
+```sh
+juice user requesters --as agent@work
+juice user approve alice@work --as agent@work
+juice user revoke alice@work --as agent@work
+juice user block alice@work --as agent@work
+```
+
+Approval admits the requester's waiting tasks. Revocation withholds their tasks again. Blocking
+also declines their waiting tasks and refuses new ones. The daemon does not approve requesters.
+
+For a direct message, the requester is the sender. When an application creates a task, the requester
+is the application's owner. Approving that owner therefore admits work from users of the application.
+
+### Conversations
+
+Conversation histories are kept separately under `personas/`. The daemon processes one task at a
+time for each conversation, while other conversations can run concurrently.
+
+- Direct messages from the same sender through the same creating action share a conversation.
+- An application can supply `thread_id` in a task's arguments to group messages into a conversation.
+  Threads are scoped to the requester and creating action, so identical thread names from different
+  applications do not share history.
+- A relayed task without `thread_id` gets its own conversation.
+
+The model sees who sent each message, including the intermediary when an application relays it.
+Only the current conversation's history is loaded for a job; `agent.md` supplies shared instructions
+for all conversations. An application is responsible for assigning its thread identifiers correctly.
+
+### Completion and failures
+
+The daemon completes a task with the job's answer. For direct messages, the sender reads that answer
+from the completion transaction. Completion runs as the requester and uses the task's reserved
+funds; the agent pays for the tools it calls while working.
+
+If delivery fails transiently, the daemon retains the answer and retries at later polls without
+rerunning the job. A rejected completion can leave the task `waiting`; inspect it with
+`juice task show`. A failed job also attempts to complete its task, supplying a status and reason
+instead of an answer.
+
+A task still waiting after a daemon restart may be executed again. A tool call the kernel reports
+as `timeout` is already dispatched and awaiting settlement, so the daemon does not dispatch it
+again. Inspect its process with `juice process show <process_id>`.
+
+## Running a single job
+
+To run a job directly and print its outcome as JSON:
 
 ```sh
 juice-agent task agent@work "What is the current time? Reply with an ISO-8601 timestamp."
 ```
 
-Runs one job and prints its outcome as JSON to stdout:
+Successive invocations use the same conversation, `cli`, separate from tasks received by the daemon.
+A successful outcome looks like:
 
 ```json
 { "status": "answered", "answer": { "answer": "2026-07-10T00:50:45Z" }, "spent": 0, "turns": 2 }
 ```
 
-## Giving the daemon work (channels)
+| Field | Meaning |
+| --- | --- |
+| `status` | `answered`, `failed`, or `interrupted`. |
+| `answer` | Reply object for an answered job. |
+| `reason` | Explanation for a failed or interrupted job. |
+| `spent` | Tool charges in base units; an unsettled call counts at its quoted price. |
+| `turns` | Number of reasoning turns. |
 
-Where tasks come from is a replaceable boundary. Three channels ship:
+## Operation and troubleshooting
 
-### HTTP channel (Juice-independent)
+Run one `juice-agent serve <login>` process per agent. The daemon writes structured JSON logs to
+stderr. On SIGTERM or SIGINT it stops taking new work and lets queued and running jobs finish.
+At startup, it marks interrupted jobs in the stored histories.
 
-Enable `channels.http.addr`, then submit tasks over plain HTTP:
+The daemon uses the sessions maintained by the `juice` CLI under `$JUICE_HOME/client/` and renews
+them when needed. It does not need the account's password in configuration.
 
-```sh
-# submit — returns {"task_id":"http-1"}
-curl -s -X POST http://127.0.0.1:871/task \
-  -H 'Content-Type: application/json' \
-  -d '{"prompt":"Translate \"good morning\" into Spanish.","budget":40}'
+| Problem | What to check |
+| --- | --- |
+| Kernel is not recorded | Run `juice kernel add <url>`. |
+| Session is missing or revoked | Run `juice auth login <login>`. |
+| Session belongs to another account | Log in to the intended account and restart the daemon. It will not adopt another account's session while running. |
+| Task is waiting | Check requester approval, the task's required caller, and the daemon's logs for execution or completion errors. |
 
-# poll — 202 {"status":"running"} until ready, then 200 with the outcome
-curl -s http://127.0.0.1:871/task/http-1
-```
+Logs include job, persona, action, and transaction identifiers where applicable. The `persona_opened`
+event reports how much earlier history a job loaded. Conversation files under `personas/` retain
+the local record; `juice tx list --as <login>` shows the kernel's record of calls, charges, and ratings.
 
-`budget` is optional (falls back to `default_budget`).
+## Upgrading from 0.3
 
-### Task channel (kernel-native, always on)
+The daemon no longer reads `persona.md`, `knowledge.md`, `memory.md`, or `data/`. It also rejects the
+retired configuration keys `channels`, `memory_bytes`, `maker`, `max_repeats`, `candidate_limit`, and
+`lookup_limit`. Remove those keys from `config.json` before starting the new version.
 
-Any user or action can hand the agent work by parking a kernel *task* addressed to the agent's
-address — no integration between them beyond the kernel. The simplest way is the `message` native:
+Back up the agent directory first. Merge the instructions and knowledge you want to retain into
+`agent.md`, including useful entries from `memory.md`. Keep the old files until you have checked the
+new setup, then archive or remove them. Existing `agent.md` content should be preserved during the
+merge. The former HTTP and chat intakes have been replaced by kernel tasks.
 
-```sh
-# as any funded kernel user
-juice run sys@work/message '{"to":"agent@work","message":"Summarise the latest release notes."}'
-```
+## Development
 
-The daemon polls for waiting tasks whose required caller is its login, works each as a job, and
-completes the task with its answer; the settlement transaction names the agent as caller. This is
-also how other agents delegate to it. If completing fails because the kernel is briefly
-unreachable, the daemon resends the same answer at each later poll without redoing the job; if the
-kernel refuses the answer, the task stays `waiting`, visible with `juice task list`.
+The [design document](agent-design.md) explains the architecture;
+[requirements.md](requirements.md) defines the expected behaviour.
 
-A call the kernel reports as `timeout` has been dispatched and parked; the kernel settles it on its
-own (`juice process show <process_id>`), so the daemon does not run it again. Any retried call is
-sent under the same external key, so the kernel answers a repeat with the first run's outcome.
-
-### Chat channel (juice-ui chat)
-
-Enable `channels.chat` and the agent answers messages in juice-ui `chat` rooms:
-
-```json
-"chat": {
-  "enabled": true,
-  "poll_seconds": 2,
-  "context_messages": 20,
-  "loop": { "enabled": true, "max_events": 20, "window_seconds": 60, "cooldown_seconds": 60 }
-}
-```
-
-The chat service is the account `chat` on the agent's kernel. Add the agent's address to a room (as a
-room admin) and it handles its own access on first use — no other setup.
-It remembers the recent conversation: each reply sees the last `context_messages` messages in the room
-(default 20; set `-1` to answer each message with no memory of earlier ones). The optional `loop` block
-keeps the agent from getting stuck replying back and forth with another bot: after `max_events` replies
-to the same sender within `window_seconds`, it goes quiet for `cooldown_seconds`. Omit a number for the
-default shown; omit the block to turn the limit off.
-
-## Outcomes
-
-Every job yields:
-
-| field    | meaning                                                        |
-| -------- | ------------------------------------------------------------- |
-| `status` | `answered`, `failed`, or `interrupted`                         |
-| `answer` | the reply object the model produced (for `answered`)          |
-| `reason` | why it failed (`turn-cap`, `decide-error: …`) when not answered|
-| `spent`  | base units the kernel charged (a parked call counts at its price) — reconstructible from the kernel ledger |
-| `turns`  | model round-trips taken                                        |
-
-## Observability
-
-- **Logs** — structured JSON to stderr (`event`, `turn`, `action`, `tx_id`, …).
-- **Transcripts** — one append-only JSONL per job under the agent's `data/` dir; the durable record
-  and replay log. A job interrupted at shutdown is marked on the next start's recovery scan.
-- **Ledger** — the kernel is the financial ground truth: `juice tx list` shows the agent's calls,
-  their costs, and the ratings it left.
-
-## Measuring performance across versions
-
-The agent will change over time, so competence is tracked quantitatively, not by impression:
+### Tests
 
 ```sh
-juice-agent bench agent@work bench/tasks.json 5   # 5 repetitions per task, against a live kernel + LLM
+make test     # unit tests; no kernel or model required
+make flows    # integration flows against a real kernel
 ```
 
-`bench/tasks.json` is a versioned suite of tasks with machine-checkable success criteria. Each run
-writes a report (success rate, mean credits from the ledger, latency, turns) keyed by `git describe`
-+ suite version under `bench/results/`, so performance is a diffable time series. The bench needs a
-live kernel and real LLM, so it is excluded from `go test`.
+Flows use the kernel checkout at `JUICE_SRC` (default `../juice`) and its compiled binary at
+`JUICE_BIN` (default `$JUICE_SRC/juice`). The kernel must support contract 0.16 or later. Flows that
+exercise model behaviour use the real Ollama endpoint and skip when Ollama or the chat model is
+unavailable; the remaining flows check daemon and kernel behaviour without a model.
 
-## Tests
+### Benchmarks
 
 ```sh
-make test     # go test ./... — offline, deterministic, no kernel or LLM
-make flows    # end-to-end against a real kernel + real Ollama (JUICE_SRC ?= ../juice)
+juice-agent bench agent@work bench/tasks.json 5
 ```
 
-The flows boot a kernel from the kernel checkout `JUICE_SRC` (its binary `JUICE_BIN`, default
-`$JUICE_SRC/juice`) through that checkout's own flow harness. Mechanism flows (bootstrap, init,
-no_session, recovery, drain, task_channel, named, session_identity, usage) need no model; LLM flows (task, persona, rating,
-role_law, memory, maker) drive a real model and skip cleanly if Ollama or the chat model is
-unavailable.
+This runs five repetitions of each task in the versioned suite against a live kernel and model.
+Each repetition uses a fresh conversation. Reports include success rate, spending, latency, and
+turn count, and are written to stdout and `bench/results/`, keyed by agent and suite version.
+Rerunning the same version pair replaces its report. Benchmarks are separate from the unit tests.

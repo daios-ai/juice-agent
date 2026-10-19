@@ -10,7 +10,7 @@
 # Booting a kernel, creating accounts, funding them and logging them in is the
 # kernel's own business, so this harness sources the kernel repository's flow
 # library ($JUICE_SRC/flows/lib.sh) for it and adds only what is the agent's:
-# starting the daemon as a login and talking to its HTTP channel. Each account
+# starting the daemon as a login and handing it tasks. Each account
 # gets its own client home (its juice CLI records), which is the JUICE_HOME the
 # daemon then runs under — exactly as an operator's installation would be.
 #
@@ -78,7 +78,16 @@ create_user() {
     make_user "$DB" "$KDIR/sys" "$KDIR/$1" "$1" "$2"
     deposit "$DB" "$KDIR/sys" "$1" 100000000
 }
-create_agent() { create_user agent agent-pass; }
+# create_agent — create the agent's account and, as its operator, approve sys:
+# the message helper below runs as sys, and the kernel withholds every task from a
+# requester the addressee has not approved (kernel U52).
+create_agent() {
+    create_user agent agent-pass
+    approve agent "sys@$(kname "$DB")"
+}
+
+# approve handle requester — handle's operator approves requester (kernel U52).
+approve() { jj "$DB" "$KDIR/$1" user approve "$2" >/dev/null; }
 
 # ---------------------------------------------------------------------------
 # agentd
@@ -87,49 +96,103 @@ create_agent() { create_user agent agent-pass; }
 agent_home() { local h="${1:-agent}"; echo "$(client_home "$h")/agents/$(login "$h")"; }
 
 # start_agentd dir [cfg-fragment] — write the agent's optional config.json, launch
-# the daemon as agent's login, and set AGENTD_PID, ADATA and AHTTP. Memory is off
-# by default (flows that test it override memory_bytes in their fragment).
+# the daemon as agent's login, and set AGENTD_PID and PERSONAS.
 start_agentd() {
     local dir="$1" extra="${2:-}" home; home=$(agent_home)
-    ADATA="$home/data"
+    PERSONAS="$home/personas"
     mkdir -p "$home"
     cat > "$home/config.json" <<CFG
-{ "default_budget": 100, "max_turns": 12, "concurrency": 2,
-  "lookup_limit": 8, "candidate_limit": 12, "rate_tasks": true, "memory_bytes": 0,
-  "channels": { "http": { "addr": "127.0.0.1:0" }, "task": { "poll_seconds": 1 } }
+{ "default_budget": 100, "max_turns": 12, "concurrency": 2, "poll_seconds": 1, "rate_tasks": true
   ${extra:+, $extra} }
 CFG
     JUICE_HOME="$(client_home agent)" "$AGENTD" serve "$(login agent)" >"$dir/agentd.log" 2>&1 &
     AGENTD_PID=$!; track_pid "$AGENTD_PID"
-    local addr; addr=$(wait_line "$dir/agentd.log" '"event":"serving".*"http_addr":"\([^"]*\)"')
-    [ -n "$addr" ] || { echo "agentd did not start" >&2; cat "$dir/agentd.log" >&2; return 1; }
-    AHTTP="http://$addr"
+    wait_line "$dir/agentd.log" '"event":"\(serving\)"' >/dev/null || { echo "agentd did not start" >&2; cat "$dir/agentd.log" >&2; return 1; }
 }
 
-# submit_http prompt [budget] — POST a job to agentd's http channel, echo its id.
-submit_http() {
-    local prompt="$1" budget="${2:-0}"
-    curl -sf -X POST "$AHTTP/task" -H 'Content-Type: application/json' \
-        -d "{\"prompt\":$(json_str "$prompt"),\"budget\":$budget}" 2>/dev/null \
-        | python3 -c "import sys,json; print(json.load(sys.stdin)['task_id'])" 2>/dev/null
-}
-
-# await_http id [timeout_s] — poll until the outcome is ready; echo its JSON.
-await_http() {
-    local id="$1" secs="${2:-300}" code
-    local deadline=$(( $(date +%s) + secs ))
-    while :; do
-        code=$(curl -s -o /dev/null -w '%{http_code}' "$AHTTP/task/$id" 2>/dev/null)
-        [ "$code" = "200" ] && { curl -s "$AHTTP/task/$id" 2>/dev/null; return 0; }
-        [ "$(date +%s)" -ge "$deadline" ] && return 1
-        sleep 0.3
-    done
-}
-
-# message to text — park a message task for to (a handle) as sys; echo its id.
+# message to text [from] — park a message task for to (a handle) as from (default
+# sys); echo its id.
 message() {
-    kj run "sys@$(kname "$DB")/message" "{\"to\":\"$(login "$1")\",\"message\":$(json_str "$2")}" \
+    local run=(kj); [ -n "${3:-}" ] && run=(jj "$DB" "$KDIR/$3")
+    "${run[@]}" run "sys@$(kname "$DB")/message" "{\"to\":\"$(login "$1")\",\"message\":$(json_str "$2")}" \
         | python3 -c "import sys,json; print(json.load(sys.stdin)['result']['task_id'])" 2>/dev/null
+}
+
+# reply_of id [from] — the answer the agent completed task id with, read from the
+# completion transaction as its sender (default sys), a party to it.
+reply_of() {
+    local run=(kj); [ -n "${2:-}" ] && run=(jj "$DB" "$KDIR/$2")
+    local tx; tx=$("${run[@]}" task show "$1" | jfield tx_id)
+    "${run[@]}" tx show "$tx" | python3 -c "import sys,json; print(json.load(sys.stdin).get('args',{}).get('answer',''))" 2>/dev/null
+}
+
+# ---------------------------------------------------------------------------
+# applications: an HTTP action whose backend creates a task for the agent
+# ---------------------------------------------------------------------------
+# start_app handle name — publish handle's action <name>; each call creates a
+# task for the agent through the call's capability (kernel API §9), with the
+# call's args as partial_args. The task acts for handle (its requester), is paid
+# by the caller (its owner) and is created by handle's action (created_by).
+start_app() {
+    local port; port=$(backend_port)
+    python3 - "$port" "$(login agent)" <<'PYEOF' &
+import sys, json, http.server, urllib.request
+port, to = int(sys.argv[1]), sys.argv[2]
+class H(http.server.BaseHTTPRequestHandler):
+    def do_POST(self):
+        args = json.loads(self.rfile.read(int(self.headers.get('Content-Length', 0))) or b'{}')
+        cap, out = self.headers.get('X-Juice-Capability'), b'{}'
+        if cap:  # absent only on the harness's readiness probe
+            req = urllib.request.Request(self.headers['X-Juice-Callback'] + '/v1/tasks', method='POST',
+                data=json.dumps({"action": "sys@" + to.split('@')[1] + "/sink", "required_caller": to,
+                                 "partial_args": args}).encode(),
+                headers={'Content-Type': 'application/json', 'X-Juice-Capability': cap})
+            out = json.dumps({"task_id": json.load(urllib.request.urlopen(req))["id"]}).encode()
+        self.send_response(200); self.send_header('Content-Type', 'application/json'); self.end_headers()
+        self.wfile.write(out)
+    def log_message(self, *a): pass
+http.server.HTTPServer(('127.0.0.1', port), H).serve_forever()
+PYEOF
+    track_pid $!
+    _await_http "$port" POST
+    publish "$DB" "$KDIR/$1" "$2" --kind http --source "http://127.0.0.1:$port/" --price "$(units 0)" \
+        --description "relays a post to the agent" >/dev/null
+}
+
+# dead_reason — create, as the agent, a reasoning action that meets the reason
+# contract but whose endpoint is closed, and echo its address. Every call fails
+# at once, so every job fails at once and its task is completed with
+# status failed: a flow's conversations and completions are then decided by the
+# task fields alone, whether or not a model is present.
+dead_reason() {
+    local in='{"type":"object","properties":{"messages":{"type":"array","description":"The conversation","items":{"type":"object","properties":{"role":{"type":"string","description":"Who speaks"},"content":{"type":"string","description":"What is said"}},"required":["role","content"]}}},"required":["messages"]}'
+    local out='{"type":"object","properties":{"choices":{"type":"array","description":"The reply","items":{"type":"object","properties":{"message":{"type":"object","description":"The reply","properties":{"content":{"type":"string","description":"The reply text"}}}}}}}}'
+    enabled "$DB" "$KDIR/agent" dead-chat --kind http --source "http://127.0.0.1:1/" --price "$(units 0)" \
+        --description "a closed endpoint" --input-schema "$in" --output-schema "$out" >/dev/null \
+        && echo "$(login agent)/dead-chat"
+}
+
+# post from action json — call action as from; echo the task it created.
+post() {
+    jj "$DB" "$KDIR/$1" run "$2" "$3" | python3 -c "import sys,json; print(json.load(sys.stdin)['result']['task_id'])" 2>/dev/null
+}
+
+# persona_of id log — the persona the daemon opened for task id.
+persona_of() {
+    grep '"event":"persona_opened"' "$2" | python3 -c "
+import sys,json
+for l in sys.stdin:
+    e=json.loads(l)
+    if e['job']=='task-$1': print(e['persona'])"
+}
+
+# loaded_of id log — how many earlier records the job for task id carried in.
+loaded_of() {
+    grep '"event":"persona_opened"' "$2" | python3 -c "
+import sys,json
+for l in sys.stdin:
+    e=json.loads(l)
+    if e['job']=='task-$1': print(e['loaded'])"
 }
 
 # await_task id [timeout_s] — wait until a task is done; echo its status.
@@ -143,7 +206,6 @@ await_task() {
 
 json_str() { python3 -c "import sys,json; print(json.dumps(sys.argv[1]))" "$1"; }
 jfield()   { python3 -c "import sys,json; print(json.loads(sys.stdin.read()).get(sys.argv[1],''))" "$1"; }
-afield()   { python3 -c "import sys,json; print(json.loads(sys.stdin.read()).get('answer',{}).get(sys.argv[1],''))" "$1"; }
 
 assert_le()      { [ "$2" -le "$3" ] && ok "$1" || fail "$1" "want $2 <= $3"; }
 assert_match()   { echo "$3" | grep -qE "$2" && ok "$1" || fail "$1" "want /$2/ in [$3]"; }

@@ -2,13 +2,14 @@ package main
 
 import (
 	"context"
+	"math"
 	"strconv"
 
 	"github.com/daios-ai/juice-agent/agent"
 )
 
 // Rater judges and records tool-call quality. Implemented by the juice client
-// (llm/json to judge, POST /rate to record).
+// (the reasoning affordance to judge, POST /rate to record).
 type Rater interface {
 	ChatJSON(ctx context.Context, messages []agent.Message, schema map[string]any) (any, error)
 	Rate(ctx context.Context, txID string, rating int, note string) error
@@ -20,13 +21,12 @@ type dispatched struct {
 	action  string
 	txID    string
 	isError bool
-	errText string
 }
 
 // RateTask grades every dispatched call in a finished transcript and records a
 // 0/1 rating with a one-line note for each — the agent's durable, kernel-held
 // memory of tool quality. A kernel-failed call is a mechanical 0; successful
-// calls are judged together by one llm/json call over the transcript. This
+// calls are judged together by one structured reasoning call over the transcript. This
 // runs after the loop, never inside it (the kernel law: execution must not
 // rate). Rating is best-effort: a judging failure leaves calls unrated rather
 // than failing the task.
@@ -42,21 +42,19 @@ func RateTask(ctx context.Context, messages []agent.Message, r Rater, intrinsics
 		if _, isIntrinsic := intrinsics[m.Action]; isIntrinsic {
 			continue
 		}
-		calls = append(calls, dispatched{index: len(calls), action: m.Action, txID: m.TxID, isError: m.IsError, errText: m.Content})
+		calls = append(calls, dispatched{index: len(calls), action: m.Action, txID: m.TxID, isError: m.IsError})
 	}
 	if len(calls) == 0 {
 		return
 	}
 
-	// Mechanical 0 for failed calls; collect the rest for the judge.
+	// Mechanical 0 for failed calls; collect the rest for the judge. The note is
+	// public (anyone who can read the action lists it) and an error text can echo
+	// the call's arguments, so a failure's note is fixed.
 	var toJudge []dispatched
 	for _, c := range calls {
 		if c.isError {
-			note := "call failed"
-			if c.errText != "" {
-				note = "call failed: " + trunc(c.errText, 120)
-			}
-			if err := r.Rate(ctx, c.txID, 0, note); err != nil {
+			if err := r.Rate(ctx, c.txID, 0, "call failed"); err != nil {
 				log("rate_error", map[string]any{"tx_id": c.txID, "error": err.Error()})
 			}
 			continue
@@ -90,7 +88,7 @@ type judgment struct {
 func judge(ctx context.Context, messages []agent.Message, calls []dispatched, r Rater) map[int]judgment {
 	prompt := "You are grading how well each tool call below served the task, judging in hindsight " +
 		"from the full transcript. For each call return rating 1 (helpful, correct, worth reusing) or " +
-		"0 (unhelpful, wrong, or wasteful) and a one-line note. Calls to grade:\n"
+		"0 (unhelpful, wrong, or wasteful) and a one-line note. " + notePolicy + " Calls to grade:\n"
 	for _, c := range calls {
 		prompt += "  index=" + strconv.Itoa(c.index) + " action=" + c.action + "\n"
 	}
@@ -106,7 +104,7 @@ func judge(ctx context.Context, messages []agent.Message, calls []dispatched, r 
 					"properties": map[string]any{
 						"index":  map[string]any{"type": "integer", "description": "the call index"},
 						"rating": map[string]any{"type": "integer", "description": "0 or 1"},
-						"note":   map[string]any{"type": "string", "description": "one-line justification"},
+						"note":   map[string]any{"type": "string", "description": "one line on the tool's performance only; no request content, no names or addresses"},
 					},
 					"required": []any{"index", "rating", "note"},
 				},
@@ -121,6 +119,16 @@ func judge(ctx context.Context, messages []agent.Message, calls []dispatched, r 
 	return parseJudgments(val)
 }
 
+// notePolicy tells the judge that its notes are public. It reduces the risk of
+// disclosure; it cannot guarantee it, since the model's compliance is unverified.
+const notePolicy = "Each note is published with its rating, readable by anyone. Describe only how the " +
+	"tool performed: whether its result was correct, useful, or wasteful. Never quote or paraphrase the " +
+	"request, the tool's input or output, or the agent's instructions, and never name or address any " +
+	"person, account, room, or conversation."
+
+// parseJudgments keeps only well-formed judgments: an integral index, a rating of
+// exactly 0 or 1, and a string note. A rating is permanent (kernel D11), so a
+// malformed one leaves its call unrated rather than recording false evidence.
 func parseJudgments(val any) map[int]judgment {
 	out := map[int]judgment{}
 	obj, ok := val.(map[string]any)
@@ -136,35 +144,26 @@ func parseJudgments(val any) map[int]judgment {
 		if !ok {
 			continue
 		}
-		idx, ok := toInt(m["index"])
-		if !ok {
+		idx, okIdx := toInt(m["index"])
+		rating, okRating := toInt(m["rating"])
+		note, okNote := m["note"].(string)
+		if !okIdx || !okRating || !okNote || (rating != 0 && rating != 1) {
 			continue
 		}
-		rating, _ := toInt(m["rating"])
-		if rating != 0 && rating != 1 {
-			rating = 0
-		}
-		note, _ := m["note"].(string)
 		out[idx] = judgment{rating: rating, note: note}
 	}
 	return out
 }
 
+// toInt reads a JSON number as an int, refusing a fractional one.
 func toInt(v any) (int, bool) {
 	switch n := v.(type) {
 	case float64:
-		return int(n), true
+		return int(n), n == math.Trunc(n)
 	case int:
 		return n, true
 	case int64:
 		return int(n), true
 	}
 	return 0, false
-}
-
-func trunc(s string, n int) string {
-	if len(s) <= n {
-		return s
-	}
-	return s[:n] + "…"
 }

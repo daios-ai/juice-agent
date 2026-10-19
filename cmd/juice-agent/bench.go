@@ -40,14 +40,8 @@ func runBench(args []string) error {
 	if err != nil {
 		return err
 	}
-	// Bench tasks should not spawn maker synthesis; rating is orthogonal and left
-	// on so runs exercise the real post-task path.
-	e.Maker = nil
-
-	run := func(ctx context.Context, t agent.Job) (agent.Outcome, error) {
-		return e.Execute(ctx, t, nil)
-	}
-	rep := RunSuite(ctx, suite, reps, agentVersion(), run, time.Now)
+	// Rating is left on so runs exercise the real post-job path.
+	rep := RunSuite(ctx, suite, reps, agentVersion(), e.Execute, time.Now)
 
 	// Report to stdout and to a committed results file.
 	enc := json.NewEncoder(os.Stdout)
@@ -180,12 +174,15 @@ func RunSuite(ctx context.Context, s Suite, reps int, agentVersion string, run R
 	rep := Report{AgentVersion: agentVersion, SuiteVersion: s.Version, Reps: reps,
 		Generated: now().UTC().Format(time.RFC3339)}
 	var totalSucc, totalReps int
+	run0 := now().UTC().Format("20060102-150405.000000000") // two runs in one second stay apart
 	for _, task := range s.Tasks {
 		tr := TaskResult{ID: task.ID, Reps: reps}
 		var succ, spent, turns int
 		var latency time.Duration
 		for i := 0; i < reps; i++ {
-			at := agent.Job{ID: task.ID + "-r" + strconv.Itoa(i), Channel: "bench", Budget: task.Budget,
+			// Each repetition of each run is its own persona: no run sees another's history.
+			id := task.ID + "-r" + strconv.Itoa(i)
+			at := agent.Job{ID: id, Persona: "bench-" + run0 + "-" + id, Budget: task.Budget,
 				Messages: []agent.Message{{Role: agent.RoleUser, Content: task.Prompt}}}
 			start := now()
 			out, err := run(ctx, at)

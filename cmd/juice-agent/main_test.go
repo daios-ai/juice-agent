@@ -13,19 +13,15 @@ import (
 	"testing"
 	"unicode/utf8"
 
-	"github.com/daios-ai/juice-agent/channels"
 	"github.com/daios-ai/juice-agent/juice"
 )
 
-// Compile-time guarantees that the juice client and adapters satisfy the
-// interfaces the higher layers depend on. If a method drifts, this fails to
-// build rather than at runtime. kernelAdapter is the single kernel bridge for
-// every channel; satisfying channels.Kernel also satisfies channels.TaskSource
-// (embedded), so the task channel is covered too.
+// Compile-time guarantees that the juice client satisfies the interfaces the
+// higher layers depend on. If a method drifts, this fails to build rather than at
+// runtime.
 var (
-	_ Kernel          = (*juice.Client)(nil)
-	_ Publisher       = (*juice.Client)(nil)
-	_ channels.Kernel = kernelAdapter{}
+	_ Kernel     = (*juice.Client)(nil)
+	_ TaskSource = (*juice.Client)(nil)
 )
 
 func TestLoggerEmitsStructuredJSON(t *testing.T) {
@@ -52,13 +48,37 @@ func TestLoggerEmitsStructuredJSON(t *testing.T) {
 	}
 }
 
-// kernelServing answers GET /v1/me as address/id, accepting only token tok-1.
+// nativeReads are the kernel's action reads for the natives setup checks, with
+// their canonical schemas (descriptions shortened).
+var nativeReads = map[string]string{
+	"sys@k/llm/chat": `{"action":"sys@k/llm/chat","description":"chat","price":0,
+		"input_schema":{"type":"object","properties":{"messages":{"type":"array","description":"history","items":{"type":"object","properties":{"role":{"type":"string","description":"role"},"content":{"type":"string","description":"text"}},"required":["role","content"],"additionalProperties":false}}},"required":["messages"],"additionalProperties":false},
+		"output_schema":{"type":"object","properties":{"choices":{"type":"array","description":"reply","items":{"type":"object","properties":{"message":{"type":"object","description":"the reply","properties":{"content":{"type":"string","description":"text"}},"additionalProperties":false}},"additionalProperties":false}}},"additionalProperties":false}}`,
+	"sys@k/lookup": `{"action":"sys@k/lookup","description":"Semantic search over active actions","price":0,
+		"input_schema":{"type":"object","properties":{"query":{"type":"string","description":"query"},"limit":{"type":"integer","description":"max"}},"required":["query"],"additionalProperties":false},
+		"output_schema":{"type":"object","properties":{"results":{"type":"array","description":"ranked","items":{"type":"object","properties":{"action":{"type":"string","description":"address"},"description":{"type":"string","description":"what"},"input_schema":{"type":"object","description":"input"}},"additionalProperties":false}}},"additionalProperties":false}}`,
+	"sys@k/time": `{"action":"sys@k/time","description":"Current time","price":0,
+		"input_schema":{"type":"object","properties":{},"additionalProperties":false},
+		"output_schema":{"type":"object","properties":{"iso":{"type":"string","description":"RFC 3339"}},"additionalProperties":false}}`,
+}
+
+// kernelServing answers GET /v1/me as address/id and the natives' action reads,
+// accepting only token tok-1.
 func kernelServing(t *testing.T, address, id string) string {
 	t.Helper()
 	srv := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
 		if r.Header.Get("Authorization") != "Bearer tok-1" {
 			w.WriteHeader(401)
 			w.Write([]byte(`{"error":"unauthenticated","code":"unauthenticated"}`))
+			return
+		}
+		if r.URL.Path == "/v1/actions" {
+			row, ok := nativeReads[r.URL.Query().Get("ref")]
+			if !ok {
+				w.Write([]byte(`[]`))
+				return
+			}
+			w.Write([]byte("[" + row + "]"))
 			return
 		}
 		json.NewEncoder(w).Encode(map[string]any{"id": id, "address": address})
@@ -80,12 +100,33 @@ func writeLogin(t *testing.T, root, endpoint, principal string) {
 func TestSetupAcceptsTheLoginsOwnAccount(t *testing.T) {
 	root := setJuiceHome(t)
 	writeLogin(t, root, kernelServing(t, "agent@k", "u1"), "u1")
-	_, cl, cfg, err := setup(context.Background(), newLogger(), "agent@k")
+	exec, cl, cfg, err := setup(context.Background(), newLogger(), "agent@k")
 	if err != nil {
 		t.Fatalf("setup: %v", err)
 	}
-	if cl.Sys("lookup") != "sys@k/lookup" || cfg.Home != filepath.Join(root, "agents", "agent@k") {
-		t.Fatalf("lookup=%q home=%q", cl.Sys("lookup"), cfg.Home)
+	if cl.Login() != "agent@k" || cfg.Home != filepath.Join(root, "agents", "agent@k") {
+		t.Fatalf("login=%q home=%q", cl.Login(), cfg.Home)
+	}
+	// The loop discovers through the configured action lookup, offered with the
+	// terms the kernel holds for it.
+	if exec.Loop.ActionLookup != "sys@k/lookup" || exec.Loop.Always[0].Ref != "sys@k/lookup" ||
+		exec.Loop.Always[0].Description != "Semantic search over active actions" {
+		t.Fatalf("action lookup = %q / %+v", exec.Loop.ActionLookup, exec.Loop.Always)
+	}
+}
+
+// An affordance whose action falls short of its contract stops startup, and the
+// message names the file, the key, the address and the field.
+func TestSetupRefusesAnAffordanceOfTheWrongShape(t *testing.T) {
+	root := setJuiceHome(t)
+	writeLogin(t, root, kernelServing(t, "agent@k", "u1"), "u1")
+	home := filepath.Join(root, "agents", "agent@k")
+	os.MkdirAll(home, 0o700)
+	os.WriteFile(filepath.Join(home, "config.json"), []byte(`{"action_lookup":"sys@k/time"}`), 0o600)
+	_, _, _, err := setup(context.Background(), newLogger(), "agent@k")
+	want := "config.json: action_lookup = sys@k/time: input.properties.limit: missing (want integer)"
+	if err == nil || err.Error() != want {
+		t.Fatalf("err = %v, want %q", err, want)
 	}
 }
 

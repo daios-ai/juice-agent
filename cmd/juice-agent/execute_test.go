@@ -21,9 +21,11 @@ type fakeKernel struct {
 	script []agent.Selection
 	i      int
 	rated  map[string]int
+	seen   [][]agent.Message // the view each Decide was given
 }
 
-func (k *fakeKernel) Decide(_ context.Context, _ []agent.Message, _ []agent.Candidate, _ []agent.Tool) (*agent.Selection, error) {
+func (k *fakeKernel) Decide(_ context.Context, msgs []agent.Message, _ []agent.Candidate, _ []agent.Tool) (*agent.Selection, error) {
+	k.seen = append(k.seen, msgs)
 	if k.i >= len(k.script) {
 		return &agent.Selection{Action: "reply", Args: map[string]any{"answer": "fallback"}}, nil
 	}
@@ -50,7 +52,6 @@ func (k *fakeKernel) Chat(context.Context, []agent.Message) (string, error) { re
 func (k *fakeKernel) ChatJSON(context.Context, []agent.Message, map[string]any) (any, error) {
 	return map[string]any{"ratings": []any{map[string]any{"index": float64(0), "rating": float64(1), "note": "good"}}}, nil
 }
-func (k *fakeKernel) Embed(context.Context, string) ([]float64, error) { return []float64{1, 0}, nil }
 func (k *fakeKernel) Rate(_ context.Context, txID string, rating int, _ string) error {
 	if k.rated == nil {
 		k.rated = map[string]int{}
@@ -67,65 +68,94 @@ func replyIntrinsics() map[string]agent.Intrinsic {
 	}
 }
 
+func testExecutor(dir string, k Kernel) *Executor {
+	return &Executor{
+		Kernel:      k,
+		PersonasDir: dir,
+		Retry:       RetryPolicy{MaxRetries: 0},
+		RetryOK:     func(error) bool { return false },
+		Loop: agent.Config{
+			ReplyTool: "reply", ActionLookup: "sys@k/lookup",
+			Always: []agent.Candidate{{Ref: "sys@k/lookup"}}, MaxTurns: 10, Intrinsics: replyIntrinsics(),
+		},
+		RateTasks: true,
+		Handle:    "agent@k",
+		AgentPath: filepath.Join(dir, "agent.md"),
+	}
+}
+
+func userJob(id, persona, prompt string) agent.Job {
+	return agent.Job{ID: id, Persona: persona, Budget: 100, Messages: []agent.Message{{Role: agent.RoleUser, Content: prompt}}}
+}
+
 func TestExecutorRunsRatesAndRecordsOutcome(t *testing.T) {
 	dir := t.TempDir()
+	os.WriteFile(filepath.Join(dir, "agent.md"), []byte("AGENT-MARKER be terse"), 0o600)
 	k := &fakeKernel{script: []agent.Selection{
 		{Action: "sys@k/time"},
 		{Action: "reply", Args: map[string]any{"answer": "noon"}},
 	}}
-	e := &Executor{
-		Kernel:  k,
-		DataDir: dir,
-		Retry:   RetryPolicy{MaxRetries: 0},
-		RetryOK: func(error) bool { return false },
-		Loop: agent.Config{
-			ReplyTool: "reply", LookupAction: "sys@k/lookup",
-			Always: []agent.Candidate{{Ref: "sys@k/lookup"}}, MaxTurns: 10, Intrinsics: replyIntrinsics(),
-		},
-		RateTasks: true,
-	}
-	task := agent.Job{ID: "t1", Channel: "test", Budget: 100,
-		Messages: []agent.Message{{Role: agent.RoleUser, Content: "what time is it?"}}}
-
-	out, err := e.Execute(context.Background(), task, nil)
+	out, err := testExecutor(dir, k).Execute(context.Background(), userJob("t1", "p1", "what time is it?"))
 	if err != nil {
 		t.Fatalf("execute: %v", err)
 	}
 	if out.Status != agent.StatusAnswered || out.Answer["answer"] != "noon" {
 		t.Fatalf("outcome = %+v", out)
 	}
-	// The dispatched sys@k/time call must have been rated.
 	if k.rated["tx-sys@k/time"] != 1 {
 		t.Fatalf("expected sys@k/time rated 1, got %v", k.rated)
 	}
-	// The transcript file must end with a terminal outcome record.
-	data, _ := os.ReadFile(filepath.Join(dir, "t1.jsonl"))
+	// The model saw agent.md in the system prompt.
+	if first := k.seen[0][0]; first.Kind != "system" || !strings.Contains(first.Content, "AGENT-MARKER") {
+		t.Fatalf("first message = %+v, want the system prompt carrying agent.md", first)
+	}
+	// The persona file ends with a terminal outcome record.
+	data, _ := os.ReadFile(filepath.Join(dir, "p1.jsonl"))
 	if !strings.Contains(string(data), `"kind":"outcome"`) {
-		t.Fatalf("transcript missing outcome record:\n%s", data)
+		t.Fatalf("persona file missing outcome record:\n%s", data)
 	}
 }
 
-func TestExecutorEnqueuesMakerSynthesis(t *testing.T) {
+// A second job in a persona continues the first's conversation, with one system
+// prompt (its own), and rates only its own calls: the first job's transaction was
+// rated once already, and the kernel refuses a second rating (kernel D11).
+func TestExecutorContinuesPersonaAndRatesOnlyThisJob(t *testing.T) {
 	dir := t.TempDir()
-	k := &fakeKernel{}
-	maker, _ := NewMaker(dir, MakerConfig{Enabled: true, MinRepeats: 1, Window: 10, Budget: 40, Threshold: 0.5},
-		k, nil, "sys@k/tinygo/compile", nil)
-	var enqueued []agent.Job
-	e := &Executor{
-		Kernel: k, DataDir: dir, RetryOK: func(error) bool { return false },
-		Loop: agent.Config{ReplyTool: "reply", LookupAction: "sys@k/lookup",
-			MaxTurns: 5, Intrinsics: replyIntrinsics()},
-		Maker:   maker,
-		Enqueue: func(tk agent.Job) { enqueued = append(enqueued, tk) },
-	}
-	// min_repeats=1 so a single occurrence triggers synthesis.
-	task := agent.Job{ID: "t1", Channel: "http", Budget: 50,
-		Messages: []agent.Message{{Role: agent.RoleUser, Content: "do a recurring thing"}}}
-	if _, err := e.Execute(context.Background(), task, nil); err != nil {
+	k1 := &fakeKernel{script: []agent.Selection{{Action: "sys@k/time"}, {Action: "reply", Args: map[string]any{"answer": "noon"}}}}
+	if _, err := testExecutor(dir, k1).Execute(context.Background(), userJob("j1", "alice", "what time is it?")); err != nil {
 		t.Fatal(err)
 	}
-	if len(enqueued) != 1 || enqueued[0].Channel != "self" {
-		t.Fatalf("expected one self synthesis task, got %+v", enqueued)
+	k2 := &fakeKernel{script: []agent.Selection{{Action: "sys@k/web"}, {Action: "reply", Args: map[string]any{"answer": "done"}}}}
+	if _, err := testExecutor(dir, k2).Execute(context.Background(), userJob("j2", "alice", "and the weather?")); err != nil {
+		t.Fatal(err)
+	}
+	view := k2.seen[0]
+	var systems, sawFirst, sawFirstReply bool
+	nsys := 0
+	for _, m := range view {
+		switch {
+		case m.Kind == "system":
+			nsys++
+		case m.Role == agent.RoleUser && m.Content == "what time is it?":
+			sawFirst = true
+		case m.Role == agent.RoleTool && m.Action == "reply" && m.Result["answer"] == "noon":
+			sawFirstReply = true
+		case m.Kind == "outcome":
+			t.Fatalf("an earlier job's outcome record leaked into the view: %+v", m)
+		}
+	}
+	systems = nsys == 1 && view[0].Kind == "system"
+	if !sawFirst || !sawFirstReply || !systems || view[len(view)-1].Content != "and the weather?" {
+		t.Fatalf("second job's view does not continue the first: %+v", view)
+	}
+	if _, again := k2.rated["tx-sys@k/time"]; again || k2.rated["tx-sys@k/web"] != 1 {
+		t.Fatalf("second job rated %v, want only tx-sys@k/web", k2.rated)
+	}
+	// Another persona starts with nothing but its own prompt.
+	k3 := &fakeKernel{}
+	testExecutor(dir, k3).Execute(context.Background(), userJob("j3", "bob", "hi"))
+	if v := k3.seen[0]; len(v) != 2 || v[1].Content != "hi" {
+		t.Fatalf("a new persona's view = %+v, want only its system prompt and request", v)
 	}
 }
 
@@ -252,16 +282,15 @@ func (k *bracketKernel) Chat(context.Context, []agent.Message) (string, error) {
 func (k *bracketKernel) ChatJSON(context.Context, []agent.Message, map[string]any) (any, error) {
 	return nil, nil
 }
-func (k *bracketKernel) Embed(context.Context, string) ([]float64, error) { return nil, nil }
-func (k *bracketKernel) Rate(context.Context, string, int, string) error  { return nil }
+func (k *bracketKernel) Rate(context.Context, string, int, string) error { return nil }
 
 func bracketExecutor(dir string) *Executor {
 	return &Executor{
-		Kernel:  &bracketKernel{},
-		DataDir: dir,
-		RetryOK: func(error) bool { return false },
+		Kernel:      &bracketKernel{},
+		PersonasDir: dir,
+		RetryOK:     func(error) bool { return false },
 		Loop: agent.Config{
-			ReplyTool: "reply", SubtaskTool: "subtask", LookupAction: "sys@k/lookup", MaxTurns: 10,
+			ReplyTool: "reply", SubtaskTool: "subtask", ActionLookup: "sys@k/lookup", MaxTurns: 10,
 			Tools: []agent.Tool{
 				{Name: "reply", InputSchema: map[string]any{"type": "object", "required": []any{"answer"}}},
 				{Name: "subtask", InputSchema: map[string]any{"type": "object", "required": []any{"instruction"}}},
@@ -279,9 +308,9 @@ func TestConcurrentBracketTasksDoNotCrossTalk(t *testing.T) {
 		go func(i int) {
 			defer wg.Done()
 			e := bracketExecutor(dir) // independent kernel/counters per task
-			task := agent.Job{ID: "task-" + strconv.Itoa(i), Channel: "test", Budget: 100,
+			task := agent.Job{ID: "task-" + strconv.Itoa(i), Persona: "task-" + strconv.Itoa(i), Budget: 100,
 				Messages: []agent.Message{{Role: agent.RoleUser, Content: "go"}}}
-			out, _ := e.Execute(context.Background(), task, nil)
+			out, _ := e.Execute(context.Background(), task)
 			results[i] = out
 		}(i)
 	}

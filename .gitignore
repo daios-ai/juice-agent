@@ -15,8 +15,5 @@ memory.md
 /agent.json
 /juice.json
 
-# agentd build scratch (mirrors build.py's dir)
-/.agent_build/
-
 # bench outputs are committed; local scratch is not
 /bench/results/*.local.json

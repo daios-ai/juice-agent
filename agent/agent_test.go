@@ -129,7 +129,7 @@ func replyIntrinsic() map[string]Intrinsic {
 func baseConfig() Config {
 	return Config{
 		ReplyTool:      "reply",
-		LookupAction:   "sys@k/lookup",
+		ActionLookup:   "sys@k/lookup",
 		Tools:          []Tool{{Name: "reply", Description: "finish", InputSchema: map[string]any{"type": "object"}}},
 		Always:         []Candidate{{Ref: "sys@k/lookup"}},
 		MaxTurns:       32,

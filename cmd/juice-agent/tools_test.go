@@ -7,18 +7,11 @@ import (
 	"github.com/daios-ai/juice-agent/agent"
 )
 
-func TestLookupCandidateIsTheGivenAddressAndFree(t *testing.T) {
-	c := lookupCandidate("sys@k/lookup")
-	if c.Ref != "sys@k/lookup" || c.Price != 0 {
-		t.Fatalf("lookup candidate = %+v", c)
-	}
-}
-
 func TestHarnessToolsArePlainNamedAndRequireTheirKeys(t *testing.T) {
 	for _, tc := range []struct {
 		tool agent.Tool
 		key  string
-	}{{replyTool(), "answer"}, {subtaskTool(), "instruction"}, {publishTool(), "artifact"}} {
+	}{{replyTool(), "answer"}, {subtaskTool(), "instruction"}} {
 		if strings.Contains(tc.tool.Name, "/") {
 			t.Fatalf("harness tool %q must not look like an action address", tc.tool.Name)
 		}

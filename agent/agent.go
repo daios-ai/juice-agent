@@ -114,8 +114,9 @@ type Runner interface {
 // one record; Messages returns the current *frame's* model view (which the
 // implementation may have compacted). Child opens a nested bracket frame — a
 // fresh model view seeded with `seed`, whose records are teed to the same durable
-// store, tagged with a new bracket id. All returns every record across frames
-// (for rating and memory). The core keeps no other state.
+// store, tagged with a new bracket id. All returns every record this job wrote,
+// across frames (for rating); history a persona carried in from earlier jobs is
+// never part of it. The core keeps no other state.
 type Transcript interface {
 	Append(ctx context.Context, m Message) error
 	Messages() []Message
@@ -131,12 +132,13 @@ type Intrinsic struct {
 	Handle func(ctx context.Context, args map[string]any) (result map[string]any, terminal bool, err error)
 }
 
-// Job is one unit of the agent's work: a transcript seed, an originating
-// channel, and a credit budget bounding total spend. (A kernel task, D6, is what
-// a channel turns into a Job; the two are distinct.)
+// Job is one unit of the agent's work: a transcript seed, the persona whose
+// history it continues, and a credit budget bounding total spend. (A kernel
+// task, D6, is what intake turns into a Job; the two are distinct.) The loop
+// never reads Persona; it names the transcript the executor opens.
 type Job struct {
 	ID       string
-	Channel  string
+	Persona  string
 	Messages []Message
 	Budget   int
 }
@@ -175,9 +177,9 @@ type Tool struct {
 type Config struct {
 	ReplyTool      string      // the terminal tool's name (e.g. "reply")
 	SubtaskTool    string      // the bracket-opening tool's name (e.g. "subtask"); "" disables brackets
-	LookupAction   string      // the discovery action's address (e.g. "sys@work/lookup")
+	ActionLookup   string      // the action-lookup affordance's address (e.g. "sys@work/lookup")
 	Tools          []Tool      // harness tools rendered to the model each turn
-	Always         []Candidate // catalog candidates always offered (e.g. lookup); never evicted
+	Always         []Candidate // catalog candidates always offered (e.g. the action lookup); never evicted
 	MaxTurns       int
 	CandidateLimit int
 	LookupLimit    int
@@ -414,7 +416,7 @@ func runFrame(ctx context.Context, cfg Config, deps Deps, budget int, cnt *count
 			cand, ok := ws.offered(cfg, sel.Action)
 			if !ok {
 				over, aerr := feedback(fmt.Sprintf("%q is not one of the offered tools or actions. Select one "+
-					"that is offered, or run %q to find more.", sel.Action, cfg.LookupAction))
+					"that is offered, or run %q to find more.", sel.Action, cfg.ActionLookup))
 				if aerr != nil {
 					return nil, StatusFailed, "", aerr
 				}
@@ -444,7 +446,7 @@ func runFrame(ctx context.Context, cfg Config, deps Deps, budget int, cnt *count
 			}
 			cnt.spent += charge
 			result := rr.Result
-			if sel.Action == cfg.LookupAction && rerr == nil {
+			if sel.Action == cfg.ActionLookup && rerr == nil {
 				mergeCandidates(ctx, deps, ws, ParseLookup(rr.Result))
 				result = trimLookup(rr.Result)
 			}

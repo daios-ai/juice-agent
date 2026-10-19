@@ -28,8 +28,7 @@ keeps clusters apart from users. Only the terms are ours.
 $JUICE_HOME/
   bin/                   the family's executables, where the installer puts them
   worlds/<world>.json    one network's definition: its money, and the servers to meet it through
-  llm/<endpoint>.json    one language-model provider: its protocol, address and models
-  schemas/               the JSON Schema of config.json, world and endpoint files, rewritten every serve
+  schemas/               the JSON Schema of config.json and world files, rewritten every serve
   kernels/<world>/       one kernel: juice.db, config.json, the rail key and its records,
                          serve.lock, cache/
   client/config.json     the kernels this client knows, and which login is selected
@@ -183,6 +182,16 @@ held by the service.
 Registration is by adapter. An OpenAPI document installed with `action import` is one adapter, and
 gets identity-preserving reconciliation across upgrades. A service that is not representable that
 way is registered by ordinary action creation. Neither is a requirement of being a service.
+
+Once registered, a service shows up on the kernel as an **application**: a set of actions that
+share a name prefix, `owner@kernel/<name>/...`. The kernel keeps no record of the grouping. The
+only rule is that `owner@kernel/<name>` resolves to `owner@kernel/<name>/index` (U50); the rest is
+convention. The index we recommend is a free action that explains the application: its description
+says what it is for, and its output says how to use it and which actions to call, so an agent can
+read it and go from there. When an OpenAPI document has an operation keyed `index`, the import
+makes it the index. An owner may instead make the index the application's main action, or a
+composite that calls the others and charges one price. Programs must not depend on any of these
+forms, and must not expect the index to list the members; the members are found by their prefix.
 
 **The interface** is a client like any other. It reads the same logins, shows which one is in use,
 and checks `/health` before it trusts. A port number is a default, never an identity: an interface

@@ -2,7 +2,9 @@
 // client over the public TCP API. It implements the agent core's Decider,
 // Catalog, and Runner interfaces (every capability reached through POST /v1/run
 // or the REST surface), plus the supervision calls the policy layer needs
-// (ratings, action lifecycle, tasks). It is the only package that speaks HTTP.
+// (ratings, tasks). It is the only package that speaks HTTP. The two actions the
+// harness depends on, reasoning and action lookup, are configured addresses whose
+// actions must meet a contract (contract.go); the client names no other action.
 //
 // The client holds no secret of its own. It acts as one login, handle@kernel,
 // read from the juice-family client records under $JUICE_HOME/client/ (ecosystem
@@ -37,14 +39,15 @@ var ErrNoSession = errors.New("no session")
 // Client is an authenticated kernel client for one login. It is safe for
 // concurrent use; the access token is guarded by a mutex and rotated on 401.
 type Client struct {
-	login     string // handle@kernel
-	handle    string
-	kernel    string // the name the kernel calls itself, the login's kernel half
-	kernelKey string // the kernel's public key, as recorded by `juice kernel add`
-	principal string // the account's principal id, as recorded by `juice auth login`
-	base      string
-	credPath  string
-	hc        *http.Client
+	login        string // handle@kernel
+	handle       string
+	kernel       string // the name the kernel calls itself, the login's kernel half
+	principal    string // the account's principal id, as recorded by `juice auth login`
+	reason       string // the reasoning affordance's address (reasonContract)
+	actionLookup string // the action-lookup affordance's address (actionLookupContract)
+	base         string
+	credPath     string
+	hc           *http.Client
 
 	mu    sync.Mutex
 	token string
@@ -74,17 +77,18 @@ func localName(s string) bool {
 }
 
 // New builds a client for login from the client records under home
-// ($JUICE_HOME). It fails when the kernel is not recorded or the login holds no
-// session; it sends nothing.
-func New(login, home string) (*Client, error) {
+// ($JUICE_HOME), reasoning through reason and finding actions through
+// actionLookup. It
+// fails when the kernel is not recorded or the login holds no session; it sends
+// nothing.
+func New(login, home, reason, actionLookup string) (*Client, error) {
 	handle, kern, err := ParseLogin(login)
 	if err != nil {
 		return nil, err
 	}
 	var records struct {
 		Kernels map[string]struct {
-			Endpoint  string `json:"endpoint"`
-			PublicKey string `json:"public_key"`
+			Endpoint string `json:"endpoint"`
 		} `json:"kernels"`
 	}
 	cfgPath := filepath.Join(home, "client", "config.json")
@@ -95,7 +99,7 @@ func New(login, home string) (*Client, error) {
 		return nil, fmt.Errorf("kernel %q is not recorded in %s: run juice kernel add <url>", kern, cfgPath)
 	}
 	c := &Client{
-		login: login, handle: handle, kernel: kern, kernelKey: rec.PublicKey,
+		login: login, handle: handle, kernel: kern, reason: reason, actionLookup: actionLookup,
 		base:     strings.TrimRight(rec.Endpoint, "/"),
 		credPath: filepath.Join(home, "client", "credentials", login+".json"),
 		hc:       &http.Client{Timeout: 3 * time.Minute},
@@ -116,16 +120,7 @@ func (c *Client) noSession() error {
 // Login is the client's login, handle@kernel.
 func (c *Client) Login() string { return c.login }
 
-// Address is a user's address on this client's kernel: handle@kernel.
-func (c *Client) Address(handle string) string { return handle + "@" + c.kernel }
-
-// Sys is the address of a kernel native: sys@kernel/name.
-func (c *Client) Sys(name string) string { return "sys@" + c.kernel + "/" + name }
-
-// KernelKey is the kernel's recorded public key; Principal the account's
-// recorded principal id. Together they identify what memory is about (ecosystem
-// standard §4).
-func (c *Client) KernelKey() string { return c.kernelKey }
+// Principal is the account's recorded principal id (ecosystem standard §4).
 func (c *Client) Principal() string { return c.principal }
 
 // readCredentials reads a credential file as a map, so a rewrite keeps every
@@ -467,52 +462,47 @@ func trunc(s string, n int) string {
 
 // --- LLM natives (kernel D17) ---------------------------------------------
 
-// Chat runs llm/chat over role/content messages and returns the reply text.
+// Chat runs the reasoning affordance over role/content messages and returns the
+// reply text.
 func (c *Client) Chat(ctx context.Context, messages []agent.Message) (string, error) {
-	res, err := c.Run(ctx, c.Sys("llm/chat"), map[string]any{"messages": toChatMessages(messages)}, "", "")
+	res, err := c.Run(ctx, c.reason, map[string]any{"messages": toChatMessages(messages)}, "", "")
 	if err != nil {
 		return "", err
 	}
-	choices, _ := res.Result["choices"].([]any)
-	if len(choices) == 0 {
-		return "", nil
+	// The contract cannot make these fields present (the kernel's own schema has
+	// them optional), so a reply without them is reported here, not read as empty.
+	var first map[string]any
+	if choices, _ := res.Result["choices"].([]any); len(choices) > 0 {
+		first, _ = choices[0].(map[string]any)
 	}
-	first, _ := choices[0].(map[string]any)
 	msg, _ := first["message"].(map[string]any)
-	content, _ := msg["content"].(string)
+	content, ok := msg["content"].(string)
+	if !ok {
+		return "", &KernelError{Status: 200, Code: "execution_failed",
+			Message: "the reasoning reply has no choices[0].message.content"}
+	}
 	return content, nil
 }
 
-// ChatJSON runs llm/json with a schema and returns the validated value.
+// ChatJSON asks the reasoning affordance for a JSON value shaped by schema and
+// returns the first JSON object in its reply. The schema is stated in the prompt,
+// so structured output needs no affordance beyond reasoning.
 func (c *Client) ChatJSON(ctx context.Context, messages []agent.Message, schema map[string]any) (any, error) {
-	res, err := c.Run(ctx, c.Sys("llm/json"), map[string]any{
-		"messages": toChatMessages(messages), "schema": schema,
-	}, "", "")
+	sch, err := json.Marshal(schema)
 	if err != nil {
 		return nil, err
 	}
-	return res.Result["value"], nil
-}
-
-// Embed runs llm/embed and returns the embedding vector.
-func (c *Client) Embed(ctx context.Context, text string) ([]float64, error) {
-	res, err := c.Run(ctx, c.Sys("llm/embed"), map[string]any{"input": text}, "", "")
+	aug := append(append([]agent.Message{}, messages...), agent.Message{Role: agent.RoleUser,
+		Content: "Respond with ONLY a JSON object matching this JSON Schema, no prose, no code fences:\n" + string(sch)})
+	content, err := c.Chat(ctx, aug)
 	if err != nil {
 		return nil, err
 	}
-	data, _ := res.Result["data"].([]any)
-	if len(data) == 0 {
-		return nil, nil
+	var v any
+	if js := extractJSON(content); js == "" || json.Unmarshal([]byte(js), &v) != nil {
+		return nil, &KernelError{Status: 200, Code: "execution_failed", Message: "no JSON object in model reply: " + trunc(content, 120)}
 	}
-	first, _ := data[0].(map[string]any)
-	raw, _ := first["embedding"].([]any)
-	out := make([]float64, 0, len(raw))
-	for _, v := range raw {
-		if f, ok := v.(float64); ok {
-			out = append(out, f)
-		}
-	}
-	return out, nil
+	return v, nil
 }
 
 // toChatMessages flattens transcript messages into {role, content} for the chat
@@ -545,15 +535,19 @@ func toChatMessages(msgs []agent.Message) []map[string]any {
 
 // --- Catalog ---------------------------------------------------------------
 
-// Lookup ranks callable actions for a query via the lookup native. The rows are
-// indicative; Read gives the authoritative terms.
+// Lookup ranks callable actions for a query through the action-lookup
+// affordance. The rows are indicative; Read gives the authoritative terms.
 func (c *Client) Lookup(ctx context.Context, query string, limit int) ([]agent.Candidate, error) {
 	if limit <= 0 {
 		limit = 10
 	}
-	res, err := c.Run(ctx, c.Sys("lookup"), map[string]any{"query": query, "limit": limit}, "", "")
+	res, err := c.Run(ctx, c.actionLookup, map[string]any{"query": query, "limit": limit}, "", "")
 	if err != nil {
 		return nil, err
+	}
+	if _, ok := res.Result["results"].([]any); !ok {
+		return nil, &KernelError{Status: 200, Code: "execution_failed",
+			Message: "the action lookup reply has no results list"}
 	}
 	return agent.ParseLookup(res.Result), nil
 }
@@ -562,27 +556,63 @@ func (c *Client) Lookup(ctx context.Context, query string, limit int) ([]agent.C
 // quote_hash that pins them, any value effect, and the kernel's evidence about
 // it (GET /v1/actions?ref=).
 func (c *Client) Read(ctx context.Context, ref string) (agent.Candidate, error) {
-	var rows []struct {
-		ActionRef   string         `json:"action"`
-		Description string         `json:"description"`
-		InputSchema map[string]any `json:"input_schema"`
-		Price       int            `json:"price"`
-		QuoteHash   string         `json:"quote_hash"`
-		Effect      string         `json:"effect"`
-		Evidence    map[string]any `json:"evidence"`
-	}
-	if err := c.do(ctx, http.MethodGet, "/v1/actions?ref="+url.QueryEscape(ref), nil, &rows); err != nil {
-		return agent.Candidate{}, err
-	}
-	if len(rows) == 0 {
-		return agent.Candidate{}, &KernelError{Status: 404, Code: "not_found", Message: "action not found: " + ref}
-	}
-	r := rows[0]
-	return agent.Candidate{Ref: r.ActionRef, Description: r.Description, InputSchema: r.InputSchema,
-		Price: r.Price, QuoteHash: r.QuoteHash, Effect: r.Effect, Evidence: r.Evidence}, nil
+	a, err := c.readAction(ctx, ref)
+	return a.candidate(), err
 }
 
-// --- Supervision: ratings, action lifecycle, tasks, self -------------------
+// actionRow is an action read (GET /v1/actions?ref=), as far as the client uses it.
+type actionRow struct {
+	ActionRef    string         `json:"action"`
+	Description  string         `json:"description"`
+	InputSchema  map[string]any `json:"input_schema"`
+	OutputSchema map[string]any `json:"output_schema"`
+	Price        int            `json:"price"`
+	QuoteHash    string         `json:"quote_hash"`
+	Effect       string         `json:"effect"`
+	Evidence     map[string]any `json:"evidence"`
+}
+
+func (a actionRow) candidate() agent.Candidate {
+	return agent.Candidate{Ref: a.ActionRef, Description: a.Description, InputSchema: a.InputSchema,
+		Price: a.Price, QuoteHash: a.QuoteHash, Effect: a.Effect, Evidence: a.Evidence}
+}
+
+func (c *Client) readAction(ctx context.Context, ref string) (actionRow, error) {
+	var rows []actionRow
+	if err := c.do(ctx, http.MethodGet, "/v1/actions?ref="+url.QueryEscape(ref), nil, &rows); err != nil {
+		return actionRow{}, err
+	}
+	if len(rows) == 0 {
+		return actionRow{}, &KernelError{Status: 404, Code: "not_found", Message: "action not found: " + ref}
+	}
+	return rows[0], nil
+}
+
+// Affordances reads the two configured actions and checks each one's declared
+// schemas against its contract, once, at startup. It returns the action-lookup
+// action as the candidate the loop always offers, with the terms the kernel
+// holds for it. An error names the configuration key and the address.
+func (c *Client) Affordances(ctx context.Context) (agent.Candidate, error) {
+	if _, err := c.affordance(ctx, "reason", c.reason, reasonContract); err != nil {
+		return agent.Candidate{}, err
+	}
+	row, err := c.affordance(ctx, "action_lookup", c.actionLookup, actionLookupContract)
+	return row.candidate(), err
+}
+
+// affordance reads the action configured under key and checks it against k.
+func (c *Client) affordance(ctx context.Context, key, ref string, k contract) (actionRow, error) {
+	row, err := c.readAction(ctx, ref)
+	if err == nil {
+		err = k.check(row.InputSchema, row.OutputSchema)
+	}
+	if err != nil {
+		return actionRow{}, fmt.Errorf("%s = %s: %w", key, ref, err)
+	}
+	return row, nil
+}
+
+// --- Supervision: ratings, tasks, self ---------------------------------------
 
 // Rate posts a 0/1 rating with an optional note for a transaction the client
 // paid for (POST /v1/transactions/{id}/rate).
@@ -591,76 +621,19 @@ func (c *Client) Rate(ctx context.Context, txID string, rating int, note string)
 		map[string]any{"rating": rating, "note": note}, nil)
 }
 
-// CreateWasmAction registers a kind=wasm action from a base64 artifact and
-// returns its id and address.
-func (c *Client) CreateWasmAction(ctx context.Context, name, description string, price int, in, out map[string]any, artifactB64 string) (id, ref string, err error) {
-	body := map[string]any{
-		"name": name, "title": name, "kind": "wasm", "price": price,
-		"description": description, "wasm_artifact": artifactB64,
-	}
-	if in != nil {
-		body["input_schema"] = in
-	}
-	if out != nil {
-		body["output_schema"] = out
-	}
-	var a struct {
-		ID        string `json:"id"`
-		ActionRef string `json:"action"`
-	}
-	if err := c.do(ctx, http.MethodPost, "/v1/actions", body, &a); err != nil {
-		return "", "", err
-	}
-	return a.ID, a.ActionRef, nil
-}
-
-// EnableAction activates the action with this id.
-func (c *Client) EnableAction(ctx context.Context, id string) error {
-	return c.do(ctx, http.MethodPost, "/v1/actions/enable", map[string]any{"target": id}, nil)
-}
-
-// SetPublic makes the action with this id public.
-func (c *Client) SetPublic(ctx context.Context, id string) error {
-	return c.do(ctx, http.MethodPut, "/v1/actions", map[string]any{"target": id, "visibility": "public"}, nil)
-}
-
-// DeleteAction removes the action with this id (history preserved kernel-side).
-func (c *Client) DeleteAction(ctx context.Context, id string) error {
-	return c.do(ctx, http.MethodDelete, "/v1/actions?target="+url.QueryEscape(id), nil, nil)
-}
-
 // Self is the authenticated identity (GET /v1/me).
 type Self struct {
-	ID         string      `json:"id"`
-	Address    string      `json:"address"`
-	Available  int         `json:"available"`
-	Locked     int         `json:"locked"`
-	Connectors []Connector `json:"connectors"`
+	ID        string `json:"id"`
+	Address   string `json:"address"`
+	Available int    `json:"available"`
+	Locked    int    `json:"locked"`
 }
 
-// Connector is a directory-grouped grant node from GET /v1/me: the folder the
-// granted actions share and the actions granted beneath it. It lets a caller
-// check whether a grant selector is already connected without exposing any token.
-type Connector struct {
-	Directory string `json:"directory"`
-	Actions   []struct {
-		Action string `json:"action"`
-	} `json:"actions"`
-}
-
-// Me returns the client's own identity, wallet, and grant connectors.
+// Me returns the client's own identity and wallet.
 func (c *Client) Me(ctx context.Context) (Self, error) {
 	var s Self
 	err := c.do(ctx, http.MethodGet, "/v1/me", nil, &s)
 	return s, err
-}
-
-// ConnectGrant attaches a static token as the grant for selector (a
-// delegated_bearer group): POST /v1/grants {selector, token}. It is idempotent —
-// reconnecting overwrites the stored token.
-func (c *Client) ConnectGrant(ctx context.Context, selector, token string) error {
-	return c.do(ctx, http.MethodPost, "/v1/grants",
-		map[string]any{"selector": selector, "token": token}, nil)
 }
 
 // Task is a kernel task (D6) as GET /v1/tasks renders it: every party an address.
@@ -668,6 +641,7 @@ type Task struct {
 	ID             string         `json:"id"`
 	ActionRef      string         `json:"action"`
 	CreatedBy      string         `json:"created_by"`
+	Requester      string         `json:"requester"`
 	Owner          string         `json:"owner"`
 	RequiredCaller string         `json:"required_caller"`
 	PartialArgs    map[string]any `json:"partial_args"`
@@ -675,12 +649,27 @@ type Task struct {
 	Status         string         `json:"status"`
 }
 
+// taskPage is the most tasks one list request returns (the API's ceiling).
+const taskPage = 200
+
 // WaitingTasks lists the waiting tasks visible to the client: those it funded
-// and those addressed to it.
+// and those addressed to it by a requester it approved (kernel U52). It reads
+// every page: the listing cannot be filtered by required caller, so a first
+// page full of tasks the client funded would otherwise hide every later one.
+// A task missed while the list changes between pages appears at the next call.
 func (c *Client) WaitingTasks(ctx context.Context) ([]Task, error) {
 	var tasks []Task
-	err := c.do(ctx, http.MethodGet, "/v1/tasks?status=waiting", nil, &tasks)
-	return tasks, err
+	for offset := 0; ; offset += taskPage {
+		var page []Task
+		path := fmt.Sprintf("/v1/tasks?status=waiting&limit=%d&offset=%d", taskPage, offset)
+		if err := c.do(ctx, http.MethodGet, path, nil, &page); err != nil {
+			return nil, err
+		}
+		tasks = append(tasks, page...)
+		if len(page) < taskPage {
+			return tasks, nil
+		}
+	}
 }
 
 // CompleteTask completes a waiting task with the given input.
@@ -722,19 +711,6 @@ func Code(err error) string {
 		return ke.Code
 	}
 	return ""
-}
-
-// IsGrantRequired reports whether err is the kernel's lazy-consent rejection
-// (§8): running an action the caller has not yet granted (code "grant_required",
-// HTTP 403). Callers provision the grant and retry. The status fallback is
-// defensive: a grant_required always carries the code, but any 403 is treated as a
-// missing grant so provisioning is attempted rather than the call failing outright.
-func IsGrantRequired(err error) bool {
-	if Code(err) == "grant_required" {
-		return true
-	}
-	var ke *KernelError
-	return errors.As(err, &ke) && ke.Status == http.StatusForbidden
 }
 
 // IsRetryable reports whether err is worth retrying with backoff: transport

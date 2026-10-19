@@ -68,6 +68,23 @@ func TestRunAggregatesMetrics(t *testing.T) {
 	}
 }
 
+// Two runs started within one second get distinct personas.
+func TestRunsWithinOneSecondUseDistinctPersonas(t *testing.T) {
+	suite := Suite{Version: "vT", Tasks: []BenchTask{{ID: "a", Prompt: "p", Budget: 10}}}
+	personas := map[string]int{}
+	run := func(_ context.Context, j agent.Job) (agent.Outcome, error) {
+		personas[j.Persona]++
+		return agent.Outcome{Status: agent.StatusAnswered}, nil
+	}
+	for _, at := range []int64{1, 2} {
+		now := func() time.Time { return time.Unix(100, at*int64(time.Millisecond)) }
+		RunSuite(context.Background(), suite, 2, "test-1", run, now)
+	}
+	if len(personas) != 4 {
+		t.Fatalf("personas = %v, want four distinct (two runs x two reps)", personas)
+	}
+}
+
 func TestLoadSuiteAndWriteReport(t *testing.T) {
 	// The committed starter suite must parse.
 	s, err := LoadSuite("../../bench/tasks.json")

@@ -9,6 +9,7 @@ import (
 	"net/http/httptest"
 	"os"
 	"path/filepath"
+	"strconv"
 	"strings"
 	"testing"
 
@@ -28,12 +29,6 @@ type fakeKernel struct {
 	lastRun    map[string]any            // last POST /v1/run body
 	actions    map[string]map[string]any // ref -> GET /v1/actions?ref= row
 	rated      map[string]any
-	lastAction struct {
-		method, query string
-		body          map[string]any
-	}
-	connectors []map[string]any
-	lastGrant  map[string]any
 	tasks      []map[string]any
 	completed  map[string]any // task id -> completion body
 }
@@ -98,30 +93,30 @@ func (f *fakeKernel) handler() http.Handler {
 			}
 			return
 		}
-		f.lastAction.method, f.lastAction.query, f.lastAction.body = r.Method, r.URL.RawQuery, readBody(r)
-		writeJSON(w, 200, map[string]any{"id": "act-1", "action": "agent@k/x"})
-	}))
-	mux.HandleFunc("/v1/actions/enable", authed(func(w http.ResponseWriter, r *http.Request) {
-		f.lastAction.method, f.lastAction.query, f.lastAction.body = r.Method+" enable", "", readBody(r)
-		writeJSON(w, 200, []any{})
+		writeJSON(w, 400, map[string]string{"error": "want ?ref=", "code": "invalid_input"})
 	}))
 	mux.HandleFunc("/v1/transactions/", authed(func(w http.ResponseWriter, r *http.Request) {
 		f.rated[strings.TrimSuffix(strings.TrimPrefix(r.URL.Path, "/v1/transactions/"), "/rate")] = readBody(r)
 		writeJSON(w, 200, map[string]any{})
 	}))
 	mux.HandleFunc("/v1/me", authed(func(w http.ResponseWriter, r *http.Request) {
-		writeJSON(w, 200, map[string]any{"id": "u1", "address": "agent@k", "available": 500, "connectors": f.connectors})
-	}))
-	mux.HandleFunc("/v1/grants", authed(func(w http.ResponseWriter, r *http.Request) {
-		f.lastGrant = readBody(r)
-		writeJSON(w, 200, map[string]any{})
+		writeJSON(w, 200, map[string]any{"id": "u1", "address": "agent@k", "available": 500})
 	}))
 	mux.HandleFunc("/v1/tasks", authed(func(w http.ResponseWriter, r *http.Request) {
 		if r.URL.Query().Get("status") != "waiting" {
 			writeJSON(w, 400, map[string]string{"error": "want status=waiting", "code": "invalid_input"})
 			return
 		}
-		writeJSON(w, 200, f.tasks)
+		// Paged as the API pages every list: limit defaults to 50, ceiling 200.
+		limit, offset := 50, 0
+		if v, err := strconv.Atoi(r.URL.Query().Get("limit")); err == nil {
+			limit = min(v, 200)
+		}
+		if v, err := strconv.Atoi(r.URL.Query().Get("offset")); err == nil {
+			offset = max(v, 0)
+		}
+		page := f.tasks[min(offset, len(f.tasks)):min(offset+limit, len(f.tasks))]
+		writeJSON(w, 200, page)
 	}))
 	mux.HandleFunc("/v1/tasks/", authed(func(w http.ResponseWriter, r *http.Request) {
 		id := strings.TrimSuffix(strings.TrimPrefix(r.URL.Path, "/v1/tasks/"), "/complete")
@@ -156,13 +151,20 @@ func writeRecords(t *testing.T, endpoint string, cred map[string]any) string {
 	return home
 }
 
+// The configured affordances in tests. They are deliberately not the kernel's
+// default natives, so a test passing proves the client names no other action.
+const (
+	testReason = "brain@k/think"
+	testLookup = "index@k/find"
+)
+
 // startFake starts f and returns a client for agent@k holding tok-1/ref-1.
 func startFake(t *testing.T, f *fakeKernel) *Client {
 	t.Helper()
 	srv := httptest.NewServer(f.handler())
 	t.Cleanup(srv.Close)
 	home := writeRecords(t, srv.URL, map[string]any{"token": "tok-1", "refresh_token": "ref-1", "principal_id": "u1"})
-	c, err := New("agent@k", home)
+	c, err := New("agent@k", home, testReason, testLookup)
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -181,22 +183,19 @@ func TestParseLogin(t *testing.T) {
 	}
 }
 
-func TestNewReadsRecordsAndFormsAddresses(t *testing.T) {
+func TestNewReadsRecords(t *testing.T) {
 	c := startFake(t, newFakeKernel())
-	if c.Login() != "agent@k" || c.KernelKey() != "KEY" || c.Principal() != "u1" {
-		t.Fatalf("login=%q key=%q principal=%q", c.Login(), c.KernelKey(), c.Principal())
-	}
-	if c.Sys("llm/chat") != "sys@k/llm/chat" || c.Address("chat") != "chat@k" {
-		t.Fatalf("Sys=%q Address=%q", c.Sys("llm/chat"), c.Address("chat"))
+	if c.Login() != "agent@k" || c.Principal() != "u1" {
+		t.Fatalf("login=%q principal=%q", c.Login(), c.Principal())
 	}
 }
 
 func TestNewRefusesUnrecordedKernelAndMissingSession(t *testing.T) {
 	home := writeRecords(t, "http://x", nil)
-	if _, err := New("agent@other", home); err == nil || !strings.Contains(err.Error(), "juice kernel add") {
+	if _, err := New("agent@other", home, testReason, testLookup); err == nil || !strings.Contains(err.Error(), "juice kernel add") {
 		t.Fatalf("unrecorded kernel: err = %v", err)
 	}
-	if _, err := New("agent@k", home); !errors.Is(err, ErrNoSession) || !strings.Contains(err.Error(), "juice auth login agent@k") {
+	if _, err := New("agent@k", home, testReason, testLookup); !errors.Is(err, ErrNoSession) || !strings.Contains(err.Error(), "juice auth login agent@k") {
 		t.Fatalf("missing session: err = %v", err)
 	}
 }
@@ -324,31 +323,59 @@ func TestRunFailureIsKernelError(t *testing.T) {
 	}
 }
 
-func TestLLMNativesUseKernelShapes(t *testing.T) {
+// chatReply is the llm/chat result shape carrying content as the reply.
+func chatReply(content string) map[string]any {
+	return map[string]any{"choices": []any{map[string]any{"index": 0,
+		"message": map[string]any{"role": "assistant", "content": content}}}}
+}
+
+func TestChatAndChatJSONRunTheReasonAffordance(t *testing.T) {
 	f := newFakeKernel()
-	f.runResults["sys@k/llm/chat"] = map[string]any{"choices": []any{
-		map[string]any{"index": 0, "message": map[string]any{"role": "assistant", "content": "hello"}}}}
-	f.runResults["sys@k/llm/json"] = map[string]any{"value": map[string]any{"ok": true}}
-	f.runResults["sys@k/llm/embed"] = map[string]any{"data": []any{map[string]any{"index": 0, "embedding": []any{0.5, 1.0}}}}
+	f.runResults[testReason] = chatReply("hello")
 	c := startFake(t, f)
 	ctx := context.Background()
 	msgs := []agent.Message{{Role: agent.RoleUser, Content: "hi"}}
 
-	if got, err := c.Chat(ctx, msgs); err != nil || got != "hello" {
-		t.Fatalf("chat = %q, %v", got, err)
+	if got, err := c.Chat(ctx, msgs); err != nil || got != "hello" || f.lastRun["action"] != testReason {
+		t.Fatalf("chat = %q, %v, ran %v", got, err, f.lastRun["action"])
 	}
-	schema := map[string]any{"type": "object"}
-	if got, err := c.ChatJSON(ctx, msgs, schema); err != nil || got.(map[string]any)["ok"] != true {
-		t.Fatalf("json = %v, %v", got, err)
+	// ChatJSON states the schema in the prompt and extracts the first JSON object.
+	f.runResults[testReason] = chatReply("Here: {\"ratings\": [{\"index\": 0}]} done")
+	schema := map[string]any{"type": "object", "required": []any{"ratings"}}
+	got, err := c.ChatJSON(ctx, msgs, schema)
+	if err != nil || got.(map[string]any)["ratings"] == nil || f.lastRun["action"] != testReason {
+		t.Fatalf("json = %v, %v, ran %v", got, err, f.lastRun["action"])
 	}
-	if _, ok := f.lastRun["args"].(map[string]any)["schema"]; !ok {
-		t.Fatalf("llm/json args = %v, want schema", f.lastRun["args"])
+	sent, _ := f.lastRun["args"].(map[string]any)["messages"].([]any)
+	last, _ := sent[len(sent)-1].(map[string]any)["content"].(string)
+	if !strings.Contains(last, `"required":["ratings"]`) {
+		t.Fatalf("schema not stated in the prompt: %q", last)
 	}
-	if got, err := c.Embed(ctx, "text"); err != nil || len(got) != 2 || got[1] != 1.0 {
-		t.Fatalf("embed = %v, %v", got, err)
+	f.runResults[testReason] = chatReply("no object at all")
+	if _, err := c.ChatJSON(ctx, msgs, schema); Code(err) != "execution_failed" {
+		t.Fatalf("reply without JSON: err = %v, want execution_failed", err)
 	}
-	if f.lastRun["args"].(map[string]any)["input"] != "text" {
-		t.Fatalf("llm/embed args = %v, want input", f.lastRun["args"])
+}
+
+// A reply lacking the field the client reads is an error, never an empty answer
+// or an empty search; an empty result list is a search that matched nothing.
+func TestRepliesWithoutTheReadFieldAreErrors(t *testing.T) {
+	f := newFakeKernel()
+	c := startFake(t, f)
+	ctx := context.Background()
+	for _, res := range []map[string]any{{}, {"choices": []any{}}, {"choices": []any{map[string]any{"index": 0}}}} {
+		f.runResults[testReason] = res
+		if _, err := c.Chat(ctx, nil); Code(err) != "execution_failed" {
+			t.Errorf("chat reply %v: err = %v, want execution_failed", res, err)
+		}
+	}
+	f.runResults[testLookup] = map[string]any{}
+	if _, err := c.Lookup(ctx, "q", 8); Code(err) != "execution_failed" {
+		t.Errorf("lookup reply without results: err = %v, want execution_failed", err)
+	}
+	f.runResults[testLookup] = map[string]any{"results": []any{}}
+	if cands, err := c.Lookup(ctx, "q", 8); err != nil || len(cands) != 0 {
+		t.Errorf("empty results = %v, %v; want no candidates and no error", cands, err)
 	}
 }
 
@@ -356,8 +383,7 @@ func TestDecideRendersToolsAndExtractsSelection(t *testing.T) {
 	f := newFakeKernel()
 	// The model replies with prose wrapping a JSON selection, which the client
 	// must extract.
-	f.runResults["sys@k/llm/chat"] = map[string]any{"choices": []any{map[string]any{"message": map[string]any{
-		"role": "assistant", "content": `Sure. {"action": "sys@k/web", "args": {"url": "x"}}`}}}}
+	f.runResults[testReason] = chatReply(`Sure. {"action": "sys@k/web", "args": {"url": "x"}}`)
 	c := startFake(t, f)
 	catalog := []agent.Candidate{{Ref: "sys@k/web", Description: "fetch a page", Price: 3,
 		Evidence:    map[string]any{"local_experience": map[string]any{"uses": 4, "successes": 3}},
@@ -397,9 +423,43 @@ func TestExtractJSON(t *testing.T) {
 	}
 }
 
+// nativeRow is an action read whose schemas are given as JSON.
+func nativeRow(t *testing.T, ref, input, output string) map[string]any {
+	t.Helper()
+	return map[string]any{"action": ref, "description": "native " + ref, "price": 0, "quote_hash": "q-" + ref,
+		"input_schema": schema(t, input), "output_schema": schema(t, output)}
+}
+
+func TestAffordancesAreCheckedAndTheLookupIsOffered(t *testing.T) {
+	f := newFakeKernel()
+	f.actions[testReason] = nativeRow(t, testReason, kernelChatInput, kernelChatOutput)
+	f.actions[testLookup] = nativeRow(t, testLookup, kernelLookupInput, kernelLookupOutput)
+	c := startFake(t, f)
+	ctx := context.Background()
+
+	// The offered entry is the kernel's read of the configured action.
+	cand, err := c.Affordances(ctx)
+	if err != nil || cand.Ref != testLookup || cand.Description != "native "+testLookup ||
+		cand.QuoteHash != "q-"+testLookup || cand.InputSchema["required"] == nil {
+		t.Fatalf("affordances = %+v, %v", cand, err)
+	}
+
+	// A wrong-shaped action lookup is refused, naming the key, the address and the field.
+	f.actions[testLookup] = nativeRow(t, testLookup, kernelLookupInput, kernelTimeOutput)
+	if _, err := c.Affordances(ctx); err == nil ||
+		err.Error() != "action_lookup = "+testLookup+": output.properties.results: missing (want array)" {
+		t.Fatalf("err = %v", err)
+	}
+	// A reasoning action the kernel does not hold is refused, naming reason.
+	delete(f.actions, testReason)
+	if _, err := c.Affordances(ctx); err == nil || !strings.HasPrefix(err.Error(), "reason = "+testReason+": ") {
+		t.Fatalf("err = %v", err)
+	}
+}
+
 func TestLookupAndRead(t *testing.T) {
 	f := newFakeKernel()
-	f.runResults["sys@k/lookup"] = map[string]any{"results": []any{
+	f.runResults[testLookup] = map[string]any{"results": []any{
 		map[string]any{"action": "sys@k/web", "description": "fetch", "price": 9},
 	}}
 	f.actions["sys@k/web"] = map[string]any{"action": "sys@k/web", "description": "fetch", "price": 7,
@@ -409,8 +469,8 @@ func TestLookupAndRead(t *testing.T) {
 	ctx := context.Background()
 
 	cands, err := c.Lookup(ctx, "fetch a page", 8)
-	if err != nil || len(cands) != 1 || cands[0].Ref != "sys@k/web" {
-		t.Fatalf("lookup = %+v, %v", cands, err)
+	if err != nil || len(cands) != 1 || cands[0].Ref != "sys@k/web" || f.lastRun["action"] != testLookup {
+		t.Fatalf("lookup = %+v, %v, ran %v", cands, err, f.lastRun["action"])
 	}
 	got, err := c.Read(ctx, "sys@k/web")
 	if err != nil || got.Price != 7 || got.QuoteHash != "q-web" || got.Evidence["local_experience"] == nil {
@@ -437,35 +497,16 @@ func TestRatePostsRatingAndNote(t *testing.T) {
 	}
 }
 
-func TestActionMutationsTargetByID(t *testing.T) {
-	f := newFakeKernel()
-	c := startFake(t, f)
-	ctx := context.Background()
-
-	if err := c.EnableAction(ctx, "act-1"); err != nil || f.lastAction.body["target"] != "act-1" {
-		t.Fatalf("enable: %v body=%v", err, f.lastAction.body)
-	}
-	if err := c.SetPublic(ctx, "act-1"); err != nil || f.lastAction.method != http.MethodPut ||
-		f.lastAction.body["target"] != "act-1" || f.lastAction.body["visibility"] != "public" {
-		t.Fatalf("set public: %v %+v", err, f.lastAction)
-	}
-	if err := c.DeleteAction(ctx, "act-1"); err != nil || f.lastAction.method != http.MethodDelete || f.lastAction.query != "target=act-1" {
-		t.Fatalf("delete: %v %+v", err, f.lastAction)
-	}
-	id, ref, err := c.CreateWasmAction(ctx, "x", "does x", 2, nil, nil, "AAA")
-	if err != nil || id != "act-1" || ref != "agent@k/x" || f.lastAction.body["kind"] != "wasm" {
-		t.Fatalf("create: %q %q %v %v", id, ref, err, f.lastAction.body)
-	}
-}
-
 func TestTasksListAndComplete(t *testing.T) {
 	f := newFakeKernel()
-	f.tasks = []map[string]any{{"id": "t1", "action": "sys@k/sink", "owner": "alice@k", "required_caller": "agent@k",
+	f.tasks = []map[string]any{{"id": "t1", "action": "sys@k/sink", "owner": "alice@k", "requester": "rooms@k",
+		"created_by": "rooms@k/post", "required_caller": "agent@k",
 		"partial_args": map[string]any{"message": "hi"}, "status": "waiting"}}
 	c := startFake(t, f)
 	ctx := context.Background()
 	tasks, err := c.WaitingTasks(ctx)
-	if err != nil || len(tasks) != 1 || tasks[0].Owner != "alice@k" || tasks[0].RequiredCaller != "agent@k" {
+	if err != nil || len(tasks) != 1 || tasks[0].Owner != "alice@k" || tasks[0].Requester != "rooms@k" ||
+		tasks[0].CreatedBy != "rooms@k/post" || tasks[0].RequiredCaller != "agent@k" {
 		t.Fatalf("tasks = %+v, %v", tasks, err)
 	}
 	if err := c.CompleteTask(ctx, "t1", nil); err != nil {
@@ -473,6 +514,20 @@ func TestTasksListAndComplete(t *testing.T) {
 	}
 	if body, _ := f.completed["t1"].(map[string]any); body == nil || body["args"] == nil {
 		t.Fatalf("completion body = %v, want args {}", f.completed["t1"])
+	}
+}
+
+// Tasks the agent funded for other callers fill the first pages; the one
+// addressed to the agent comes last and must still be listed.
+func TestWaitingTasksReadsEveryPage(t *testing.T) {
+	f := newFakeKernel()
+	for i := 0; i < 449; i++ {
+		f.tasks = append(f.tasks, map[string]any{"id": "funded-" + strconv.Itoa(i), "required_caller": "bob@k", "status": "waiting"})
+	}
+	f.tasks = append(f.tasks, map[string]any{"id": "mine", "required_caller": "agent@k", "status": "waiting"})
+	tasks, err := startFake(t, f).WaitingTasks(context.Background())
+	if err != nil || len(tasks) != 450 || tasks[449].ID != "mine" {
+		t.Fatalf("listed %d tasks, %v; want all 450 ending with mine", len(tasks), err)
 	}
 }
 
@@ -504,36 +559,10 @@ func TestIsRetryable(t *testing.T) {
 	}
 }
 
-func TestGrantsAndConnectors(t *testing.T) {
-	f := newFakeKernel()
-	f.connectors = []map[string]any{{"directory": "chat@k/msg", "actions": []map[string]any{{"action": "chat@k/msg/read"}}}}
-	c := startFake(t, f)
-	ctx := context.Background()
-	if err := c.ConnectGrant(ctx, "chat@k/msg", "key-abc"); err != nil || f.lastGrant["selector"] != "chat@k/msg" || f.lastGrant["token"] != "key-abc" {
-		t.Fatalf("grant: %v body=%v", err, f.lastGrant)
-	}
-	self, err := c.Me(ctx)
-	if err != nil || self.Address != "agent@k" || len(self.Connectors) != 1 || self.Connectors[0].Directory != "chat@k/msg" {
+func TestMeReadsIdentity(t *testing.T) {
+	self, err := startFake(t, newFakeKernel()).Me(context.Background())
+	if err != nil || self.Address != "agent@k" || self.ID != "u1" || self.Available != 500 {
 		t.Fatalf("me = %+v, %v", self, err)
-	}
-}
-
-func TestIsGrantRequired(t *testing.T) {
-	cases := []struct {
-		err  error
-		want bool
-	}{
-		{&KernelError{Status: 403, Code: "grant_required"}, true},
-		{&KernelError{Status: 403, Code: ""}, true}, // defensive status fallback
-		{&KernelError{Status: 401, Code: "unauthenticated"}, false},
-		{&KernelError{Status: 500, Code: "internal"}, false},
-		{errors.New("plain"), false},
-		{nil, false},
-	}
-	for i, c := range cases {
-		if got := IsGrantRequired(c.err); got != c.want {
-			t.Errorf("case %d (%v): IsGrantRequired = %v, want %v", i, c.err, got, c.want)
-		}
 	}
 }
 

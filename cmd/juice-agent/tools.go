@@ -21,41 +21,6 @@ func replyTool() agent.Tool {
 	}
 }
 
-// publishTool is the maker's transactional publish of a compiled WASM action.
-func publishTool() agent.Tool {
-	return agent.Tool{
-		Name:        "publish",
-		Description: "register a compiled WASM action so it becomes reusable",
-		InputSchema: map[string]any{
-			"type": "object",
-			"properties": map[string]any{
-				"name":          map[string]any{"type": "string", "description": "kebab-case action name"},
-				"description":   map[string]any{"type": "string", "description": "what the action does"},
-				"artifact":      map[string]any{"type": "string", "description": "base64 WASM artifact from the tinygo/compile native"},
-				"input_schema":  map[string]any{"type": "object", "description": "the action's input schema"},
-				"output_schema": map[string]any{"type": "object", "description": "the action's output schema"},
-				"test_inputs":   map[string]any{"type": "array", "description": "distinct inputs to validate before publishing", "items": map[string]any{"type": "object"}},
-			},
-			"required": []any{"name", "artifact"},
-		},
-	}
-}
-
-// lookupCandidate is the lookup native at ref as an always-offered catalog
-// candidate, so the agent can always search even before its first lookup.
-func lookupCandidate(ref string) agent.Candidate {
-	return agent.Candidate{
-		Ref:         ref,
-		Description: "Search over callable actions; returns matching actions by address",
-		Price:       0,
-		InputSchema: map[string]any{
-			"type":       "object",
-			"properties": map[string]any{"query": map[string]any{"type": "string"}, "limit": map[string]any{"type": "integer"}},
-			"required":   []any{"query"},
-		},
-	}
-}
-
 // subtaskTool opens a bracket: a focused sub-loop that inherits context and an
 // instruction, works in isolation, and rolls up a single result (§4b).
 func subtaskTool() agent.Tool {

@@ -30,7 +30,7 @@ flow_bootstrap() {
     # Harness tools are NOT registered on the platform — the catalog stays clean.
     local acts; acts=$(kj action list --all)
     assert_not_contains bootstrap.no_fake_reply   "$(login agent)/reply"   "$acts"
-    assert_not_contains bootstrap.no_fake_publish "$(login agent)/publish" "$acts"
+    assert_not_contains bootstrap.no_fake_subtask "$(login agent)/subtask" "$acts"
 
     kill -9 "$AGENTD_PID" 2>/dev/null; wait "$AGENTD_PID" 2>/dev/null
     start_agentd "$dir" || { fail bootstrap.restart "no daemon"; return; }
@@ -41,11 +41,11 @@ flow_recovery() {
     echo "=== FLOW recovery ==="
     local dir; dir=$(new_dir)
     start_kernel "$dir"; create_agent
-    local adata; adata="$(agent_home)/data"
-    mkdir -p "$adata"
+    local pdir; pdir="$(agent_home)/personas"
+    mkdir -p "$pdir"
     printf '%s\n%s\n' \
         '{"role":"user","content":"half-done job"}' \
-        '{"role":"assistant","action":"sys@k/time"}' > "$adata/orphan.jsonl"
+        '{"role":"assistant","action":"sys@k/time"}' > "$pdir/orphan.jsonl"
 
     start_agentd "$dir" || { fail recovery.agentd "no daemon"; return; }
     if grep -q '"event":"recovery"' "$dir/agentd.log" && grep -q 'orphan' "$dir/agentd.log"; then
@@ -53,11 +53,11 @@ flow_recovery() {
     else
         fail recovery.marks_interrupted "no recovery log for orphan"
     fi
-    assert_contains recovery.marker '"kind":"interrupted"' "$(tail -1 "$adata/orphan.jsonl")"
+    assert_contains recovery.marker '"kind":"interrupted"' "$(tail -1 "$pdir/orphan.jsonl")"
 }
 
 flow_init() {
-    echo "=== FLOW init (home under agents/<login>; blank files; no config written) ==="
+    echo "=== FLOW init (home under agents/<login>; blank agent.md; personas/; no config written) ==="
     local dir; dir=$(new_dir)
     start_kernel "$dir"; create_agent
     local home; home=$(agent_home)
@@ -66,26 +66,51 @@ flow_init() {
     local pid=$!; track_pid "$pid"
     wait_line "$dir/agentd.log" '"event":"\(serving\)"' >/dev/null || { fail init.serving "no daemon"; cat "$dir/agentd.log" >&2; return; }
 
-    local missing=""
-    for f in persona.md knowledge.md memory.md; do
-        [ -f "$home/$f" ] || missing="$missing $f"
-        [ -s "$home/$f" ] && missing="$missing $f(nonempty)"
-    done
-    [ -d "$home/data" ] || missing="$missing data/"
-    [ -z "$missing" ] && ok init.blank_files_created || fail init.blank_files_created "missing/nonblank:$missing"
+    [ -f "$home/agent.md" ] && [ ! -s "$home/agent.md" ] && ok init.blank_agent_md || fail init.blank_agent_md "agent.md missing or not blank"
+    [ -d "$home/personas" ] && ok init.personas_dir || fail init.personas_dir "no personas/"
+    local retired=""
+    for f in persona.md knowledge.md memory.md data; do [ -e "$home/$f" ] && retired="$retired $f"; done
+    [ -z "$retired" ] && ok init.no_retired_files || fail init.no_retired_files "the daemon created:$retired"
     [ -e "$home/config.json" ] && fail init.no_config_written "the daemon wrote config.json" || ok init.no_config_written
-    grep -q '"channels":\[[^]]*"task"' "$dir/agentd.log" && ok init.task_channel_always_on \
-        || fail init.task_channel_always_on "no task channel with no config"
+    # With no config at all, the daemon still takes tasks.
+    local tid; tid=$(message agent "no config")
+    assert_eq init.serves_without_config done "$(await_task "$tid" 120)"
 
     # An operator edit must survive a restart (init never truncates).
-    printf 'INIT-MARKER-9Z\n' > "$home/persona.md"
+    printf 'INIT-MARKER-9Z\n' > "$home/agent.md"
     kill -9 "$pid" 2>/dev/null; wait "$pid" 2>/dev/null
     JUICE_HOME="$(client_home agent)" "$AGENTD" serve "$(login agent)" >"$dir/agentd2.log" 2>&1 &
     track_pid $!
     wait_line "$dir/agentd2.log" '"event":"\(serving\)"' >/dev/null || { fail init.restart "no daemon"; return; }
-    grep -q 'INIT-MARKER-9Z' "$home/persona.md" \
+    grep -q 'INIT-MARKER-9Z' "$home/agent.md" \
         && ok init.non_truncating \
-        || fail init.non_truncating "persona.md truncated on restart"
+        || fail init.non_truncating "agent.md truncated on restart"
+}
+
+flow_config() {
+    echo "=== FLOW config (retired keys and wrong-shaped affordances are refused at startup) ==="
+    local dir; dir=$(new_dir)
+    start_kernel "$dir"; create_agent
+    local home; home=$(agent_home); mkdir -p "$home"
+    local key out rc
+    for key in channels memory_bytes maker; do
+        echo "{ \"$key\": {} }" > "$home/config.json"
+        out=$(JUICE_HOME="$(client_home agent)" "$AGENTD" serve "$(login agent)" 2>&1); rc=$?
+        assert_ne "config.refuses_$key" 0 "$rc"
+    done
+    assert_contains config.names_file "config.json" "$out"
+
+    # Each affordance is checked against its contract: an action of another
+    # shape stops the daemon, naming the key, the address and the field.
+    local t="sys@$(kname "$DB")/time"
+    echo "{ \"reason\": \"$t\" }" > "$home/config.json"
+    out=$(JUICE_HOME="$(client_home agent)" "$AGENTD" serve "$(login agent)" 2>&1); rc=$?
+    assert_ne config.refuses_wrong_reason 0 "$rc"
+    assert_contains config.names_reason "reason = $t: input.properties.messages: missing" "$out"
+    echo "{ \"action_lookup\": \"sys@$(kname "$DB")/llm/chat\" }" > "$home/config.json"
+    out=$(JUICE_HOME="$(client_home agent)" "$AGENTD" serve "$(login agent)" 2>&1); rc=$?
+    assert_ne config.refuses_wrong_action_lookup 0 "$rc"
+    assert_contains config.names_action_lookup "action_lookup = sys@$(kname "$DB")/llm/chat: input: requires messages, which the agent does not send" "$out"
 }
 
 flow_no_session() {
@@ -116,29 +141,162 @@ flow_drain() {
     grep -q '"event":"stopped"' "$dir/agentd.log" && ok drain.logged_stopped || fail drain.logged_stopped "no stopped event"
 }
 
-flow_task_channel() {
-    echo "=== FLOW task_channel (intake + egress mechanics; no LLM required) ==="
+flow_tasks() {
+    echo "=== FLOW tasks (intake + completion mechanics) ==="
     local dir; dir=$(new_dir)
-    start_kernel "$dir" || { fail task_channel.kernel "no kernel"; return; }
+    start_kernel "$dir" || { fail tasks.kernel "no kernel"; return; }
     create_agent
     create_user other other-pass
-    start_agentd "$dir" || { fail task_channel.agentd "no daemon"; return; }
+    approve other "sys@$(kname "$DB")"
+    # No model: every job fails at once, so the completion is deterministic.
+    start_agentd "$dir" "\"reason\": \"$(dead_reason)\"" || { fail tasks.agentd "no daemon"; return; }
 
-    # A task addressed to the agent is picked up and COMPLETED by the daemon even
-    # with no LLM: a failed loop still acks the task (waiting -> done). The reply
-    # rides in the completion transaction's args, readable by the sender.
+    # A task addressed to the agent is picked up and COMPLETED by the daemon, even
+    # when its job fails. The reply rides in the completion transaction's args,
+    # which the sender can read: the completion runs as the sender (kernel D6).
+    # The kernel merges the task's partial_args into those args, so the check reads
+    # the status, which only the agent's completion supplies.
     local tid; tid=$(message agent "deterministic ping")
-    assert_nonempty task_channel.created "$tid"
-    assert_eq task_channel.completed_by_daemon done "$(await_task "$tid" 60)"
-    local tx args; tx=$(kj task show "$tid" | jfield tx_id)
-    args=$(kj tx show "$tx" | python3 -c 'import sys,json; print(json.dumps(json.load(sys.stdin).get("args",{})))' 2>/dev/null)
-    assert_contains task_channel.reply_in_tx_args "deterministic ping" "$args"
+    assert_nonempty tasks.created "$tid"
+    assert_eq tasks.completed_by_daemon done "$(await_task "$tid" 120)"
+    local tx; tx=$(kj task show "$tid" | jfield tx_id)
+    assert_eq tasks.reply_in_tx_args failed "$(kj tx show "$tx" | python3 -c 'import sys,json; print(json.load(sys.stdin).get("args",{}).get("status",""))' 2>/dev/null)"
+    assert_eq tasks.runs_as_sender "sys@$(kname "$DB")" "$(kj tx show "$tx" | jfield caller)"
 
-    # A task addressed to other is not the agent's work: the daemon leaves it
-    # waiting (only tasks whose required caller is the agent are its to do).
+    # A task addressed to other is not the agent's work: it stays waiting.
     local oid; oid=$(message other "not for the agent")
     sleep 3 # several daemon polls
-    assert_eq task_channel.foreign_untouched waiting "$(kj task show "$oid" | jfield status)"
+    assert_eq tasks.foreign_untouched waiting "$(kj task show "$oid" | jfield status)"
+}
+
+flow_approval() {
+    echo "=== FLOW approval (the kernel withholds an unapproved sender's task) ==="
+    local dir; dir=$(new_dir)
+    start_kernel "$dir"; create_agent; create_user alice alice-pass
+    start_agentd "$dir" || { fail approval.agentd "no daemon"; return; }
+
+    local tid; tid=$(message agent "let me in" alice)
+    assert_nonempty approval.created "$tid"
+    sleep 3 # several daemon polls
+    assert_eq approval.withheld_until_approved waiting "$(jj "$DB" "$KDIR/alice" task show "$tid" | jfield status)"
+    assert_contains approval.listed_pending '"pending"' "$(jj "$DB" "$KDIR/agent" user requesters)"
+
+    approve agent "$(login alice)"
+    assert_eq approval.served_once_approved done "$(await_task_as alice "$tid" 120)"
+}
+
+# await_task_as handle id [timeout_s] — wait until handle sees task id done.
+await_task_as() {
+    local h="$1" id="$2" deadline=$(( $(date +%s) + ${3:-300} )) st=""
+    while [ "$(date +%s)" -lt "$deadline" ]; do
+        st=$(jj "$DB" "$KDIR/$h" task show "$id" | jfield status); [ "$st" = "done" ] && break; sleep 0.5
+    done
+    echo "$st"
+}
+
+flow_personas() {
+    echo "=== FLOW personas (one file per sender; a sender's next job loads the last) ==="
+    local dir; dir=$(new_dir)
+    start_kernel "$dir"; create_agent; create_user alice alice-pass
+    approve agent "$(login alice)"
+    start_agentd "$dir" || { fail personas.agentd "no daemon"; return; }
+
+    local t1 t2 t3
+    t1=$(message agent "first from sys");  await_task "$t1" 300 >/dev/null
+    t2=$(message agent "second from sys"); await_task "$t2" 300 >/dev/null
+    t3=$(message agent "hello from alice" alice); await_task_as alice "$t3" 300 >/dev/null
+
+    local n; n=$(ls "$PERSONAS"/*.jsonl 2>/dev/null | wc -l)
+    assert_eq personas.one_file_per_sender 2 "$n"
+    local sysfile; sysfile=$(grep -l 'first from sys' "$PERSONAS"/*.jsonl)
+    assert_contains personas.second_in_same_file "second from sys" "$(cat "$sysfile")"
+    assert_not_contains personas.alice_kept_apart "hello from alice" "$(cat "$sysfile")"
+    assert_contains personas.attributed "sys@$(kname "$DB"): first from sys" "$(cat "$sysfile")"
+
+    # The log says what each job loaded: nothing for a persona's first job, the
+    # earlier exchange for its next.
+    local loads; loads=$(grep '"event":"persona_opened"' "$dir/agentd.log" | python3 -c '
+import sys,json
+for l in sys.stdin:
+    e=json.loads(l); print(e["job"], e["loaded"])')
+    local l1 l2 l3
+    l1=$(echo "$loads" | awk -v j="task-$t1" '$1==j{print $2}')
+    l2=$(echo "$loads" | awk -v j="task-$t2" '$1==j{print $2}')
+    l3=$(echo "$loads" | awk -v j="task-$t3" '$1==j{print $2}')
+    assert_eq personas.first_job_loads_nothing 0 "$l1"
+    [ "${l2:-0}" -gt 0 ] && ok personas.next_job_loads_history || fail personas.next_job_loads_history "loaded=[$l2]"
+    assert_eq personas.other_sender_loads_nothing 0 "$l3"
+}
+
+flow_threads() {
+    echo "=== FLOW threads (applications' tasks: which tasks share a conversation) ==="
+    local dir; dir=$(new_dir)
+    start_kernel "$dir"; create_agent
+    local u; for u in alice carol bob bot2 rooms cron; do create_user "$u" "$u-pass"; done
+    start_app rooms post; start_app rooms notice; start_app cron fire; start_app bob post
+    local R="$(login rooms)/post" N="$(login rooms)/notice" C="$(login cron)/fire" B="$(login bob)/post"
+
+    # Access: a relayed task acts for the application, so approving the person
+    # who posted releases nothing; the operator approves the application.
+    local a1; a1=$(post alice "$R" '{"thread_id":"team","message":"A1 lunch at noon"}')
+    assert_nonempty threads.app_created_task "$a1"
+    approve agent "$(login alice)"
+    assert_eq threads.withheld_until_app_approved "[]" "$(jj "$DB" "$KDIR/agent" task list | tr -d ' \n')"
+    assert_contains threads.app_listed_pending "\"$(login rooms)\"" "$(jj "$DB" "$KDIR/agent" user requesters)"
+    local t; for t in rooms cron bob bot2; do approve agent "$(login "$t")"; done
+
+    # Every task waits before the daemon starts, so all arrive in one poll.
+    local c1 c2 ev s1 n1 b1 d1 r1 f1 f2
+    c1=$(post carol "$R" '{"thread_id":"team","message":"C1 I will bring cake"}')
+    c2=$(post carol "$R" '{"thread_id":"team","message":"C2 and coffee"}')
+    ev=$(post rooms "$R" '{"thread_id":"team","event":"carol joined"}')
+    s1=$(post alice "$R" '{"thread_id":"secret","message":"S1 surprise party"}')
+    n1=$(post alice "$N" '{"thread_id":"team","message":"N1 another action"}')
+    b1=$(post alice "$B" '{"thread_id":"secret","message":"B1 via bob"}')
+    d1=$(message agent "D1 direct from alice" alice)
+    r1=$(message agent "R1 from another agent" bot2)
+    f1=$(post agent "$C" '{"note":"F1 reminder one"}')
+    f2=$(post agent "$C" '{"note":"F2 reminder two"}')
+
+    # No model: every job fails at once and still completes its task, so the
+    # conversations are decided by the task fields alone.
+    start_agentd "$dir" "\"reason\": \"$(dead_reason)\"" || { fail threads.agentd "no daemon"; return; }
+    local id all="$a1 $c1 $c2 $ev $s1 $n1 $b1 $d1 $r1 $f1 $f2" undone=""
+    for id in $all; do [ "$(await_task "$id" 120)" = done ] || undone="$undone $id"; done
+    assert_eq threads.all_answered "" "$undone"
+    local args; args=$(kj tx show "$(kj task show "$s1" | jfield tx_id)" | python3 -c 'import sys,json; print(json.load(sys.stdin)["args"].get("status",""))')
+    assert_eq threads.reply_in_completion failed "$args"
+
+    local log="$dir/agentd.log" team
+    team=$(persona_of "$a1" "$log")
+    # One room is one conversation, whoever speaks, and an application's event joins it.
+    for id in $c1 $c2 $ev; do assert_eq threads.room_shared "$team" "$(persona_of "$id" "$log")"; done
+    # Its jobs run one at a time, each carrying in all earlier ones: four distinct loads.
+    local loads; loads=$(for id in $a1 $c1 $c2 $ev; do loaded_of "$id" "$log"; done | sort -un | wc -l)
+    assert_eq threads.room_serialised 4 "$loads"
+    # Everything else is its own conversation: another room, the same room name
+    # from another action of the application or from another application, a
+    # direct message, another agent, and each reminder.
+    local distinct; distinct=$(for id in $a1 $s1 $n1 $b1 $d1 $r1 $f1 $f2; do persona_of "$id" "$log"; done | sort -u | wc -l)
+    assert_eq threads.others_apart 8 "$distinct"
+    assert_eq threads.reminder_fresh "0 0" "$(loaded_of "$f1" "$log") $(loaded_of "$f2" "$log")"
+
+    # What each conversation holds, attributed to who said it.
+    local tf sf bf df
+    tf=$(cat "$PERSONAS/$team.jsonl")
+    sf=$(cat "$PERSONAS/$(persona_of "$s1" "$log").jsonl")
+    bf=$(cat "$PERSONAS/$(persona_of "$b1" "$log").jsonl")
+    df=$(cat "$PERSONAS/$(persona_of "$d1" "$log").jsonl")
+    assert_contains threads.room_alice "$(login alice) via $(login rooms): A1" "$tf"
+    assert_contains threads.room_carol "$(login carol) via $(login rooms): C2" "$tf"
+    assert_contains threads.room_event "carol joined" "$tf"
+    assert_not_contains threads.room_no_secret "S1" "$tf"
+    assert_contains threads.secret_holds_own "S1 surprise party" "$sf"
+    assert_not_contains threads.secret_no_room "A1" "$sf"
+    assert_contains threads.other_app_attributed "$(login alice) via $(login bob): B1" "$bf"
+    assert_not_contains threads.other_app_no_secret "S1" "$bf"
+    assert_contains threads.direct_attributed "$(login alice): D1" "$df"
+    assert_not_contains threads.direct_no_room "A1" "$df"
 }
 
 flow_named() {
@@ -168,6 +326,7 @@ flow_usage() {
     echo "=== FLOW usage (wraps to the terminal's width; no kernel) ==="
     local out; out=$("$AGENTD" 2>&1)
     assert_contains usage.printed "usage:" "$out"
+    assert_contains usage.names_home_files "agent.md" "$out"
     assert_le usage.fits_80_without_terminal "$(echo "$out" | widest)" 80
     command -v script >/dev/null || { skip usage.fits_terminal "script unavailable"; return; }
     assert_le usage.fits_50_column_terminal "$(script -qec "stty cols 50; '$AGENTD'" /dev/null | widest)" 50
@@ -189,51 +348,49 @@ flow_session_identity() {
     k admin user unsuspend "$(login agent)" >/dev/null 2>&1
 
     # The daemon kept the agent's own session: a task addressed to the agent is
-    # still seen and completed by the agent (bob's session would never list it).
-    local tid tx; tid=$(message agent "identity check")
+    # still seen and completed (bob's session would never list it).
+    local tid; tid=$(message agent "identity check")
     assert_eq session_identity.still_the_agent done "$(await_task "$tid" 120)"
-    tx=$(kj task show "$tid" | jfield tx_id)
-    assert_eq session_identity.caller_is_agent "$(login agent)" "$(kj tx show "$tx" | jfield caller)"
 }
 
 # ---- LLM-in-the-loop flows (real model; robust structural assertions) ------
 
-flow_task() {
-    echo "=== FLOW task (real LLM: answer + ledger) ==="
-    require_ollama || { skip task.answered "Ollama/$CHAT_MODEL unavailable"; return; }
+flow_answer() {
+    echo "=== FLOW answer (real LLM: answer + ledger) ==="
+    require_ollama || { skip answer.answered "Ollama/$CHAT_MODEL unavailable"; return; }
     local dir; dir=$(new_dir)
     start_kernel "$dir"; create_agent
-    start_agentd "$dir" || { fail task.agentd "no daemon"; return; }
+    start_agentd "$dir" || { fail answer.agentd "no daemon"; return; }
 
-    local before after id out
+    local before after tid
     before=$(jj "$DB" "$KDIR/agent" user me | jfield available)
-    id=$(submit_http "What is the current time? Reply with an ISO-8601 timestamp." 100)
-    assert_nonempty task.task_id "$id"
-    out=$(await_http "$id") || { fail task.await "no outcome (model too slow?)"; return; }
+    tid=$(message agent "What is the current time? Reply with an ISO-8601 timestamp.")
+    assert_eq answer.done done "$(await_task "$tid" 300)"
+    sleep 1 # the rating pass follows the completion
     after=$(jj "$DB" "$KDIR/agent" user me | jfield available)
-    assert_eq    task.answered "answered" "$(echo "$out" | jfield status)"
-    assert_match task.iso_answer '[0-9]{4}-[0-9]{2}-[0-9]{2}T[0-9]{2}:[0-9]{2}' "$(echo "$out" | afield answer)"
+    assert_match answer.iso_answer '[0-9]{4}-[0-9]{2}-[0-9]{2}T[0-9]{2}:[0-9]{2}' "$(reply_of "$tid")"
+    local spent; spent=$(grep '"event":"task_end"' "$dir/agentd.log" | tail -1 | jfield spent)
     # Budget invariant: whatever the model chose, spend never exceeds the budget.
-    assert_le    task.within_budget "$(echo "$out" | jfield spent)" 100
+    assert_le answer.within_budget "$spent" 100
     # spent is what the kernel charged: the agent's balance fell by exactly that.
-    assert_eq    task.spent_is_charged "$(echo "$out" | jfield spent)" "$(( before - after ))"
+    assert_eq answer.spent_is_charged "$spent" "$(( before - after ))"
 }
 
-flow_role_law() {
-    echo "=== FLOW role_law (job via a kernel task, real LLM) ==="
-    require_ollama || { skip role_law.task_done "Ollama/$CHAT_MODEL unavailable"; return; }
+flow_agent_md() {
+    echo "=== FLOW agent_md (agent.md reaches the system prompt) ==="
+    require_ollama || { skip agent_md.injected "Ollama/$CHAT_MODEL unavailable"; return; }
     local dir; dir=$(new_dir)
     start_kernel "$dir"; create_agent
-    start_agentd "$dir" || { fail role_law.agentd "no daemon"; return; }
+    local home; home=$(agent_home); mkdir -p "$home"
+    printf 'Agent note AGENT-MARKER-7Q: be terse.\n' > "$home/agent.md"
+    start_agentd "$dir" || { fail agent_md.agentd "no daemon"; return; }
 
-    local tid; tid=$(message agent "Please reply that you acknowledge this.")
-    assert_nonempty role_law.task_created "$tid"
-    assert_eq role_law.task_done "done" "$(await_task "$tid")"
-    local txid; txid=$(kj task show "$tid" | jfield tx_id)
-    if [ -n "$txid" ]; then
-        assert_eq role_law.caller_is_agent "$(login agent)" "$(kj tx show "$txid" | jfield caller)"
+    local tid; tid=$(message agent "In one short sentence, what is the capital of France?")
+    assert_eq agent_md.done done "$(await_task "$tid" 300)"
+    if grep -q 'AGENT-MARKER-7Q' "$PERSONAS"/*.jsonl 2>/dev/null && grep -q '# Agent' "$PERSONAS"/*.jsonl 2>/dev/null; then
+        ok agent_md.injected
     else
-        fail role_law.tx "task had no tx_id"
+        fail agent_md.injected "agent.md not present in the job's system prompt"
     fi
 }
 
@@ -246,11 +403,9 @@ flow_rating() {
 
     # A time question makes the model dispatch the time native, giving the
     # post-job rating pass a real call to grade.
-    local id out; id=$(submit_http "What is the current time? Reply with an ISO-8601 timestamp." 100)
-    out=$(await_http "$id") || { fail rating.await "no outcome"; return; }
-    assert_eq rating.answered "answered" "$(echo "$out" | jfield status)"
-
-    sleep 2 # the rating pass runs just after the outcome is delivered
+    local tid; tid=$(message agent "What is the current time? Reply with an ISO-8601 timestamp.")
+    assert_eq rating.done done "$(await_task "$tid" 300)"
+    sleep 3 # the rating pass runs just after the completion
     local rated; rated=$(jj "$DB" "$KDIR/agent" tx list | python3 -c "
 import sys,json
 for t in json.load(sys.stdin):
@@ -258,74 +413,62 @@ for t in json.load(sys.stdin):
         print(t['rating'].get('value')); break
 " 2>/dev/null)
     assert_nonempty rating.tx_rated "$rated"
+    # A second job in the same persona rates only its own calls: no rating error.
+    local t2; t2=$(message agent "Thanks. Reply with the word OK.")
+    await_task "$t2" 300 >/dev/null; sleep 3
+    assert_not_contains rating.never_rerates "rate_error" "$(cat "$dir/agentd.log")"
 }
 
-flow_maker() {
-    echo "=== FLOW maker (repetition trigger, real embeddings) ==="
-    require_ollama || { skip maker.trigger "Ollama/$CHAT_MODEL unavailable"; return; }
+flow_conversation() {
+    echo "=== FLOW conversation (real LLM: a persona remembers; another does not) ==="
+    require_ollama || { skip conversation.remembers "Ollama/$CHAT_MODEL unavailable"; return; }
+    local dir; dir=$(new_dir)
+    start_kernel "$dir"; create_agent; create_user bob bob-pass
+    approve agent "$(login bob)"
+    start_agentd "$dir" || { fail conversation.agentd "no daemon"; return; }
+
+    local t1 t2 t3
+    t1=$(message agent "Remember this codeword for later: ZEPHYR-4417. Reply only with OK.")
+    await_task "$t1" 300 >/dev/null
+    t2=$(message agent "What codeword did I ask you to remember? Reply with the codeword only.")
+    await_task "$t2" 300 >/dev/null
+    assert_contains conversation.remembers "ZEPHYR-4417" "$(reply_of "$t2")"
+
+    t3=$(message agent "What codeword were you asked to remember? Reply with the codeword only, or NONE." bob)
+    await_task_as bob "$t3" 300 >/dev/null
+    assert_not_contains conversation.isolated "ZEPHYR-4417" "$(reply_of "$t3" bob)"
+}
+
+flow_thread_conversation() {
+    echo "=== FLOW thread_conversation (real LLM: a room remembers for all in it, and only them) ==="
+    require_ollama || { skip thread_conversation.room_remembers "Ollama/$CHAT_MODEL unavailable"; return; }
     local dir; dir=$(new_dir)
     start_kernel "$dir"; create_agent
-    start_agentd "$dir" '"maker": {"enabled": true, "min_repeats": 2, "threshold": 0.9}' \
-        || { fail maker.agentd "no daemon"; return; }
+    local u; for u in alice carol bob rooms; do create_user "$u" "$u-pass"; done
+    start_app rooms post; start_app bob post
+    local t; for t in rooms bob; do approve agent "$(login "$t")"; done
+    start_agentd "$dir" || { fail thread_conversation.agentd "no daemon"; return; }
+    local R="$(login rooms)/post" B="$(login bob)/post" ask="What codeword did alice give? Reply with the codeword only, or NONE."
 
-    local id
-    id=$(submit_http "Translate the phrase into pirate speak." 100); await_http "$id" >/dev/null
-    id=$(submit_http "Translate the phrase into pirate speak." 100); await_http "$id" >/dev/null
-    sleep 2
-    grep -q '"event":"maker_trigger"' "$dir/agentd.log" \
-        && ok maker.trigger_fires \
-        || fail maker.trigger_fires "no maker_trigger after two similar jobs"
+    local t1 t2 t3 t4
+    t1=$(post alice "$R" '{"thread_id":"team","message":"Remember this codeword for later: ORCHID-2291. Reply only with OK."}')
+    await_task "$t1" 300 >/dev/null
+    # Carol was not there when alice spoke, but the room was.
+    t2=$(post carol "$R" "{\"thread_id\":\"team\",\"message\":$(json_str "$ask")}")
+    await_task "$t2" 300 >/dev/null
+    assert_contains thread_conversation.room_remembers "ORCHID-2291" "$(reply_of "$t2")"
+    # Alice herself, in another room, and bob's application naming the same room, hear nothing.
+    t3=$(post alice "$R" "{\"thread_id\":\"secret\",\"message\":$(json_str "$ask")}")
+    t4=$(post bob "$B" "{\"thread_id\":\"team\",\"message\":$(json_str "$ask")}")
+    await_task "$t3" 300 >/dev/null; await_task "$t4" 300 >/dev/null
+    assert_not_contains thread_conversation.other_room_apart "ORCHID-2291" "$(reply_of "$t3")"
+    assert_not_contains thread_conversation.other_app_apart "ORCHID-2291" "$(reply_of "$t4")"
 }
 
-flow_persona() {
-    echo "=== FLOW persona (persona.md reaches the system prompt) ==="
-    require_ollama || { skip persona.injected "Ollama/$CHAT_MODEL unavailable"; return; }
-    local dir; dir=$(new_dir)
-    start_kernel "$dir"; create_agent
-    local home; home=$(agent_home); mkdir -p "$home"
-    printf 'Persona note PERSONA-MARKER-7Q: be terse.\n' > "$home/persona.md"
-    start_agentd "$dir" || { fail persona.agentd "no daemon"; return; }
-
-    local id out; id=$(submit_http "In one short sentence, what is the capital of France?" 100)
-    out=$(await_http "$id") || { fail persona.await "no outcome"; return; }
-    assert_eq persona.answered "answered" "$(echo "$out" | jfield status)"
-    # Structural: the persona must appear in the job's injected system prompt.
-    if grep -q 'PERSONA-MARKER-7Q' "$ADATA/$id.jsonl" 2>/dev/null && grep -q '# Persona' "$ADATA/$id.jsonl" 2>/dev/null; then
-        ok persona.injected
-    else
-        fail persona.injected "persona.md not present in the job's system prompt"
-    fi
-}
-
-flow_memory() {
-    echo "=== FLOW memory (learned cross-job memory, tagged with its identity) ==="
-    require_ollama || { skip memory.persists "Ollama/$CHAT_MODEL unavailable"; return; }
-    local dir; dir=$(new_dir)
-    start_kernel "$dir"; create_agent
-    start_agentd "$dir" '"memory_bytes": 8192' || { fail memory.agentd "no daemon"; return; }
-
-    local mem; mem="$(agent_home)/memory.md"
-    local id; id=$(submit_http "What is the current time? Reply with an ISO-8601 timestamp." 100)
-    await_http "$id" >/dev/null || { fail memory.await1 "no outcome"; return; }
-    sleep 2
-    [ -s "$mem" ] && ok memory.entry_written || fail memory.entry_written "memory.md empty"
-    assert_contains memory.entry_tagged "principal=" "$(cat "$mem" 2>/dev/null)"
-
-    # Restart the daemon (same home) → memory persists and loads into the next job.
-    kill -9 "$AGENTD_PID" 2>/dev/null; wait "$AGENTD_PID" 2>/dev/null
-    start_agentd "$dir" '"memory_bytes": 8192' || { fail memory.restart "no daemon"; return; }
-    local id2; id2=$(submit_http "What is 2 plus 2?" 100)
-    await_http "$id2" >/dev/null || { fail memory.await2 "no outcome"; return; }
-    if grep -q '"kind":"system"' "$ADATA/$id2.jsonl" 2>/dev/null && grep -q '# Memory' "$ADATA/$id2.jsonl" 2>/dev/null; then
-        ok memory.loaded_next_job
-    else
-        fail memory.loaded_next_job "job 2 transcript lacks injected memory"
-    fi
-}
-
-# Mechanism flows (no LLM) run first and fast; LLM flows (real Ollama) follow.
-ALL=(flow_bootstrap flow_init flow_no_session flow_recovery flow_drain flow_task_channel flow_named flow_session_identity flow_usage
-     flow_task flow_persona flow_rating flow_role_law flow_memory flow_maker)
+# Mechanism flows (deterministic assertions) run first; LLM flows (real Ollama) follow.
+ALL=(flow_bootstrap flow_init flow_config flow_no_session flow_recovery flow_drain flow_tasks flow_approval
+     flow_personas flow_threads flow_named flow_session_identity flow_usage
+     flow_answer flow_agent_md flow_rating flow_conversation flow_thread_conversation)
 
 if [ "$#" -gt 0 ]; then
     RUN=("$@")

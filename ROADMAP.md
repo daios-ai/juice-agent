@@ -11,7 +11,9 @@ implemented (the normative spec then lives in `requirements.md`) or rejected (wi
 
 ## 1. Relevance-based memory recall ("bubble up similar situations")
 
-Status: accepted, awaiting implementation
+Status: rejected 2026-10-19. `requirements.md` 0.4.0 removes `memory.md`: under personas, memory
+learned in one conversation and recalled in another discloses one audience's words to another
+(§9, §10). Recall within a persona is its own history. Kept for the record.
 Requested: 2026-07-12
 Origin: review of openclaw's `active-memory` push-recall design
 

@@ -34,14 +34,15 @@ func TestResolveConfigDefaultsWhenNoFile(t *testing.T) {
 		t.Fatalf("resolve: %v", err)
 	}
 	wantHome := filepath.Join(root, "agents", "research@work")
-	if cfg.Login != "research@work" || cfg.Home != wantHome || cfg.DataDir != filepath.Join(wantHome, "data") {
-		t.Fatalf("login=%q home=%q data=%q", cfg.Login, cfg.Home, cfg.DataDir)
+	if cfg.Login != "research@work" || cfg.Home != wantHome || cfg.PersonasDir != filepath.Join(wantHome, "personas") {
+		t.Fatalf("login=%q home=%q personas=%q", cfg.Login, cfg.Home, cfg.PersonasDir)
 	}
-	if cfg.MaxTurns != 32 || cfg.DefaultBudget != 100 || cfg.MemoryBytes != 65536 {
+	if cfg.MaxTurns != 32 || cfg.DefaultBudget != 100 || cfg.PollSeconds != 5 || cfg.Concurrency != 4 || !cfg.RateTasks {
 		t.Fatalf("defaults not applied: %+v", cfg)
 	}
-	if cfg.Channels.Task == nil || cfg.Channels.Task.PollSeconds != defaultTaskPoll {
-		t.Fatalf("task channel = %+v, want present with the default poll", cfg.Channels.Task)
+	// The affordances default to the natives of the login's own kernel.
+	if cfg.Reason != "sys@work/llm/chat" || cfg.ActionLookup != "sys@work/lookup" {
+		t.Fatalf("reason=%q action_lookup=%q", cfg.Reason, cfg.ActionLookup)
 	}
 }
 
@@ -56,22 +57,24 @@ func TestResolveConfigRejectsMalformedLogin(t *testing.T) {
 
 func TestResolveConfigOverridesDefaultsAndRepairsPoll(t *testing.T) {
 	root := setJuiceHome(t)
-	writeAgentConfig(t, root, "a@k", `{"max_turns": 7, "memory_bytes": 0, "channels": {"task": {"poll_seconds": 0}, "http": {"addr": "127.0.0.1:0"}}}`)
+	writeAgentConfig(t, root, "a@k", `{"max_turns": 7, "reason": "brain@k/think", "poll_seconds": 0, "concurrency": -1}`)
 	cfg, err := ResolveConfig("a@k")
 	if err != nil {
 		t.Fatal(err)
 	}
-	if cfg.MaxTurns != 7 || cfg.DefaultBudget != 100 || cfg.MemoryBytes != 0 {
-		t.Fatalf("cfg = %+v, want max_turns 7, default budget kept, memory off", cfg)
+	if cfg.MaxTurns != 7 || cfg.DefaultBudget != 100 || cfg.Reason != "brain@k/think" || cfg.ActionLookup != "sys@k/lookup" {
+		t.Fatalf("cfg = %+v, want max_turns 7 and reason swapped, the rest defaulted", cfg)
 	}
-	if cfg.Channels.Task.PollSeconds != defaultTaskPoll || cfg.Channels.HTTP.Addr != "127.0.0.1:0" {
-		t.Fatalf("channels = %+v", cfg.Channels)
+	if cfg.PollSeconds != 5 || cfg.Concurrency != 4 {
+		t.Fatalf("poll=%d concurrency=%d, want the defaults restored", cfg.PollSeconds, cfg.Concurrency)
 	}
 }
 
 func TestResolveConfigRejectsUnknownKeysAndMalformedJSON(t *testing.T) {
 	root := setJuiceHome(t)
-	for _, body := range []string{`{"server_url": "http://x"}`, `{"channels": {"step": {}}}`, `{not json`} {
+	// Every key retired in 0.4.0 is reported, never silently ignored.
+	for _, body := range []string{`{"server_url": "http://x"}`, `{"channels": {"task": {}}}`, `{"memory_bytes": 0}`,
+		`{"maker": {}}`, `{"max_repeats": 3}`, `{"candidate_limit": 9}`, `{"lookup_limit": 9}`, `{"lookup": "sys@k/lookup"}`, `{"reason": ""}`, `{"action_lookup": ""}`, `{not json`} {
 		writeAgentConfig(t, root, "a@k", body)
 		if _, err := ResolveConfig("a@k"); err == nil {
 			t.Errorf("config %s accepted, want an error", body)
@@ -79,19 +82,17 @@ func TestResolveConfigRejectsUnknownKeysAndMalformedJSON(t *testing.T) {
 	}
 }
 
-func TestEnsureHomeCreatesBlankFilesAndNoConfig(t *testing.T) {
+func TestEnsureHomeCreatesAgentFileAndPersonasAndNoConfig(t *testing.T) {
 	setJuiceHome(t)
 	cfg, _ := ResolveConfig("a@k")
 	if err := cfg.EnsureHome(); err != nil {
 		t.Fatal(err)
 	}
-	for _, p := range []string{cfg.personaPath(), cfg.knowledgePath(), cfg.memoryPath()} {
-		if b, err := os.ReadFile(p); err != nil || len(b) != 0 {
-			t.Fatalf("%s: %q, %v; want an empty file", p, b, err)
-		}
+	if b, err := os.ReadFile(cfg.agentPath()); err != nil || len(b) != 0 {
+		t.Fatalf("agent.md: %q, %v; want an empty file", b, err)
 	}
-	if fi, err := os.Stat(cfg.DataDir); err != nil || fi.Mode().Perm() != 0o700 {
-		t.Fatalf("data dir: %v %v, want mode 0700", fi, err)
+	if fi, err := os.Stat(cfg.PersonasDir); err != nil || fi.Mode().Perm() != 0o700 {
+		t.Fatalf("personas dir: %v %v, want mode 0700", fi, err)
 	}
 	if _, err := os.Stat(filepath.Join(cfg.Home, "config.json")); !os.IsNotExist(err) {
 		t.Fatalf("EnsureHome must not write config.json (stat err = %v)", err)
@@ -102,24 +103,12 @@ func TestEnsureHomeNeverTruncates(t *testing.T) {
 	setJuiceHome(t)
 	cfg, _ := ResolveConfig("a@k")
 	cfg.EnsureHome()
-	os.WriteFile(cfg.personaPath(), []byte("you are terse"), 0o600)
+	os.WriteFile(cfg.agentPath(), []byte("you are terse"), 0o600)
 	if err := cfg.EnsureHome(); err != nil {
 		t.Fatal(err)
 	}
-	if got, _ := os.ReadFile(cfg.personaPath()); string(got) != "you are terse" {
-		t.Fatalf("persona truncated: %q", got)
-	}
-}
-
-func TestMakerConfigFillsZeroFields(t *testing.T) {
-	cfg := DefaultConfig()
-	cfg.Maker = MakerConfig{Enabled: true} // all thresholds zero
-	m := cfg.makerConfig()
-	if !m.Enabled {
-		t.Fatal("enabled lost")
-	}
-	if m.MinRepeats <= 0 || m.Window <= 0 || m.Budget <= 0 || m.Threshold <= 0 {
-		t.Fatalf("zero fields not filled from defaults: %+v", m)
+	if got, _ := os.ReadFile(cfg.agentPath()); string(got) != "you are terse" {
+		t.Fatalf("agent.md truncated: %q", got)
 	}
 }
 

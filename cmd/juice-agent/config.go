@@ -15,76 +15,40 @@ import (
 // $JUICE_HOME/agents/<login>/ (§11 of requirements.md); an unknown key or a
 // malformed file is an error at startup. The daemon never writes it. Secrets never
 // live here: the session is the login's, in $JUICE_HOME/client/credentials/.
+//
+// Reason and ActionLookup are the two affordances the harness depends on, named
+// by address so either can be swapped for any action meeting its contract, which
+// the daemon checks at startup (juice/contract.go). No other action is named in
+// configuration or code.
 type Config struct {
-	MemoryBytes    int           `json:"memory_bytes"`
-	DefaultBudget  int           `json:"default_budget"`
-	MaxTurns       int           `json:"max_turns"`
-	MaxRepeats     int           `json:"max_repeats"`
-	Concurrency    int           `json:"concurrency"`
-	CandidateLimit int           `json:"candidate_limit"`
-	LookupLimit    int           `json:"lookup_limit"`
-	CompactBytes   int           `json:"compact_bytes"`
-	RateTasks      bool          `json:"rate_tasks"`
-	Maker          MakerConfig   `json:"maker"`
-	Channels       ChannelConfig `json:"channels"`
+	Reason        string `json:"reason"`
+	ActionLookup  string `json:"action_lookup"`
+	DefaultBudget int    `json:"default_budget"`
+	MaxTurns      int    `json:"max_turns"`
+	Concurrency   int    `json:"concurrency"`
+	PollSeconds   int    `json:"poll_seconds"`
+	CompactBytes  int    `json:"compact_bytes"`
+	RateTasks     bool   `json:"rate_tasks"`
 
 	// Computed at resolution time from the login and $JUICE_HOME; never JSON.
-	Login   string `json:"-"`
-	Home    string `json:"-"`
-	DataDir string `json:"-"`
+	Login       string `json:"-"`
+	Home        string `json:"-"`
+	PersonasDir string `json:"-"`
 }
 
-// ChannelConfig enables and configures intake surfaces.
-type ChannelConfig struct {
-	Task *TaskChannelConfig `json:"task,omitempty"`
-	HTTP *HTTPChannelConfig `json:"http,omitempty"`
-	Chat *ChatChannelConfig `json:"chat,omitempty"`
-}
-
-type TaskChannelConfig struct {
-	PollSeconds int `json:"poll_seconds"`
-}
-
-type HTTPChannelConfig struct {
-	Addr string `json:"addr"`
-}
-
-// ChatChannelConfig enables the chat channel (juice-ui chat rooms). Off by
-// default; the agent must be a room member (the msg grant is provisioned on
-// demand — see chatActions.ensureGrant).
-type ChatChannelConfig struct {
-	Enabled     bool `json:"enabled"`
-	PollSeconds int  `json:"poll_seconds"`
-	// ContextMessages is how many recent conversation turns to seed as context for
-	// each reply (0 → default 20; -1 disables, answering each message in isolation).
-	ContextMessages int               `json:"context_messages"`
-	Loop            LoopChannelConfig `json:"loop"`
-}
-
-// LoopChannelConfig bounds the chat channel's reply rate to any one counterpart,
-// breaking runaway agent↔agent exchanges. Zero fields fall back to the driver's
-// defaults (20 / 60s / 60s).
-type LoopChannelConfig struct {
-	Enabled         bool `json:"enabled"`
-	MaxEvents       int  `json:"max_events"`
-	WindowSeconds   int  `json:"window_seconds"`
-	CooldownSeconds int  `json:"cooldown_seconds"`
-}
-
-// DefaultConfig is the safe baseline applied when a key is absent. Identity
-// (Login) and paths (Home, DataDir) are computed by ResolveConfig, not here.
-func DefaultConfig() Config {
+// DefaultConfig is the safe baseline applied when a key is absent. The two
+// affordances default to the kernel's own natives on the login's kernel, and
+// identity and paths are computed by ResolveConfig, not here.
+func DefaultConfig(kernel string) Config {
 	return Config{
-		MemoryBytes:    65536,
-		DefaultBudget:  100,
-		MaxTurns:       32,
-		MaxRepeats:     3,
-		Concurrency:    4,
-		CandidateLimit: 24,
-		LookupLimit:    8,
-		CompactBytes:   262144,
-		RateTasks:      true,
-		Maker:          MakerConfig{Enabled: false, MinRepeats: 3, Window: 50, Budget: 40, Threshold: 0.85},
+		Reason:        "sys@" + kernel + "/llm/chat",
+		ActionLookup:  "sys@" + kernel + "/lookup",
+		DefaultBudget: 100,
+		MaxTurns:      32,
+		Concurrency:   4,
+		PollSeconds:   5,
+		CompactBytes:  262144,
+		RateTasks:     true,
 	}
 }
 
@@ -100,23 +64,21 @@ func juiceHome() string {
 	return ".juice"
 }
 
-// defaultTaskPoll is the fallback poll interval (seconds) for the task channel,
-// which every agent always has (see ResolveConfig).
-const defaultTaskPoll = 5
-
 // ResolveConfig computes the agent home ($JUICE_HOME/agents/<login>/) from the
 // login and decodes its config.json over the defaults (a key it omits keeps its
 // default). A missing file is fine; a malformed file or an unknown key is an
-// error. The task channel is always present: it is how the kernel hands the
-// agent work, so an absent channel or a non-positive poll interval is defaulted.
+// error, so a retired key is reported rather than ignored. A non-positive poll
+// interval or worker count falls back to its default: intake always runs.
 func ResolveConfig(login string) (Config, error) {
-	if _, _, err := juice.ParseLogin(login); err != nil {
+	_, kernel, err := juice.ParseLogin(login)
+	if err != nil {
 		return Config{}, err
 	}
-	cfg := DefaultConfig()
+	def := DefaultConfig(kernel)
+	cfg := def
 	cfg.Login = login
 	cfg.Home = filepath.Join(juiceHome(), "agents", login)
-	cfg.DataDir = filepath.Join(cfg.Home, "data")
+	cfg.PersonasDir = filepath.Join(cfg.Home, "personas")
 	path := filepath.Join(cfg.Home, "config.json")
 	if raw, err := os.ReadFile(path); err == nil {
 		dec := json.NewDecoder(bytes.NewReader(raw))
@@ -127,61 +89,35 @@ func ResolveConfig(login string) (Config, error) {
 	} else if !os.IsNotExist(err) {
 		return cfg, err
 	}
-	if cfg.Channels.Task == nil {
-		cfg.Channels.Task = &TaskChannelConfig{}
+	if cfg.Reason == "" || cfg.ActionLookup == "" {
+		return cfg, fmt.Errorf("%s: reason and action_lookup must name actions", path)
 	}
-	if cfg.Channels.Task.PollSeconds <= 0 {
-		cfg.Channels.Task.PollSeconds = defaultTaskPoll
+	if cfg.PollSeconds <= 0 {
+		cfg.PollSeconds = def.PollSeconds
+	}
+	if cfg.Concurrency <= 0 {
+		cfg.Concurrency = def.Concurrency
 	}
 	return cfg, nil
 }
 
-// EnsureHome creates the agent home and data dir (mode 0700) and writes blank
-// persona.md/knowledge.md/memory.md if absent, so the operator always has concrete
-// files to edit. It never truncates an existing file and writes no config.
+// EnsureHome creates the agent home and its personas directory (mode 0700) and
+// writes a blank agent.md if absent, so the operator always has a concrete file
+// to edit. It never truncates an existing file and writes no config.
 func (c Config) EnsureHome() error {
-	if err := os.MkdirAll(c.DataDir, 0o700); err != nil {
+	if err := os.MkdirAll(c.PersonasDir, 0o700); err != nil {
 		return err
 	}
-	for _, name := range []string{"persona.md", "knowledge.md", "memory.md"} {
-		f, err := os.OpenFile(filepath.Join(c.Home, name), os.O_CREATE|os.O_EXCL|os.O_WRONLY, 0o600)
-		if err != nil {
-			if os.IsExist(err) {
-				continue
-			}
-			return err
+	f, err := os.OpenFile(c.agentPath(), os.O_CREATE|os.O_EXCL|os.O_WRONLY, 0o600)
+	if err != nil {
+		if os.IsExist(err) {
+			return nil
 		}
-		f.Close()
+		return err
 	}
-	return nil
+	return f.Close()
 }
 
-func (c Config) personaPath() string   { return filepath.Join(c.Home, "persona.md") }
-func (c Config) knowledgePath() string { return filepath.Join(c.Home, "knowledge.md") }
-func (c Config) memoryPath() string    { return filepath.Join(c.Home, "memory.md") }
-
-// makerConfig returns the maker config with zero fields filled from defaults,
-// so a partial config stays sane.
-func (c Config) makerConfig() MakerConfig {
-	d := DefaultMakerConfig()
-	m := MakerConfig{
-		Enabled:    c.Maker.Enabled,
-		MinRepeats: c.Maker.MinRepeats,
-		Window:     c.Maker.Window,
-		Budget:     c.Maker.Budget,
-		Threshold:  c.Maker.Threshold,
-	}
-	if m.MinRepeats <= 0 {
-		m.MinRepeats = d.MinRepeats
-	}
-	if m.Window <= 0 {
-		m.Window = d.Window
-	}
-	if m.Budget <= 0 {
-		m.Budget = d.Budget
-	}
-	if m.Threshold <= 0 {
-		m.Threshold = d.Threshold
-	}
-	return m
-}
+// agentPath is agent.md, the one human-authored file: persona and knowledge,
+// read at every job start and never written by the daemon.
+func (c Config) agentPath() string { return filepath.Join(c.Home, "agent.md") }

@@ -1,7 +1,7 @@
 // Command juice-agent is the Juice agent daemon: it acts as one login on a Juice
-// kernel, watches its intake channels, and runs the pi-style loop over the kernel
-// action catalog to serve each job — paying for what it runs, rating its tools,
-// and (optionally) publishing new actions to automate recurring work.
+// kernel, takes its work from the kernel's tasks, and runs the pi-style loop over
+// the kernel action catalog to serve each job in the task's persona — paying for
+// what it runs and rating its tools.
 package main
 
 import (
@@ -19,10 +19,6 @@ import (
 	"golang.org/x/term"
 
 	"github.com/daios-ai/juice-agent/agent"
-	"github.com/daios-ai/juice-agent/channels"
-	"github.com/daios-ai/juice-agent/channels/chat"
-	httpchan "github.com/daios-ai/juice-agent/channels/http"
-	"github.com/daios-ai/juice-agent/channels/task"
 	"github.com/daios-ai/juice-agent/juice"
 )
 
@@ -64,7 +60,7 @@ func main() {
 
 // commands is the usage table: each command line as typed, and what it does.
 var commands = [][2]string{
-	{"serve <login>", "run the daemon (channels + worker pool)"},
+	{"serve <login>", "run the daemon: answer the tasks addressed to the login"},
 	{`task <login> "<prompt>"`, "run one job and print its outcome"},
 	{"bench <login> <suite.json> [N]", "run the experiment suite and write a report"},
 	{"version", "print version and commit"},
@@ -75,8 +71,8 @@ var commands = [][2]string{
 const usageNote = "A login is an account on a kernel, handle@kernel, held by the juice CLI:\n" +
 	"  juice kernel add <url>\n" +
 	"  juice auth login <handle>@<kernel>\n\n" +
-	"The agent's home is $JUICE_HOME/agents/<login>/ (JUICE_HOME default ~/.juice), holding an " +
-	"optional config.json, persona.md, knowledge.md, memory.md, and data/."
+	"The agent's home is $JUICE_HOME/agents/<login>/ (JUICE_HOME default ~/.juice), holding " +
+	"agent.md, an optional config.json, and personas/."
 
 func usage() { fmt.Fprint(os.Stderr, usageText(helpWidth(term.GetSize))) }
 
@@ -148,7 +144,7 @@ func setup(ctx context.Context, log *logger, login string) (*Executor, *juice.Cl
 	if err := cfg.EnsureHome(); err != nil {
 		return nil, nil, cfg, fmt.Errorf("ensure home %s: %w", cfg.Home, err)
 	}
-	cl, err := juice.New(login, juiceHome())
+	cl, err := juice.New(login, juiceHome(), cfg.Reason, cfg.ActionLookup)
 	if err != nil {
 		return nil, nil, cfg, err
 	}
@@ -164,53 +160,52 @@ func setup(ctx context.Context, log *logger, login string) (*Executor, *juice.Cl
 			login, self.Address, self.ID, login)
 	}
 	log.event("login", map[string]any{"login": login, "available": self.Available})
-
-	maker, err := NewMaker(cfg.DataDir, cfg.makerConfig(), cl, cl, cl.Sys("tinygo/compile"), log.event)
+	// The two affordances must meet their contracts; the action lookup is then
+	// offered with the terms the kernel holds for it.
+	actionLookup, err := cl.Affordances(ctx)
 	if err != nil {
-		return nil, nil, cfg, fmt.Errorf("maker: %w", err)
+		return nil, nil, cfg, fmt.Errorf("config.json: %w", err)
 	}
 
 	// Harness tools: plain-named, intercepted, never registered on the platform.
-	intrinsics := map[string]agent.Intrinsic{
-		"reply": {Handle: func(_ context.Context, args map[string]any) (map[string]any, bool, error) {
-			return args, true, nil // terminal: the answer is the selection's args
-		}},
-		"publish": maker.PublishIntrinsic(),
-	}
 	loopCfg := agent.Config{
 		ReplyTool:      "reply",
 		SubtaskTool:    "subtask",
-		LookupAction:   cl.Sys("lookup"),
-		Tools:          []agent.Tool{replyTool(), subtaskTool(), publishTool()},
-		Always:         []agent.Candidate{lookupCandidate(cl.Sys("lookup"))},
+		ActionLookup:   cfg.ActionLookup,
+		Tools:          []agent.Tool{replyTool(), subtaskTool()},
+		Always:         []agent.Candidate{actionLookup},
 		MaxTurns:       cfg.MaxTurns,
-		MaxRepeats:     cfg.MaxRepeats,
-		CandidateLimit: cfg.CandidateLimit,
-		LookupLimit:    cfg.LookupLimit,
-		Intrinsics:     intrinsics,
+		MaxRepeats:     maxRepeats,
+		CandidateLimit: candidateLimit,
+		LookupLimit:    lookupLimit,
+		Intrinsics: map[string]agent.Intrinsic{"reply": {Handle: func(_ context.Context, args map[string]any) (map[string]any, bool, error) {
+			return args, true, nil // terminal: the answer is the selection's args
+		}}},
 	}
-	prompter := LoadPrompter(login, "reply", cfg.personaPath(), cfg.knowledgePath())
-	var mem *Memory
-	if cfg.MemoryBytes > 0 {
-		mem = NewMemory(cfg.memoryPath(), cfg.MemoryBytes, cl, "kernel="+cl.KernelKey()+" principal="+cl.Principal(), log.event)
-	}
-	log.event("identity", map[string]any{"login": login, "home": cfg.Home, "memory": mem != nil})
-
+	log.event("identity", map[string]any{"login": login, "home": cfg.Home, "reason": cfg.Reason, "action_lookup": cfg.ActionLookup})
 	exec := &Executor{
 		Kernel:       cl,
-		DataDir:      cfg.DataDir,
+		PersonasDir:  cfg.PersonasDir,
 		CompactBytes: cfg.CompactBytes,
 		Retry:        DefaultRetryPolicy(),
 		RetryOK:      juice.IsRetryable,
 		Loop:         loopCfg,
 		RateTasks:    cfg.RateTasks,
-		Maker:        maker,
-		Prompter:     prompter,
-		Memory:       mem,
+		Handle:       login,
+		AgentPath:    cfg.agentPath(),
 		Log:          log.event,
 	}
 	return exec, cl, cfg, nil
 }
+
+// The loop's tuning: how many identical repeats end a frame, how many candidate
+// actions it offers, and how many rows a lookup returns. They shape the loop, not
+// the operator's policy, so they are constants rather than configuration.
+const (
+	maxRepeats     = 3
+	candidateLimit = 24
+	lookupLimit    = 8
+)
 
 // runServe serves as the login in args[0].
 func runServe(args []string) error {
@@ -226,33 +221,25 @@ func runServe(args []string) error {
 		return err
 	}
 
-	if marked, err := Recover(cfg.DataDir); err == nil && len(marked) > 0 {
+	if marked, err := Recover(cfg.PersonasDir); err == nil && len(marked) > 0 {
 		log.event("recovery", map[string]any{"interrupted": marked})
 	}
-
-	chans := buildChannels(cfg, cl, log.event)
-	rt := NewRuntime(exec, chans, cfg.Concurrency, log.event)
-	if err := rt.Start(runCtx, cfg.Concurrency); err != nil {
-		return err
-	}
-	fields := map[string]any{"channels": channelNames(chans), "concurrency": cfg.Concurrency}
-	for _, ch := range chans {
-		if hc, ok := ch.(*httpchan.HTTP); ok {
-			fields["http_addr"] = hc.Addr
-		}
-	}
-	log.event("serving", fields)
+	in := NewIntake(cl, exec.Execute, cfg.Login, cfg.DefaultBudget, cfg.Concurrency,
+		time.Duration(cfg.PollSeconds)*time.Second, log.event)
+	in.Start(runCtx)
+	log.event("serving", map[string]any{"concurrency": cfg.Concurrency, "poll_seconds": cfg.PollSeconds})
 
 	sig := make(chan os.Signal, 1)
 	signal.Notify(sig, syscall.SIGINT, syscall.SIGTERM)
 	<-sig
 	log.event("draining", nil)
-	rt.Shutdown()
+	in.Shutdown()
 	log.event("stopped", nil)
 	return nil
 }
 
-// runTask runs one job as the login in args[0] with the prompt in args[1].
+// runTask runs one job as the login in args[0] with the prompt in args[1], in
+// the persona "cli", so one-shot runs continue one conversation of their own.
 func runTask(args []string) error {
 	if len(args) != 2 || strings.TrimSpace(args[1]) == "" {
 		return fmt.Errorf(`usage: juice-agent task <login> "<prompt>"`)
@@ -266,64 +253,17 @@ func runTask(args []string) error {
 	}
 	job := agent.Job{
 		ID:       "cli-" + time.Now().Format("20060102-150405"),
-		Channel:  "cli",
+		Persona:  "cli",
 		Budget:   cfg.DefaultBudget,
 		Messages: []agent.Message{{Role: agent.RoleUser, Content: prompt}},
 	}
-	out, err := exec.Execute(ctx, job, nil)
+	out, err := exec.Execute(ctx, job)
 	if err != nil {
 		return err
 	}
 	enc := json.NewEncoder(os.Stdout)
 	enc.SetIndent("", "  ")
 	return enc.Encode(out)
-}
-
-// buildChannels constructs the enabled intake surfaces from config. One
-// kernelAdapter is the single kernel bridge shared by every channel: the task
-// channel takes it as a channels.TaskSource, chat as the full channels.Kernel. A
-// dedicated service channel (chat) claims the tasks its service owns, so that
-// owner is excluded from the task channel. Adding a channel is one case here plus
-// a package under channels/ (see requirements §10).
-func buildChannels(cfg Config, cl *juice.Client, log func(string, map[string]any)) []channels.Channel {
-	k := kernelAdapter{cl: cl}
-	var out []channels.Channel
-	var exclude []string
-	chatOn := cfg.Channels.Chat != nil && cfg.Channels.Chat.Enabled
-	if chatOn {
-		exclude = append(exclude, cl.Address("chat"))
-	}
-	if hc := cfg.Channels.HTTP; hc != nil && hc.Addr != "" {
-		out = append(out, httpchan.NewHTTP(hc.Addr, cfg.DefaultBudget))
-	}
-	interval := time.Duration(cfg.Channels.Task.PollSeconds) * time.Second
-	out = append(out, task.New(k, interval, cfg.DefaultBudget, cfg.Login, exclude...))
-	if chatOn {
-		cc := cfg.Channels.Chat
-		out = append(out, chat.New(k, cl.Address("chat"), channels.ServiceConfig{
-			Address:         cfg.Login,
-			Interval:        time.Duration(cc.PollSeconds) * time.Second,
-			Budget:          cfg.DefaultBudget,
-			DataDir:         cfg.DataDir,
-			ContextMessages: cc.ContextMessages,
-			Loop: channels.LoopConfig{
-				Enabled:  cc.Loop.Enabled,
-				Max:      cc.Loop.MaxEvents,
-				Window:   time.Duration(cc.Loop.WindowSeconds) * time.Second,
-				Cooldown: time.Duration(cc.Loop.CooldownSeconds) * time.Second,
-			},
-			Log: log,
-		}))
-	}
-	return out
-}
-
-func channelNames(cs []channels.Channel) []string {
-	out := make([]string, 0, len(cs))
-	for _, c := range cs {
-		out = append(out, c.Name())
-	}
-	return out
 }
 
 // logger writes structured JSON log lines to stderr (stdout stays reserved for
