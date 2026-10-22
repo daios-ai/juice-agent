@@ -262,6 +262,77 @@ func TestSpentIsTheReportedCharge(t *testing.T) {
 	}
 }
 
+// paidDecider charges each turn to the job's meter at price, as the executor's
+// reasoning does, and refuses with ErrBudget a turn the meter cannot fit.
+type paidDecider struct {
+	inner Decider
+	meter *Meter
+	price int
+}
+
+func (d *paidDecider) Decide(ctx context.Context, msgs []Message, catalog []Candidate, tools []Tool) (*Selection, error) {
+	if !d.meter.Fits(d.price) {
+		return nil, ErrBudget
+	}
+	d.meter.Add(d.price)
+	return d.inner.Decide(ctx, msgs, catalog, tools)
+}
+
+// Reasoning shares the job's meter with the tools: at 3 a turn and a budget of
+// 10, three turns run and the fourth, which does not fit, ends the job without
+// being counted, since it never reached the model.
+func TestATurnThatDoesNotFitEndsTheJob(t *testing.T) {
+	m := &Meter{Budget: 10}
+	dec := &paidDecider{meter: m, price: 3, inner: &scriptedDecider{script: []Selection{
+		{Action: "a"}, {Action: "b"}, {Action: "a"}, {Action: "reply", Args: map[string]any{"answer": "late"}},
+	}}}
+	tr := &memTranscript{}
+	deps := newDeps(dec, &fakeCatalog{seed: []Candidate{{Ref: "a"}, {Ref: "b"}}}, &recordingRunner{}, tr)
+	deps.Meter = m
+	out, _ := Run(context.Background(), Job{Budget: 10}, baseConfig(), deps)
+	if out.Status != StatusFailed || out.Reason != "budget" || out.Spent != 9 || out.Turns != 3 {
+		t.Fatalf("outcome = %+v, want failed for budget after 9 spent in 3 turns", out)
+	}
+	for _, msg := range tr.msgs {
+		if msg.Kind == "decide-error" {
+			t.Fatalf("a refused turn was fed back to the model: %+v", msg)
+		}
+	}
+}
+
+// A turn whose reasoning terms moved ends the job: retrying the same pin would
+// be refused again, and the model is not at fault.
+func TestATurnWhoseTermsMovedEndsTheJob(t *testing.T) {
+	dec := &scriptedDecider{decideErr: fmt.Errorf("refused: %w", ErrTermsChanged)}
+	tr := &memTranscript{}
+	out, _ := Run(context.Background(), Job{Budget: 10}, baseConfig(), newDeps(dec, &fakeCatalog{}, &recordingRunner{}, tr))
+	if out.Status != StatusFailed || out.Reason != "terms-changed" || out.Turns != 0 {
+		t.Fatalf("outcome = %+v, want failed for terms-changed with no turn counted", out)
+	}
+	for _, msg := range tr.msgs {
+		if msg.Kind == "decide-error" {
+			t.Fatalf("a refused turn was fed back to the model: %+v", msg)
+		}
+	}
+}
+
+func TestMeterChargesAndCloses(t *testing.T) {
+	m := &Meter{Budget: 5}
+	if !m.Fits(5) || m.Fits(6) {
+		t.Fatal("a fresh meter of 5 must fit 5 and not 6")
+	}
+	m.Add(Charged(5, RunResult{TxID: "tx", Charge: 2}, nil))             // settled: its charge
+	m.Add(Charged(5, RunResult{}, fmt.Errorf("x: %w", ErrTermsChanged))) // refused by the pin: nothing
+	m.Add(Charged(1, RunResult{}, errors.New("connection reset")))       // unreported: its price
+	if m.Spent != 3 {
+		t.Fatalf("spent = %d, want 3", m.Spent)
+	}
+	m.Close()
+	if m.Fits(0) {
+		t.Fatal("a closed meter fits no call")
+	}
+}
+
 func TestEachDispatchHasItsOwnKey(t *testing.T) {
 	dec := &scriptedDecider{script: []Selection{
 		{Action: "a"}, {Action: "b"},

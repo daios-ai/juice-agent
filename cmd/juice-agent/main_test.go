@@ -107,10 +107,9 @@ func TestSetupAcceptsTheLoginsOwnAccount(t *testing.T) {
 	if cl.Login() != "agent@k" || cfg.Home != filepath.Join(root, "agents", "agent@k") {
 		t.Fatalf("login=%q home=%q", cl.Login(), cfg.Home)
 	}
-	// The loop discovers through the configured action lookup, offered with the
-	// terms the kernel holds for it.
-	if exec.Loop.ActionLookup != "sys@k/lookup" || exec.Loop.Always[0].Ref != "sys@k/lookup" ||
-		exec.Loop.Always[0].Description != "Semantic search over active actions" {
+	// The loop discovers through the configured action lookup. Its terms are not
+	// fixed at startup: each job reads them (Executor.Execute).
+	if exec.Loop.ActionLookup != "sys@k/lookup" || len(exec.Loop.Always) != 0 {
 		t.Fatalf("action lookup = %q / %+v", exec.Loop.ActionLookup, exec.Loop.Always)
 	}
 }

@@ -1,10 +1,12 @@
 // Package juice is the daemon's sole conduit to a Juice kernel: a typed HTTP
-// client over the public TCP API. It implements the agent core's Decider,
-// Catalog, and Runner interfaces (every capability reached through POST /v1/run
-// or the REST surface), plus the supervision calls the policy layer needs
+// client over the public TCP API. The client implements the agent core's Runner
+// and the authoritative read, plus the supervision calls the policy layer needs
 // (ratings, tasks). It is the only package that speaks HTTP. The two actions the
 // harness depends on, reasoning and action lookup, are configured addresses whose
 // actions must meet a contract (contract.go); the client names no other action.
+// What the harness sends them and reads back is built here too (Decide, Chat,
+// ChatJSON, Lookup), over a Call the caller supplies, so whoever runs a call
+// decides its terms, its key and what it costs the job.
 //
 // The client holds no secret of its own. It acts as one login, handle@kernel,
 // read from the juice-family client records under $JUICE_HOME/client/ (ecosystem
@@ -319,7 +321,12 @@ func (c *Client) Run(ctx context.Context, action string, args map[string]any, qu
 	return agent.RunResult{Result: rep.Result, TxID: rep.TxID, Charge: rep.Charge}, nil
 }
 
-// --- Decider ---------------------------------------------------------------
+// --- Affordance calls ------------------------------------------------------
+
+// Call runs one call of an affordance with args and returns its result. The
+// executor supplies it: it checks the call against the job's budget, pins it to
+// the terms the job read, and counts what it cost.
+type Call func(ctx context.Context, args map[string]any) (map[string]any, error)
 
 // Decide performs one selection round-trip. It renders the harness tools and
 // catalog candidates into a chat prompt, runs llm/chat, and extracts a JSON
@@ -328,10 +335,10 @@ func (c *Client) Run(ctx context.Context, action string, args map[string]any, qu
 // on Ollama, its grammar-constrained JSON corrupts copied strings (measured:
 // timestamps garbled). Unconstrained chat + balanced-brace extraction is both
 // more capable (offers tools) and higher-fidelity.
-func (c *Client) Decide(ctx context.Context, messages []agent.Message, catalog []agent.Candidate, tools []agent.Tool) (*agent.Selection, error) {
+func Decide(ctx context.Context, call Call, messages []agent.Message, catalog []agent.Candidate, tools []agent.Tool) (*agent.Selection, error) {
 	aug := append(append([]agent.Message{}, messages...),
 		agent.Message{Role: agent.RoleUser, Content: selectionPrompt(catalog, tools)})
-	content, err := c.Chat(ctx, aug)
+	content, err := Chat(ctx, call, aug)
 	if err != nil {
 		return nil, err
 	}
@@ -464,15 +471,15 @@ func trunc(s string, n int) string {
 
 // Chat runs the reasoning affordance over role/content messages and returns the
 // reply text.
-func (c *Client) Chat(ctx context.Context, messages []agent.Message) (string, error) {
-	res, err := c.Run(ctx, c.reason, map[string]any{"messages": toChatMessages(messages)}, "", "")
+func Chat(ctx context.Context, call Call, messages []agent.Message) (string, error) {
+	res, err := call(ctx, map[string]any{"messages": toChatMessages(messages)})
 	if err != nil {
 		return "", err
 	}
 	// The contract cannot make these fields present (the kernel's own schema has
 	// them optional), so a reply without them is reported here, not read as empty.
 	var first map[string]any
-	if choices, _ := res.Result["choices"].([]any); len(choices) > 0 {
+	if choices, _ := res["choices"].([]any); len(choices) > 0 {
 		first, _ = choices[0].(map[string]any)
 	}
 	msg, _ := first["message"].(map[string]any)
@@ -487,14 +494,14 @@ func (c *Client) Chat(ctx context.Context, messages []agent.Message) (string, er
 // ChatJSON asks the reasoning affordance for a JSON value shaped by schema and
 // returns the first JSON object in its reply. The schema is stated in the prompt,
 // so structured output needs no affordance beyond reasoning.
-func (c *Client) ChatJSON(ctx context.Context, messages []agent.Message, schema map[string]any) (any, error) {
+func ChatJSON(ctx context.Context, call Call, messages []agent.Message, schema map[string]any) (any, error) {
 	sch, err := json.Marshal(schema)
 	if err != nil {
 		return nil, err
 	}
 	aug := append(append([]agent.Message{}, messages...), agent.Message{Role: agent.RoleUser,
 		Content: "Respond with ONLY a JSON object matching this JSON Schema, no prose, no code fences:\n" + string(sch)})
-	content, err := c.Chat(ctx, aug)
+	content, err := Chat(ctx, call, aug)
 	if err != nil {
 		return nil, err
 	}
@@ -533,24 +540,24 @@ func toChatMessages(msgs []agent.Message) []map[string]any {
 	return out
 }
 
-// --- Catalog ---------------------------------------------------------------
-
 // Lookup ranks callable actions for a query through the action-lookup
 // affordance. The rows are indicative; Read gives the authoritative terms.
-func (c *Client) Lookup(ctx context.Context, query string, limit int) ([]agent.Candidate, error) {
+func Lookup(ctx context.Context, call Call, query string, limit int) ([]agent.Candidate, error) {
 	if limit <= 0 {
 		limit = 10
 	}
-	res, err := c.Run(ctx, c.actionLookup, map[string]any{"query": query, "limit": limit}, "", "")
+	res, err := call(ctx, map[string]any{"query": query, "limit": limit})
 	if err != nil {
 		return nil, err
 	}
-	if _, ok := res.Result["results"].([]any); !ok {
+	if _, ok := res["results"].([]any); !ok {
 		return nil, &KernelError{Status: 200, Code: "execution_failed",
 			Message: "the action lookup reply has no results list"}
 	}
-	return agent.ParseLookup(res.Result), nil
+	return agent.ParseLookup(res), nil
 }
+
+// --- Catalog ---------------------------------------------------------------
 
 // Read resolves an action reference to its authoritative terms: price, the
 // quote_hash that pins them, any value effect, and the kernel's evidence about
@@ -589,15 +596,20 @@ func (c *Client) readAction(ctx context.Context, ref string) (actionRow, error) 
 }
 
 // Affordances reads the two configured actions and checks each one's declared
-// schemas against its contract, once, at startup. It returns the action-lookup
-// action as the candidate the loop always offers, with the terms the kernel
-// holds for it. An error names the configuration key and the address.
-func (c *Client) Affordances(ctx context.Context) (agent.Candidate, error) {
-	if _, err := c.affordance(ctx, "reason", c.reason, reasonContract); err != nil {
-		return agent.Candidate{}, err
+// schemas against its contract. It returns both with the terms the kernel holds
+// for them now: their price and the quote_hash that pins it. Startup calls it to
+// refuse a wrong configuration, and every job calls it again, so a job's calls
+// run at current terms. An error names the configuration key and the address.
+func (c *Client) Affordances(ctx context.Context) (reason, actionLookup agent.Candidate, err error) {
+	r, err := c.affordance(ctx, "reason", c.reason, reasonContract)
+	if err != nil {
+		return agent.Candidate{}, agent.Candidate{}, err
 	}
-	row, err := c.affordance(ctx, "action_lookup", c.actionLookup, actionLookupContract)
-	return row.candidate(), err
+	l, err := c.affordance(ctx, "action_lookup", c.actionLookup, actionLookupContract)
+	if err != nil {
+		return agent.Candidate{}, agent.Candidate{}, err
+	}
+	return r.candidate(), l.candidate(), nil
 }
 
 // affordance reads the action configured under key and checks it against k.

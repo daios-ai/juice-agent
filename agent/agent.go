@@ -65,6 +65,44 @@ type Candidate struct {
 // before locking any funds.
 var ErrTermsChanged = errors.New("terms changed")
 
+// ErrBudget is the report that a call the harness makes on its own (reasoning,
+// the opening lookup, compaction, rating) does not fit what the job has left, so
+// it was not made.
+var ErrBudget = errors.New("budget exceeded")
+
+// Meter is a job's spending: every priced call the job makes, whether the model
+// chose it or the harness made it, is checked against Budget before it runs and
+// adds its charge to Spent after. A job runs on one goroutine, so it needs no
+// lock. Once closed, no call fits, so Spent is final.
+type Meter struct {
+	Budget int
+	Spent  int
+	closed bool
+}
+
+// Fits reports whether a call at price may run.
+func (m *Meter) Fits(price int) bool { return !m.closed && m.Spent+price <= m.Budget }
+
+// Add counts a call's charge.
+func (m *Meter) Add(charge int) { m.Spent += charge }
+
+// Close fixes Spent: no call fits afterwards.
+func (m *Meter) Close() { m.closed = true }
+
+// Charged is what a call at price cost the agent: the charge the kernel
+// reported when it settled the call, nothing when a moved quote refused it
+// before any funds were locked, and otherwise its price, since a call whose
+// settlement went unreported may still draw it.
+func Charged(price int, rr RunResult, err error) int {
+	switch {
+	case rr.TxID != "":
+		return rr.Charge
+	case errors.Is(err, ErrTermsChanged):
+		return 0
+	}
+	return price
+}
+
 // Selection is one model turn extracted by the Decider: the chosen action, its
 // args, and an optional natural-language message. Args are validated later — a
 // harness tool's required keys in-loop, a catalog action's schema kernel-side at
@@ -87,8 +125,9 @@ type RunResult struct {
 
 // Decider performs one model round-trip: given the conversation, the catalog
 // candidates (with descriptions, schemas, prices and evidence to render), and the harness tools,
-// it returns the next selection. Implemented by the juice client over
-// llm/chat (it builds the tool list itself and extracts a JSON selection).
+// it returns the next selection. Implemented over the reasoning affordance by
+// juice.Decide, which builds the tool list itself and extracts a JSON selection;
+// a call the job cannot pay for returns ErrBudget.
 type Decider interface {
 	Decide(ctx context.Context, messages []Message, catalog []Candidate, tools []Tool) (*Selection, error)
 }
@@ -195,23 +234,25 @@ type Config struct {
 	Intrinsics map[string]Intrinsic
 }
 
-// Deps is the loop's wiring: the four interfaces plus optional steering and log
-// hooks. Steering, when set, is polled before every model call.
+// Deps is the loop's wiring: the four interfaces, the job's meter, and optional
+// steering and log hooks. Steering, when set, is polled before every model call.
+// Meter is shared with whatever else spends for the job (the Decider's reasoning,
+// compaction, rating); when nil, Run meters the job against job.Budget alone.
 type Deps struct {
 	Decider    Decider
 	Catalog    Catalog
 	Runner     Runner
 	Transcript Transcript
+	Meter      *Meter
 	Steering   func() []Message
 	Log        func(event string, fields map[string]any)
 }
 
-// counters are the per-job budgets shared by every frame (root and brackets) so
-// a subtask tree totals at most MaxTurns turns and job.Budget credits — the
-// bound is the shared counter, not a per-frame cap.
+// counters are the per-job turns shared by every frame (root and brackets), so a
+// subtask tree totals at most MaxTurns turns, as the shared meter bounds its spend
+// to job.Budget: the bound is the shared count, not a per-frame cap.
 type counters struct {
 	turns int
-	spent int
 }
 
 // Run executes one job to completion via the root loop frame (§4). Subtasks
@@ -229,13 +270,15 @@ func Run(ctx context.Context, job Job, cfg Config, deps Deps) (Outcome, error) {
 			return Outcome{Status: StatusFailed}, err
 		}
 	}
+	if deps.Meter == nil {
+		deps.Meter = &Meter{Budget: job.Budget}
+	}
 	cnt := &counters{}
-	res, status, reason, err := runFrame(ctx, cfg, deps, job.Budget, cnt, 0, logf)
-	out := Outcome{Status: status, Reason: reason, Spent: cnt.spent, Turns: cnt.turns}
+	res, status, reason, err := runFrame(ctx, cfg, deps, cnt, 0, logf)
+	out := Outcome{Status: status, Reason: reason, Spent: deps.Meter.Spent, Turns: cnt.turns}
 	if status == StatusAnswered {
 		out.Answer = res
 	}
-	logf("task_end", map[string]any{"status": out.Status, "reason": out.Reason, "turns": cnt.turns, "spent": cnt.spent})
 	return out, err
 }
 
@@ -244,7 +287,7 @@ func Run(ctx context.Context, job Job, cfg Config, deps Deps) (Outcome, error) {
 // rollup error map), a status, a reason, and a Go error (only for infrastructure
 // failures; model/budget/turn failures roll up as results). deps.Transcript is
 // this frame's model view; its records are teed to the shared durable store.
-func runFrame(ctx context.Context, cfg Config, deps Deps, budget int, cnt *counters, depth int, logf func(string, map[string]any)) (map[string]any, Status, string, error) {
+func runFrame(ctx context.Context, cfg Config, deps Deps, cnt *counters, depth int, logf func(string, map[string]any)) (map[string]any, Status, string, error) {
 	ws := newWorkingSet(cfg.CandidateLimit)
 	if seed, err := deps.Catalog.Lookup(ctx, promptOf(deps.Transcript.Messages()), cfg.LookupLimit); err == nil {
 		mergeCandidates(ctx, deps, ws, seed)
@@ -295,7 +338,6 @@ func runFrame(ctx context.Context, cfg Config, deps Deps, budget int, cnt *count
 		if cfg.MaxTurns > 0 && cnt.turns >= cfg.MaxTurns {
 			return exhausted("turn-cap")
 		}
-		cnt.turns++
 
 		if depth == 0 && deps.Steering != nil {
 			for _, m := range deps.Steering() {
@@ -306,6 +348,17 @@ func runFrame(ctx context.Context, cfg Config, deps Deps, budget int, cnt *count
 		}
 
 		sel, err := deps.Decider.Decide(ctx, deps.Transcript.Messages(), ws.candidates(cfg), cfg.Tools)
+		// A turn the job cannot pay for, or whose terms moved, ends the frame: the
+		// model did nothing wrong, and telling it would itself take a turn. Neither
+		// reached the model, so neither is counted; every other turn is, even one
+		// lost in transport, since it may have reached the model.
+		switch {
+		case errors.Is(err, ErrBudget):
+			return exhausted("budget")
+		case errors.Is(err, ErrTermsChanged):
+			return exhausted("terms-changed")
+		}
+		cnt.turns++
 		if err != nil {
 			logf("decide_error", map[string]any{"turn": cnt.turns, "depth": depth, "error": err.Error()})
 			over, aerr := feedback("Your previous tool selection was invalid: " + err.Error() +
@@ -322,7 +375,7 @@ func runFrame(ctx context.Context, cfg Config, deps Deps, budget int, cnt *count
 
 		// Repeat guard (§4c): a repeated action is dropped before it is persisted or
 		// dispatched; the loop re-queries after a single reworded nudge. Each retry
-		// already cost a turn (counted at the loop top), so MaxTurns bounds the
+		// already cost a turn (counted when Decide returned), so MaxTurns bounds the
 		// rephrase loop; maxRepeats consecutive drops end the frame with repeat-loop.
 		if maxRepeats >= 0 && sel.Action != cfg.ReplyTool && sel.Action == lastAction {
 			repeatStreak++
@@ -387,7 +440,7 @@ func runFrame(ctx context.Context, cfg Config, deps Deps, budget int, cnt *count
 			childCfg := cfg
 			childCfg.SubtaskTool = ""
 			childCfg.Tools = withoutTool(cfg.Tools, cfg.SubtaskTool)
-			res, _, _, ferr := runFrame(ctx, childCfg, childDeps, budget, cnt, depth+1, logf)
+			res, _, _, ferr := runFrame(ctx, childCfg, childDeps, cnt, depth+1, logf)
 			if ferr != nil {
 				return nil, StatusFailed, "", ferr
 			}
@@ -425,26 +478,22 @@ func runFrame(ctx context.Context, cfg Config, deps Deps, budget int, cnt *count
 				}
 				continue
 			}
-			price := cand.Price
-			if cnt.spent+price > budget {
+			price, m := cand.Price, deps.Meter
+			if !m.Fits(price) {
 				if err := deps.Transcript.Append(ctx, Message{Role: RoleUser, Kind: "budget",
 					Content: fmt.Sprintf("Budget exceeded: %q costs %d but only %d credits remain. "+
-						"Choose a cheaper action or finish with the %q tool.", sel.Action, price, budget-cnt.spent, cfg.ReplyTool)}); err != nil {
+						"Choose a cheaper action or finish with the %q tool.", sel.Action, price, m.Budget-m.Spent, cfg.ReplyTool)}); err != nil {
 					return nil, StatusFailed, "", err
 				}
-				logf("budget_refusal", map[string]any{"action": sel.Action, "price": price, "remaining": budget - cnt.spent})
+				logf("budget_refusal", map[string]any{"action": sel.Action, "price": price, "remaining": m.Budget - m.Spent})
 				continue
 			}
-			rr, rerr := deps.Runner.Run(ctx, sel.Action, sel.Args, cand.QuoteHash, runKey())
-			charge := price // no settlement reported: the call may still draw its price
-			switch {
-			case rr.TxID != "":
-				charge = rr.Charge
-			case errors.Is(rerr, ErrTermsChanged):
-				charge = 0          // refused before any funds were locked
+			rr, rerr := deps.Runner.Run(ctx, sel.Action, sel.Args, cand.QuoteHash, RunKey())
+			charge := Charged(price, rr, rerr)
+			if errors.Is(rerr, ErrTermsChanged) {
 				ws.drop(sel.Action) // re-offered only after a fresh read
 			}
-			cnt.spent += charge
+			m.Add(charge)
 			result := rr.Result
 			if sel.Action == cfg.ActionLookup && rerr == nil {
 				mergeCandidates(ctx, deps, ws, ParseLookup(rr.Result))
@@ -668,9 +717,9 @@ func missingRequired(schema map[string]any, args map[string]any) string {
 	return ""
 }
 
-// runKey names one dispatch for the kernel (external_key): random, so no two
-// dispatches share it, and fixed across that dispatch's retries.
-func runKey() string {
+// RunKey names one call for the kernel (external_key): random, so no two calls
+// share it, and fixed across that call's retries.
+func RunKey() string {
 	b := make([]byte, 16)
 	_, _ = rand.Read(b)
 	return hex.EncodeToString(b)

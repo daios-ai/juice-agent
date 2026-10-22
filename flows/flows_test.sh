@@ -14,8 +14,9 @@ source "$here/lib.sh"
 #
 # The budget and turn-cap rails are code invariants proven exhaustively by
 # `go test ./agent` — a real model cannot be coerced into the pathological
-# choices that would exercise them on demand, so the flows assert the invariant
-# that survives regardless (spend never exceeds budget) rather than staging it.
+# choices that would exercise them on demand. The budget flow stages the budget
+# with a reasoning action that always replies; the model flows assert the
+# invariant that survives regardless (spend never exceeds budget).
 
 # ---- mechanism flows (no LLM: fully deterministic) ------------------------
 
@@ -167,6 +168,37 @@ flow_tasks() {
     local oid; oid=$(message other "not for the agent")
     sleep 3 # several daemon polls
     assert_eq tasks.foreign_untouched waiting "$(kj task show "$oid" | jfield status)"
+}
+
+flow_budget() {
+    echo "=== FLOW budget (reasoning is paid from the job's budget, at the terms of each job) ==="
+    local dir; dir=$(new_dir)
+    start_kernel "$dir"; create_agent; create_user alice alice-pass
+    # alice's reasoning action answers every turn with the reply, at 7 base units.
+    local reason; reason=$(replying_reason alice 7)
+    assert_nonempty budget.reason "$reason"
+    start_agentd "$dir" "\"reason\": \"$reason\"" || { fail budget.agentd "no daemon"; return; }
+    local before after tid spent
+    before=$(jj "$DB" "$KDIR/agent" user me | jfield available)
+
+    # One turn: answered, its 7 counted in spent, and the wallet fell by that.
+    tid=$(message agent "say done")
+    assert_eq budget.done done "$(await_task "$tid" 60)"
+    assert_eq budget.answered done "$(reply_of "$tid")"
+    after=$(jj "$DB" "$KDIR/agent" user me | jfield available)
+    spent=$(grep '"event":"task_end"' "$dir/agentd.log" | tail -1 | jfield spent)
+    assert_eq budget.turn_counted 7 "$spent"
+    assert_eq budget.spent_is_charged "$spent" "$(( before - after ))"
+
+    # alice raises the price above the job budget (100) while the daemon runs. The
+    # next job reads the new terms, so the turn is refused for the budget, not for
+    # moved terms, and nothing is paid.
+    jj "$DB" "$KDIR/alice" action update "$reason" --price "$(units 150)" >/dev/null
+    tid=$(message agent "say done again")
+    assert_eq budget.over_done done "$(await_task "$tid" 60)"
+    assert_eq budget.over_failed failed "$(completion_of "$tid" status)"
+    assert_eq budget.over_reason budget "$(completion_of "$tid" reason)"
+    assert_eq budget.over_unpaid "$after" "$(jj "$DB" "$KDIR/agent" user me | jfield available)"
 }
 
 flow_approval() {
@@ -366,7 +398,6 @@ flow_answer() {
     before=$(jj "$DB" "$KDIR/agent" user me | jfield available)
     tid=$(message agent "What is the current time? Reply with an ISO-8601 timestamp.")
     assert_eq answer.done done "$(await_task "$tid" 300)"
-    sleep 1 # the rating pass follows the completion
     after=$(jj "$DB" "$KDIR/agent" user me | jfield available)
     assert_match answer.iso_answer '[0-9]{4}-[0-9]{2}-[0-9]{2}T[0-9]{2}:[0-9]{2}' "$(reply_of "$tid")"
     local spent; spent=$(grep '"event":"task_end"' "$dir/agentd.log" | tail -1 | jfield spent)
@@ -466,7 +497,7 @@ flow_thread_conversation() {
 }
 
 # Mechanism flows (deterministic assertions) run first; LLM flows (real Ollama) follow.
-ALL=(flow_bootstrap flow_init flow_config flow_no_session flow_recovery flow_drain flow_tasks flow_approval
+ALL=(flow_bootstrap flow_init flow_config flow_no_session flow_recovery flow_drain flow_tasks flow_budget flow_approval
      flow_personas flow_threads flow_named flow_session_identity flow_usage
      flow_answer flow_agent_md flow_rating flow_conversation flow_thread_conversation)
 

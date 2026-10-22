@@ -160,10 +160,9 @@ func setup(ctx context.Context, log *logger, login string) (*Executor, *juice.Cl
 			login, self.Address, self.ID, login)
 	}
 	log.event("login", map[string]any{"login": login, "available": self.Available})
-	// The two affordances must meet their contracts; the action lookup is then
-	// offered with the terms the kernel holds for it.
-	actionLookup, err := cl.Affordances(ctx)
-	if err != nil {
+	// The two affordances must meet their contracts, or the daemon does not start.
+	// Each job reads their terms again (Executor.Execute).
+	if _, _, err := cl.Affordances(ctx); err != nil {
 		return nil, nil, cfg, fmt.Errorf("config.json: %w", err)
 	}
 
@@ -173,7 +172,6 @@ func setup(ctx context.Context, log *logger, login string) (*Executor, *juice.Cl
 		SubtaskTool:    "subtask",
 		ActionLookup:   cfg.ActionLookup,
 		Tools:          []agent.Tool{replyTool(), subtaskTool()},
-		Always:         []agent.Candidate{actionLookup},
 		MaxTurns:       cfg.MaxTurns,
 		MaxRepeats:     maxRepeats,
 		CandidateLimit: candidateLimit,

@@ -4,7 +4,7 @@ Version: 0.1.2
 Status: design document
 Codename: `juice-agent`
 
-This document is aligned with `requirements.md` 0.4.0: all work arrives as kernel tasks, each task
+This document is aligned with `requirements.md` 0.5.0: all work arrives as kernel tasks, each task
 joins a persona keyed from the task alone (§6), the harness depends on two configured actions
 (reasoning and action lookup), and the channel layer, the maker and the learned memory file are gone.
 
@@ -92,7 +92,7 @@ Outcome { status ∈ {answered, failed, interrupted}, answer, reason, spent, tur
 ```
 
 The outcome is delivered by completing the task. `spent` is what the kernel charged the agent for
-the calls it dispatched, reconstructible from the ledger. The completion itself runs as the task's
+every call made for the job, reasoning and rating included, reconstructible from the ledger. The completion itself runs as the task's
 requester and costs the agent nothing (kernel D6).
 
 ## 4. The loop
@@ -186,8 +186,9 @@ scope and **rolls up** to a single result in the parent chat.
   tool-result (`{action: subtask, result: <reply args>}`); the child's internal turns never enter
   the parent's model view.
 
-**The bound is a shared counter.** Turns and credits are one `counters{turns, spent}` per task,
-threaded by pointer through the recursion — a subtask tree totals ≤ `max_turns` and ≤ `budget`, not
+**The bound is a shared counter.** Turns are one `counters{turns}` per task and credits one `Meter`,
+threaded by pointer through the recursion (the meter also through the reasoning, compaction and
+rating calls) — a subtask tree totals ≤ `max_turns` and ≤ `budget`, not
 per-frame: you cannot spend turns you do not have. (Depth is separately capped at one sublevel by
 withholding the `subtask` tool from a child — see *Inside* — so the tree is at most root → subtasks,
 never deeper.) Exhaustion inside a bracket rolls up an error result the parent can act on; at the
@@ -205,11 +206,15 @@ messy interior derivations already collapsed.
 pi ships no runaway rails and its report names that the gap that matters for unattended runs. This
 daemon *is* unattended, so it takes both rails — but the primary one is economic:
 
-1. **Budget (primary).** Every real tool call costs its advertised price, prepaid. A doom loop of
-   priced calls halts on the task budget; the wallet bounds the daemon globally. This is a rail pi
-   could not have: its tools were free.
+1. **Budget (primary).** Every call the job pays for costs its price, prepaid: the tools the model
+   chooses and the harness's own reasoning, lookup, compaction and rating calls, all checked against
+   one per-job meter and counted at what the kernel charged. The model is not free: `llm/chat`
+   costs the price the kernel's operator gives the model. A doom loop of priced calls halts on the
+   task budget; the wallet bounds the daemon globally. This is a rail pi could not have: its tools
+   were free. The affordances' terms are read for each job and every call is pinned to them, so an
+   owner who raises a price mid-job gets a refused call, not the agent's wallet.
 2. **Turn cap (secondary, default 32).** Required because zero-price actions (lookup,
-   the `llm/*` natives, refused selections) escape the money rail. A configurable hard cap; hitting
+   a model priced at 0, refused selections) escape the money rail. A configurable hard cap; hitting
    it fails the task honestly with `reason = turn-cap`.
 3. **Repeat guard (§4c).** Catches the case the other two miss: a *free, succeeding* action selected
    over and over (a real observed failure — an agent posted the same chat message 31× and never
@@ -441,9 +446,9 @@ no fake model. Consequences:
   model text. They guard on `require_ollama` and *skip* (not fail)
   when the chat model is absent. Timeouts are generous (a real model takes tens of seconds/turn).
 - The **budget and turn-cap rails are code invariants**, proven exhaustively by `go test ./agent`;
-  a real model cannot be coerced into the pathological choices that would stage them on demand, so
-  the flows assert the surviving invariant (spend never exceeds budget) rather than forcing the
-  rail. Loop resilience matters more with a real model: a single invalid model selection is fed
+  a real model cannot be coerced into the pathological choices that would stage them on demand.
+  `flow_budget` stages the budget with a reasoning action that always replies; the model flows
+  assert the surviving invariant (spend never exceeds budget). Loop resilience matters more with a real model: a single invalid model selection is fed
   back for self-correction (`MaxDecideErrors` consecutive before the run fails), and model-output
   errors (`execution_failed`/`schema_violation`) are not retried as if transient.
 
@@ -455,6 +460,7 @@ flow_no_session  a login with no session, an unrecorded kernel, or a bare handle
 flow_recovery    a mid-flight persona file at startup is marked interrupted, idempotently      [no LLM]
 flow_drain       SIGTERM drains in-flight work, persists, exits 0                               [no LLM]
 flow_tasks       a task addressed to the agent is completed as its sender; another's is left   [no LLM]
+flow_budget      a paid reasoning turn is counted; a price raised mid-run fails the next job   [no LLM]
 flow_approval    an unapproved sender's task is withheld until the operator approves it        [no LLM]
 flow_personas    one file per sender; a sender's next job loads the history; others kept apart [no LLM]
 flow_named       serve alice@k and serve bob@k launch as distinct logins, each in its own home  [no LLM]

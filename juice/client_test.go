@@ -323,6 +323,15 @@ func TestRunFailureIsKernelError(t *testing.T) {
 	}
 }
 
+// at is a Call running ref through the client, unpinned and unkeyed: what the
+// executor's metered call does underneath.
+func at(c *Client, ref string) Call {
+	return func(ctx context.Context, args map[string]any) (map[string]any, error) {
+		rr, err := c.Run(ctx, ref, args, "", "")
+		return rr.Result, err
+	}
+}
+
 // chatReply is the llm/chat result shape carrying content as the reply.
 func chatReply(content string) map[string]any {
 	return map[string]any{"choices": []any{map[string]any{"index": 0,
@@ -336,13 +345,13 @@ func TestChatAndChatJSONRunTheReasonAffordance(t *testing.T) {
 	ctx := context.Background()
 	msgs := []agent.Message{{Role: agent.RoleUser, Content: "hi"}}
 
-	if got, err := c.Chat(ctx, msgs); err != nil || got != "hello" || f.lastRun["action"] != testReason {
+	if got, err := Chat(ctx, at(c, testReason), msgs); err != nil || got != "hello" || f.lastRun["action"] != testReason {
 		t.Fatalf("chat = %q, %v, ran %v", got, err, f.lastRun["action"])
 	}
 	// ChatJSON states the schema in the prompt and extracts the first JSON object.
 	f.runResults[testReason] = chatReply("Here: {\"ratings\": [{\"index\": 0}]} done")
 	schema := map[string]any{"type": "object", "required": []any{"ratings"}}
-	got, err := c.ChatJSON(ctx, msgs, schema)
+	got, err := ChatJSON(ctx, at(c, testReason), msgs, schema)
 	if err != nil || got.(map[string]any)["ratings"] == nil || f.lastRun["action"] != testReason {
 		t.Fatalf("json = %v, %v, ran %v", got, err, f.lastRun["action"])
 	}
@@ -352,7 +361,7 @@ func TestChatAndChatJSONRunTheReasonAffordance(t *testing.T) {
 		t.Fatalf("schema not stated in the prompt: %q", last)
 	}
 	f.runResults[testReason] = chatReply("no object at all")
-	if _, err := c.ChatJSON(ctx, msgs, schema); Code(err) != "execution_failed" {
+	if _, err := ChatJSON(ctx, at(c, testReason), msgs, schema); Code(err) != "execution_failed" {
 		t.Fatalf("reply without JSON: err = %v, want execution_failed", err)
 	}
 }
@@ -365,16 +374,16 @@ func TestRepliesWithoutTheReadFieldAreErrors(t *testing.T) {
 	ctx := context.Background()
 	for _, res := range []map[string]any{{}, {"choices": []any{}}, {"choices": []any{map[string]any{"index": 0}}}} {
 		f.runResults[testReason] = res
-		if _, err := c.Chat(ctx, nil); Code(err) != "execution_failed" {
+		if _, err := Chat(ctx, at(c, testReason), nil); Code(err) != "execution_failed" {
 			t.Errorf("chat reply %v: err = %v, want execution_failed", res, err)
 		}
 	}
 	f.runResults[testLookup] = map[string]any{}
-	if _, err := c.Lookup(ctx, "q", 8); Code(err) != "execution_failed" {
+	if _, err := Lookup(ctx, at(c, testLookup), "q", 8); Code(err) != "execution_failed" {
 		t.Errorf("lookup reply without results: err = %v, want execution_failed", err)
 	}
 	f.runResults[testLookup] = map[string]any{"results": []any{}}
-	if cands, err := c.Lookup(ctx, "q", 8); err != nil || len(cands) != 0 {
+	if cands, err := Lookup(ctx, at(c, testLookup), "q", 8); err != nil || len(cands) != 0 {
 		t.Errorf("empty results = %v, %v; want no candidates and no error", cands, err)
 	}
 }
@@ -391,7 +400,7 @@ func TestDecideRendersToolsAndExtractsSelection(t *testing.T) {
 	tools := []agent.Tool{{Name: "reply", Description: "finish", InputSchema: map[string]any{"type": "object",
 		"properties": map[string]any{"answer": map[string]any{"type": "string"}}, "required": []any{"answer"}}}}
 
-	sel, err := c.Decide(context.Background(), []agent.Message{{Role: agent.RoleUser, Content: "hi"}}, catalog, tools)
+	sel, err := Decide(context.Background(), at(c, testReason), []agent.Message{{Role: agent.RoleUser, Content: "hi"}}, catalog, tools)
 	if err != nil {
 		t.Fatalf("decide: %v", err)
 	}
@@ -430,29 +439,32 @@ func nativeRow(t *testing.T, ref, input, output string) map[string]any {
 		"input_schema": schema(t, input), "output_schema": schema(t, output)}
 }
 
-func TestAffordancesAreCheckedAndTheLookupIsOffered(t *testing.T) {
+func TestAffordancesAreCheckedAndReadWithTheirTerms(t *testing.T) {
 	f := newFakeKernel()
 	f.actions[testReason] = nativeRow(t, testReason, kernelChatInput, kernelChatOutput)
 	f.actions[testLookup] = nativeRow(t, testLookup, kernelLookupInput, kernelLookupOutput)
+	f.actions[testReason]["price"] = 4
 	c := startFake(t, f)
 	ctx := context.Background()
 
-	// The offered entry is the kernel's read of the configured action.
-	cand, err := c.Affordances(ctx)
-	if err != nil || cand.Ref != testLookup || cand.Description != "native "+testLookup ||
-		cand.QuoteHash != "q-"+testLookup || cand.InputSchema["required"] == nil {
-		t.Fatalf("affordances = %+v, %v", cand, err)
+	// Both come back as the kernel holds them now: the terms a job pins its calls
+	// to, and the action lookup's entry as the model is offered it.
+	reason, lookup, err := c.Affordances(ctx)
+	if err != nil || reason.Ref != testReason || reason.Price != 4 || reason.QuoteHash != "q-"+testReason ||
+		lookup.Ref != testLookup || lookup.Description != "native "+testLookup ||
+		lookup.QuoteHash != "q-"+testLookup || lookup.InputSchema["required"] == nil {
+		t.Fatalf("affordances = %+v, %+v, %v", reason, lookup, err)
 	}
 
 	// A wrong-shaped action lookup is refused, naming the key, the address and the field.
 	f.actions[testLookup] = nativeRow(t, testLookup, kernelLookupInput, kernelTimeOutput)
-	if _, err := c.Affordances(ctx); err == nil ||
+	if _, _, err := c.Affordances(ctx); err == nil ||
 		err.Error() != "action_lookup = "+testLookup+": output.properties.results: missing (want array)" {
 		t.Fatalf("err = %v", err)
 	}
 	// A reasoning action the kernel does not hold is refused, naming reason.
 	delete(f.actions, testReason)
-	if _, err := c.Affordances(ctx); err == nil || !strings.HasPrefix(err.Error(), "reason = "+testReason+": ") {
+	if _, _, err := c.Affordances(ctx); err == nil || !strings.HasPrefix(err.Error(), "reason = "+testReason+": ") {
 		t.Fatalf("err = %v", err)
 	}
 }
@@ -468,7 +480,7 @@ func TestLookupAndRead(t *testing.T) {
 	c := startFake(t, f)
 	ctx := context.Background()
 
-	cands, err := c.Lookup(ctx, "fetch a page", 8)
+	cands, err := Lookup(ctx, at(c, testLookup), "fetch a page", 8)
 	if err != nil || len(cands) != 1 || cands[0].Ref != "sys@k/web" || f.lastRun["action"] != testLookup {
 		t.Fatalf("lookup = %+v, %v, ran %v", cands, err, f.lastRun["action"])
 	}

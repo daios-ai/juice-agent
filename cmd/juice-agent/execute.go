@@ -5,22 +5,23 @@ import (
 	"time"
 
 	"github.com/daios-ai/juice-agent/agent"
+	"github.com/daios-ai/juice-agent/juice"
 )
 
-// Kernel is everything job execution needs from the kernel client: the three
-// agent-core interfaces plus the reasoning and rating helpers. The juice client
-// satisfies it; tests use a fake.
+// Kernel is everything job execution needs from the kernel client: dispatch,
+// authoritative reads, the two affordances' current terms, and rating. The juice
+// client satisfies it; tests use a fake.
 type Kernel interface {
-	agent.Decider
-	agent.Catalog
 	agent.Runner
-	Chatter
-	Rater
+	Read(ctx context.Context, ref string) (agent.Candidate, error)
+	Affordances(ctx context.Context) (reason, actionLookup agent.Candidate, err error)
+	Rate(ctx context.Context, txID string, rating int, note string) error
 }
 
-// Executor runs jobs end to end: the persona's transcript, the system prompt,
-// the retry-wrapped loop, the outcome record, then the post-job rating pass. It
-// is the seam cmd/juice-agent drives; the loop itself stays in agent/.
+// Executor runs jobs end to end: the affordances' current terms, the persona's
+// transcript, the system prompt, the loop, the post-job rating pass, then the
+// outcome record. It is the seam cmd/juice-agent drives; the loop itself stays
+// in agent/.
 type Executor struct {
 	Kernel       Kernel
 	PersonasDir  string
@@ -38,12 +39,28 @@ type Executor struct {
 // Errors from the loop are recorded but not returned as failures of Execute
 // itself unless the transcript cannot be opened; a decide error becomes a failed
 // outcome.
+//
+// Every priced call the job makes is paid from one meter: the actions the model
+// chooses, and the reasoning, lookup, compaction and rating the harness makes on
+// its own. The rating pass runs before the meter closes and the outcome is
+// recorded, so the spend reported and recorded is all the job cost.
 func (e *Executor) Execute(ctx context.Context, job agent.Job) (agent.Outcome, error) {
 	logf := e.Log
 	if logf == nil {
 		logf = func(string, map[string]any) {}
 	}
-	tr, err := OpenTranscript(e.PersonasDir, job.Persona, e.CompactBytes, e.Kernel)
+	// The terms are read for each job: a call pinned to them is refused, before
+	// any funds are locked, if they move, and the next job reads the new ones.
+	reason, lookup, err := e.Kernel.Affordances(ctx)
+	if err != nil {
+		logf("affordance_error", map[string]any{"job": job.ID, "error": err.Error()})
+		return agent.Outcome{Status: agent.StatusFailed, Reason: "affordance: " + err.Error()}, nil
+	}
+	meter := &agent.Meter{Budget: job.Budget}
+	jk := &jobKernel{kernel: e.Kernel, run: WrapRunner(e.Kernel, e.Retry, e.retryOK()),
+		reason: reason, lookup: lookup, meter: meter}
+
+	tr, err := OpenTranscript(e.PersonasDir, job.Persona, e.CompactBytes, jk)
 	if err != nil {
 		return agent.Outcome{Status: agent.StatusFailed, Reason: "transcript: " + err.Error()}, err
 	}
@@ -51,31 +68,31 @@ func (e *Executor) Execute(ctx context.Context, job agent.Job) (agent.Outcome, e
 
 	sys := systemPrompt(e.Handle, e.Loop.ReplyTool, readFileOrEmpty(e.AgentPath))
 	job.Messages = append([]agent.Message{sys}, job.Messages...)
-	deps := agent.Deps{
-		Decider:    WrapDecider(e.Kernel, e.Retry, e.retryOK()),
-		Catalog:    e.Kernel,
-		Runner:     WrapRunner(e.Kernel, e.Retry, e.retryOK()),
-		Transcript: tr,
-		Log:        logf,
-	}
-	out, loopErr := agent.Run(ctx, job, e.Loop, deps)
+	loop := e.Loop
+	loop.ActionLookup, loop.Always = lookup.Ref, []agent.Candidate{lookup}
+	deps := agent.Deps{Decider: jk, Catalog: jk, Runner: jk.run, Transcript: tr, Meter: meter, Log: logf}
+	out, loopErr := agent.Run(ctx, job, loop, deps)
 	if loopErr != nil {
 		logf("loop_error", map[string]any{"job": job.ID, "error": loopErr.Error()})
 	}
 
+	// All() is this job's records across frames: bracketed calls are rated, and
+	// an earlier job's transactions, already rated once (kernel D11), never are.
+	if e.RateTasks {
+		RateTask(ctx, tr.All(), jk, e.Loop.Intrinsics, logf)
+	}
+	// Closing the meter fixes the spend: a compaction the outcome record triggers
+	// finds no budget, so nothing is paid after the figure is taken.
+	meter.Close()
+	out.Spent = meter.Spent
+	logf("task_end", map[string]any{"job": job.ID, "status": out.Status, "reason": out.Reason, "turns": out.Turns, "spent": out.Spent})
 	// Record the terminal outcome so recovery can tell a finished job from an
 	// interrupted one.
 	_ = tr.Append(ctx, agent.Message{Role: agent.RoleSystem, Kind: "outcome",
 		Content: string(out.Status), Result: map[string]any{
 			"status": string(out.Status), "reason": out.Reason, "spent": out.Spent, "turns": out.Turns,
 		}})
-	// All() is this job's records across frames: bracketed calls are rated, and
-	// an earlier job's transactions, already rated once (kernel D11), never are.
-	msgs := tr.All()
 	_ = tr.Close()
-	if e.RateTasks {
-		RateTask(ctx, msgs, e.Kernel, e.Loop.Intrinsics, logf)
-	}
 	return out, nil
 }
 
@@ -86,36 +103,60 @@ func (e *Executor) retryOK() func(error) bool {
 	return func(error) bool { return false }
 }
 
-// Chatter summarises a conversation (used by compaction). Implemented by the
-// juice client over the reasoning affordance.
+// Chatter summarises a conversation (used by compaction). The job's jobKernel
+// implements it over the reasoning affordance.
 type Chatter interface {
 	Chat(ctx context.Context, messages []agent.Message) (string, error)
 }
 
-// retryDecider wraps an agent.Decider with bounded exponential backoff on
-// retryable errors (transport failures, 429, 5xx, timeout). It is the model
-// round-trip's resilience layer, mirroring pi's AgentSession retry.
-type retryDecider struct {
-	inner   agent.Decider
-	policy  RetryPolicy
-	retryOK func(error) bool
-	sleep   func(time.Duration)
+// jobKernel is the kernel as one job sees it: the loop's Decider and Catalog,
+// the transcript's Chatter and the rating pass's Rater. Each reasoning or lookup
+// call is checked against the job's meter, pinned to the terms the job read, run
+// under one key across its retries (so a retry after a lost reply is answered
+// with the first run's outcome and is not paid twice), and counted at what the
+// kernel charged. Reads and ratings pass through: they cost nothing. It holds the
+// kernel by name, not embedded, so no unmetered call is reachable through it.
+type jobKernel struct {
+	kernel         Kernel
+	run            agent.Runner // kernel with the retry policy
+	reason, lookup agent.Candidate
+	meter          *agent.Meter
 }
 
-func (d retryDecider) Decide(ctx context.Context, msgs []agent.Message, catalog []agent.Candidate, tools []agent.Tool) (*agent.Selection, error) {
-	var last error
-	for attempt := 0; attempt <= d.policy.MaxRetries; attempt++ {
-		sel, err := d.inner.Decide(ctx, msgs, catalog, tools)
-		if err == nil {
-			return sel, nil
+// call runs the affordance at its job's terms.
+func (j *jobKernel) call(at agent.Candidate) juice.Call {
+	return func(ctx context.Context, args map[string]any) (map[string]any, error) {
+		if !j.meter.Fits(at.Price) {
+			return nil, agent.ErrBudget
 		}
-		last = err
-		if !d.retryOK(err) || attempt == d.policy.MaxRetries {
-			break
-		}
-		d.sleep(d.policy.backoff(attempt))
+		rr, err := j.run.Run(ctx, at.Ref, args, at.QuoteHash, agent.RunKey())
+		j.meter.Add(agent.Charged(at.Price, rr, err))
+		return rr.Result, err
 	}
-	return nil, last
+}
+
+func (j *jobKernel) Read(ctx context.Context, ref string) (agent.Candidate, error) {
+	return j.kernel.Read(ctx, ref)
+}
+
+func (j *jobKernel) Rate(ctx context.Context, txID string, rating int, note string) error {
+	return j.kernel.Rate(ctx, txID, rating, note)
+}
+
+func (j *jobKernel) Decide(ctx context.Context, msgs []agent.Message, catalog []agent.Candidate, tools []agent.Tool) (*agent.Selection, error) {
+	return juice.Decide(ctx, j.call(j.reason), msgs, catalog, tools)
+}
+
+func (j *jobKernel) Lookup(ctx context.Context, query string, limit int) ([]agent.Candidate, error) {
+	return juice.Lookup(ctx, j.call(j.lookup), query, limit)
+}
+
+func (j *jobKernel) Chat(ctx context.Context, msgs []agent.Message) (string, error) {
+	return juice.Chat(ctx, j.call(j.reason), msgs)
+}
+
+func (j *jobKernel) ChatJSON(ctx context.Context, msgs []agent.Message, schema map[string]any) (any, error) {
+	return juice.ChatJSON(ctx, j.call(j.reason), msgs, schema)
 }
 
 // retryRunner wraps an agent.Runner: it retries only transport-level failures,
@@ -130,19 +171,16 @@ type retryRunner struct {
 }
 
 func (r retryRunner) Run(ctx context.Context, action string, args map[string]any, quoteHash, key string) (agent.RunResult, error) {
-	var last error
-	for attempt := 0; attempt <= r.policy.MaxRetries; attempt++ {
+	for attempt := 0; ; attempt++ {
 		res, err := r.inner.Run(ctx, action, args, quoteHash, key)
-		if err == nil || !r.retryOK(err) {
+		// A reported transaction is a settled call: a retry under its key would
+		// only repeat its outcome. The last attempt's settlement is returned with
+		// its error, so the charge it reports is the one counted.
+		if err == nil || !r.retryOK(err) || res.TxID != "" || attempt == r.policy.MaxRetries {
 			return res, err
-		}
-		last = err
-		if attempt == r.policy.MaxRetries {
-			break
 		}
 		r.sleep(r.policy.backoff(attempt))
 	}
-	return agent.RunResult{}, last
 }
 
 // RetryPolicy is the backoff schedule: MaxRetries additional attempts after the
@@ -161,12 +199,6 @@ func (p RetryPolicy) backoff(attempt int) time.Duration {
 		d *= 2
 	}
 	return d
-}
-
-// WrapDecider returns dec fortified with the retry policy. retryOK classifies
-// which errors are worth retrying (juice.IsRetryable in production).
-func WrapDecider(dec agent.Decider, p RetryPolicy, retryOK func(error) bool) agent.Decider {
-	return retryDecider{inner: dec, policy: p, retryOK: retryOK, sleep: time.Sleep}
 }
 
 // WrapRunner returns run fortified with the retry policy (transport failures only).

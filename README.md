@@ -119,7 +119,7 @@ startup. The following shows all defaults for an account on `work`:
 | --- | --- |
 | `reason` | Reasoning action. |
 | `action_lookup` | Action the agent uses to find tools. |
-| `default_budget` | Tool spending budget per job, in base units. |
+| `default_budget` | Spending budget per job, in base units, model calls included. |
 | `max_turns` | Maximum reasoning turns per job. |
 | `concurrency` | Number of conversations the daemon can serve at once. |
 | `poll_seconds` | Interval between checks for waiting tasks. |
@@ -148,18 +148,27 @@ error: config.json: action_lookup = sys@work/time: input.properties.limit: missi
 ```
 
 Compare an action's schemas with `juice action show <action>`. The full contracts are in
-`requirements.md` §11.
+`requirements.md` §11. Each job reads both actions again, so a change of price or schema applies
+from the next job, with no restart; a job whose action no longer fits fails with reason
+`affordance: …`.
 `JUICE_HOME` is the daemon's only environment setting; its default is `~/.juice`.
 
 ### Spending and ratings
 
-The agent checks a tool's price against the remaining budget before calling it. For local actions,
-the budget is a ceiling on tool spending. Remote calls settle through the kernel's lottery system:
-a winning ticket can cost more than the quoted expected price and take the job over budget. The
-agent then makes no further tool calls. Actions that transfer value beyond their price are excluded.
+Every paid call a job makes comes out of its budget: the tools the model chooses, and the
+agent's own calls of `reason` and `action_lookup` (each turn, the opening search, summarising a long
+conversation, and rating). A model's price is set by the kernel's operator and may be `0`; a
+replacement action costs what its owner charges. Before each call the agent checks its price
+against what the job has left. A turn that does not fit ends the job with reason `budget`; a
+search, summary or rating that does not fit is skipped. The price is the one the job read when it
+started: if it changed since, the kernel refuses the call without charging, and a turn so refused
+ends the job with reason `terms-changed`.
 
-Reasoning, rating, and summarisation calls are separate from the tool spending budget. Local native
-model calls have zero price under kernel policy. The turn limit also bounds loops using free tools.
+For local actions the budget is a ceiling. Remote calls settle through the kernel's lottery system:
+a winning ticket can cost more than the quoted expected price and take the job over budget. The
+agent then makes no further calls. Actions that transfer value beyond their price are excluded.
+
+The turn limit also bounds loops using free tools.
 
 With `rate_tasks` enabled, the agent records a binary rating and a short note for its tool calls.
 These notes are visible to anyone who can read the action. Failed calls receive the fixed note

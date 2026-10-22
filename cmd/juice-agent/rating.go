@@ -8,8 +8,9 @@ import (
 	"github.com/daios-ai/juice-agent/agent"
 )
 
-// Rater judges and records tool-call quality. Implemented by the juice client
-// (the reasoning affordance to judge, POST /rate to record).
+// Rater judges and records tool-call quality. Implemented by the job's jobKernel
+// (the reasoning affordance to judge, paid from the job's budget; POST /rate to
+// record).
 type Rater interface {
 	ChatJSON(ctx context.Context, messages []agent.Message, schema map[string]any) (any, error)
 	Rate(ctx context.Context, txID string, rating int, note string) error
@@ -65,7 +66,11 @@ func RateTask(ctx context.Context, messages []agent.Message, r Rater, intrinsics
 		return
 	}
 
-	judgments := judge(ctx, messages, toJudge, r)
+	judgments, err := judge(ctx, messages, toJudge, r)
+	if err != nil {
+		// Unjudged calls stay unrated; a judge the job's budget cannot pay is skipped.
+		log("judge_error", map[string]any{"error": err.Error()})
+	}
 	for _, c := range toJudge {
 		j, ok := judgments[c.index]
 		if !ok {
@@ -83,9 +88,9 @@ type judgment struct {
 }
 
 // judge asks the LLM to grade each dispatched call by index. It returns a map
-// index -> judgment; on any failure it returns an empty map (calls stay
-// unrated).
-func judge(ctx context.Context, messages []agent.Message, calls []dispatched, r Rater) map[int]judgment {
+// index -> judgment; on a failure it returns an empty map (calls stay unrated)
+// and the error.
+func judge(ctx context.Context, messages []agent.Message, calls []dispatched, r Rater) (map[int]judgment, error) {
 	prompt := "You are grading how well each tool call below served the task, judging in hindsight " +
 		"from the full transcript. For each call return rating 1 (helpful, correct, worth reusing) or " +
 		"0 (unhelpful, wrong, or wasteful) and a one-line note. " + notePolicy + " Calls to grade:\n"
@@ -114,9 +119,9 @@ func judge(ctx context.Context, messages []agent.Message, calls []dispatched, r 
 	}
 	val, err := r.ChatJSON(ctx, msgs, schema)
 	if err != nil {
-		return map[int]judgment{}
+		return map[int]judgment{}, err
 	}
-	return parseJudgments(val)
+	return parseJudgments(val), nil
 }
 
 // notePolicy tells the judge that its notes are public. It reduces the risk of

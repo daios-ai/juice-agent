@@ -159,17 +159,37 @@ PYEOF
         --description "relays a post to the agent" >/dev/null
 }
 
-# dead_reason — create, as the agent, a reasoning action that meets the reason
-# contract but whose endpoint is closed, and echo its address. Every call fails
-# at once, so every job fails at once and its task is completed with
-# status failed: a flow's conversations and completions are then decided by the
-# task fields alone, whether or not a model is present.
-dead_reason() {
+# chat_action handle name source price — publish, as handle, an HTTP action at
+# source meeting the reason contract, at price base units; echo its address.
+chat_action() {
     local in='{"type":"object","properties":{"messages":{"type":"array","description":"The conversation","items":{"type":"object","properties":{"role":{"type":"string","description":"Who speaks"},"content":{"type":"string","description":"What is said"}},"required":["role","content"]}}},"required":["messages"]}'
     local out='{"type":"object","properties":{"choices":{"type":"array","description":"The reply","items":{"type":"object","properties":{"message":{"type":"object","description":"The reply","properties":{"content":{"type":"string","description":"The reply text"}}}}}}}}'
-    enabled "$DB" "$KDIR/agent" dead-chat --kind http --source "http://127.0.0.1:1/" --price "$(units 0)" \
-        --description "a closed endpoint" --input-schema "$in" --output-schema "$out" >/dev/null \
-        && echo "$(login agent)/dead-chat"
+    publish "$DB" "$KDIR/$1" "$2" --kind http --source "$3" --price "$(units "$4")" \
+        --description "a chat endpoint" --input-schema "$in" --output-schema "$out" >/dev/null \
+        && echo "$(login "$1")/$2"
+}
+
+# dead_reason — a free reasoning action of the agent's whose endpoint is closed;
+# echo its address. Every call fails at once, so every job fails at once and its
+# task is completed with status failed: a flow's conversations and completions
+# are then decided by the task fields alone, whether or not a model is present.
+dead_reason() { chat_action agent dead-chat "http://127.0.0.1:1/" 0; }
+
+# replying_reason handle price — handle's reasoning action at price base units
+# whose every reply selects the reply tool with the answer "done"; echo its
+# address. A job reasoning through it takes exactly one paid turn. The backend's
+# output goes to /dev/null, so a $(...) around this call does not wait on it.
+replying_reason() {
+    local port; port=$(backend_port)
+    start_backend "$port" 200 '{"choices":[{"message":{"content":"{\"action\":\"reply\",\"args\":{\"answer\":\"done\"}}"}}]}' >/dev/null
+    chat_action "$1" chat "http://127.0.0.1:$port/" "$2"
+}
+
+# completion_of id field — a field of the args task id was completed with, read
+# as its sender, sys.
+completion_of() {
+    local tx; tx=$(kj task show "$1" | jfield tx_id)
+    kj tx show "$tx" | python3 -c "import sys,json; print(json.load(sys.stdin).get('args',{}).get(sys.argv[1],''))" "$2" 2>/dev/null
 }
 
 # post from action json — call action as from; echo the task it created.

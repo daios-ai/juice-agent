@@ -1,6 +1,6 @@
 # Juice Agent Requirements
 
-Version: 0.4.0
+Version: 0.5.0
 Status: implementation requirements
 Codename: `juice-agent`
 
@@ -12,7 +12,14 @@ A requirement here must violate neither. Citations use the kernel's own labels: 
 section, *kernel D/P/G/U N* for a design decision, protocol clause, guarantee, or user story, and
 *ecosystem §N* for the standard.
 
-Revision 0.4.0 resynchronises with the kernel contract 0.16 and later. A task now names its
+Revision 0.5.0 makes the budget cover every call made for a job. The harness's own calls of the two
+affordances (each turn's reasoning, the opening lookup, compaction, rating) are priced like any
+other: `llm/chat` costs the model's price, which the kernel's operator sets. Each is checked against
+what the job has left, pinned to the terms the job read, and counted at what the kernel charged
+(§3, §11). The affordances' terms are read again for each job, so a change of price reaches the next
+job without a restart.
+
+Revision 0.4.0 resynchronised with the kernel contract 0.16 and later. A task now names its
 `requester`, whom it acts for: completion runs as the requester, the completer lending neither
 identity nor funds (kernel D6), and the kernel shows the agent a task only from a requester its
 operator approved (kernel U52). All work therefore arrives as tasks, and the agent specialises to no
@@ -108,8 +115,8 @@ in the kernel's base units.
 
 | Object    | Fields                                                                        | Rules                                                                                                                                                                                                             |
 | --------- | ----------------------------------------------------------------------------- | --------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------- |
-| `Job`     | `id`, `persona`, `messages`, `budget`                                         | One request for the agent: an id, the persona whose history it continues (§10), its new messages, and a spend ceiling. One job = one loop run, appended to its persona's file.                                     |
-| `Outcome` | `status`, `answer`, `reason`, `spent`, `turns`                               | `status ∈ {answered, failed, interrupted}`. `answer` is the reply object (on `answered`). `reason` gives the failure class (`turn-cap`, `repeat-loop`, `decide-error: …`) when not answered. `spent` is what the kernel charged — the sum of each call's reported `charge` (on success, and in a failure's `meta`), `0` for a call refused with `terms_changed`, and the price for a call whose settlement was not reported (a parked call may still draw it); reconstructible from the kernel ledger (the agent is the payer of every one, kernel D4). `turns` is the count of model round-trips. |
+| `Job`     | `id`, `persona`, `messages`, `budget`                                         | One request for the agent: an id, the persona whose history it continues (§10), its new messages, and a spend ceiling covering every priced call made for it: the actions the model chooses and the harness's own calls of the two affordances (§11). One job = one loop run, appended to its persona's file.                                     |
+| `Outcome` | `status`, `answer`, `reason`, `spent`, `turns`                               | `status ∈ {answered, failed, interrupted}`. `answer` is the reply object (on `answered`). `reason` gives the failure class (`turn-cap`, `repeat-loop`, `budget`, `terms-changed`, `affordance: …`, `decide-error: …`) when not answered. `spent` is what the kernel charged for the job — every call's, the reasoning, lookup, compaction and rating calls included: the sum of each call's reported `charge` (on success, and in a failure's `meta`), `0` for a call refused with `terms_changed`, and the price for a call whose settlement was not reported (a parked call may still draw it); reconstructible from the kernel ledger (the agent is the payer of every one, kernel D4). `turns` is the count of model round-trips: a turn refused for the budget or for moved terms never reaches the model and is not counted. |
 
 A job's outcome must be delivered by completing its originating task. The daemon serves jobs from a
 bounded worker pool; each job's loop is serial, jobs in different personas are concurrent, and a
@@ -120,10 +127,12 @@ persona runs one job at a time.
 Each turn substitutes the kernel at both ends. In pseudocode — the whole of the pure loop:
 
 ```text
-run(job):
-  cands = merge(Catalog.Lookup(job.prompt, k))              # seed the working set; always ∪ cands is offered
+run(job):                                                   # meter: the job's spend, shared with every call made for it
+  cands = merge(Catalog.Lookup(job.prompt, k))              # seed the working set; skipped if it does not fit
   loop:
-    sel = Decider.Decide(messages, offered, tools)          # ONE llm/chat round-trip, JSON extracted
+    sel = Decider.Decide(messages, offered, tools)          # ONE llm/chat round-trip, JSON extracted, metered
+    if sel is budget:          fail(budget)                 # the turn does not fit: the model cannot be told
+    if sel is terms_changed:   fail(terms-changed)          # the reasoning terms moved since the job read them
     if sel is error:  fail after MaxDecideErrors consecutive # policy layer retries transport errors only
     if sel.action == ReplyTool:   return answered(sel.args)  # THE STOP RULE — nothing dispatched
     if repeat-guard trips (§6):   drop, nudge, re-query
@@ -165,7 +174,7 @@ registration and no artifact.
 
 **Discovery is in-band.** The action-lookup affordance (`action_lookup` in config, by default
 `sys@<kernel>/lookup`; `Config.ActionLookup`) is a permanent candidate, offered with the terms the
-kernel holds for it, read at startup (§11). The model expands its own tool set by selecting it; the harness runs it as an
+kernel holds for it, read at the start of each job (§11). The model expands its own tool set by selecting it; the harness runs it as an
 ordinary call and merges the results into the working set, bounded by `candidate_limit` and evicted
 least-recently-merged first. The working set is per-frame and starts fresh each run.
 
@@ -200,7 +209,7 @@ runs in its own scope and rolls up to a single result in the parent chat.
   tool-result `{action: subtask, result: <reply args>}`; the child's internal turns never enter the
   parent's model view.
 
-**Shared bound.** Turns and spend are one `counters{turns, spent}` per job, threaded by pointer
+**Shared bound.** Turns are one `counters{turns}` per job and spend one `Meter`, shared with every call made for the job, threaded by pointer
 through the recursion, so a subtask tree totals ≤ `max_turns` and ≤ `budget` — never per-frame.
 Exhaustion inside a bracket rolls up an error result the parent can act on; at the root it fails the
 job.
@@ -448,7 +457,11 @@ Each affordance is filled by whatever action its key names, so each has a contra
 agent sends and the output it reads, in the kernel's canonical schema form (kernel "Contract"; the
 manual's "Action schemas"). At startup the daemon reads both actions (`GET /v1/actions?ref=`) and
 compares each one's declared schemas with its contract. If an action is missing or falls short, the
-daemon stops with `config.json: <key> = <address>: <path>: <what is wrong>`.
+daemon stops with `config.json: <key> = <address>: <path>: <what is wrong>`. Each job reads both
+again and checks them the same way: their terms (price and `quote_hash`) are the ones every call
+of the job is checked against and pinned to, so a change of terms reaches the next job without a
+restart, and a call is never made at terms the job did not read. A job whose affordance no longer
+meets its contract fails with `affordance: <key> = <address>: …`.
 
 The comparison is of declared compatibility. What the agent sends must be accepted: every sent
 property declared, with a type that is or includes the sent one (a nullable `[T, "null"]` accepts
@@ -567,15 +580,24 @@ exact: its price bounds its charge, and an execution failure charges only the su
 For an action on another kernel it holds in expectation: the charge adds the import fee and, when
 the call's lottery ticket wins, the ticket's face value — the buyer kernel's `lottery` setting,
 readable only by its operator — whose expected value is the quoted payment (kernel P10). A winning
-ticket can therefore carry `spent` past `budget`; no further call is dispatched once it has. The policy layer's own calls (the decide turn, rating, compaction) run at the kernel's
-native prices, `0` for a local endpoint by kernel policy, and are bounded by the turn cap rather than
-counted in `spent`. The turn cap is the secondary rail for
+ticket can therefore carry `spent` past `budget`; no further call is dispatched once it has. The
+harness's own calls (each turn's reasoning, the opening lookup, compaction, rating) are priced like
+any other: `llm/chat` costs the model's price, which the kernel's operator sets per model, `0`
+included (kernel `manual/reference/config.md`), and a replacement affordance costs what its owner
+charges. Each is checked against what the job has left before it runs, pinned to the terms the job
+read (§11), run under one `external_key` across its retries, and counted in `spent` at its charge,
+or at its price when its settlement went unreported. A turn that does not fit fails the job with
+`budget`, one whose terms moved with `terms-changed`; an opening lookup, a compaction or a rating
+that does not fit is skipped. The rating pass runs before `spent` is final, and nothing is paid
+after: `spent` is the job's whole cost. The turn cap is the secondary rail for
 zero-price actions. The repeat guard (§6) catches the free-and-succeeding action both miss. Policy-
 layer retries (3×, exponential backoff) apply only to transport-level and retryable kernel errors
 (network, 5xx, 429) — never to `ErrInsufficientFunds`, schema violations, or aborts, and never to a
 `timeout`, which reports a dispatched call the kernel has parked and will settle. Every dispatch
 carries its own `external_key`, kept across its retries, so a retry after a lost reply is answered
-with the first run's outcome instead of running the action a second time. A
+with the first run's outcome instead of running the action a second time. A failure that reports a
+settlement (`tx_id` and `charge`) is not retried, since the call ran, and its charge is the one
+counted; after the last retry, the last attempt's settlement, if any, is counted. A
 single invalid model selection is fed back for self-correction; the run fails after `MaxDecideErrors`
 consecutive. Model-output errors (`execution_failed`, `schema_violation`) are not retried as
 transient.
@@ -624,7 +646,9 @@ truncates on relaunch), `config` (retired keys refused, naming the file; an affo
 the address and the field), `no_session` (the three
 startup refusals), `recovery`, `drain`, `tasks` (a task addressed to the agent is completed, its reply
 rides in the completion's arguments, the completion runs as the sender, and a task addressed to
-another stays waiting), `approval` (an unapproved sender's task is withheld and listed pending, and
+another stays waiting), `budget` (a reasoning action priced at 7 is paid each turn: `spent` is 7 and
+the agent's balance falls by 7; its owner then raises the price above the budget while the daemon
+runs, and the next job fails with `budget`, not `terms-changed`, paying nothing), `approval` (an unapproved sender's task is withheld and listed pending, and
 served once approved), `personas` (one file per sender, the second message in the first's file,
 another sender kept apart, attribution, and the log showing that a persona's first job loads nothing
 and its next loads the history), `threads` (tasks created by applications through an action's
