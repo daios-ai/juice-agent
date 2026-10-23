@@ -9,7 +9,9 @@ import (
 	"net/http/httptest"
 	"os"
 	"path/filepath"
+	"strconv"
 	"strings"
+	"syscall"
 	"testing"
 	"unicode/utf8"
 
@@ -209,4 +211,38 @@ func TestUsageFitsWidth(t *testing.T) {
 			}
 		}
 	}
+}
+
+// A serving daemon writes its process id into serve.lock and holds the lock for
+// as long as it serves: a second daemon for the login is refused while the first
+// serves, a reader cannot take the lock, and the lock is free once it stops.
+func TestHoldHomeWritesThePID(t *testing.T) {
+	home := t.TempDir()
+	release, err := holdHome(home, "agent@k")
+	if err != nil {
+		t.Fatal(err)
+	}
+	t.Cleanup(release) // a failed assertion below must not leave the home held
+	path := filepath.Join(home, "serve.lock")
+	got, err := os.ReadFile(path)
+	if err != nil || string(got) != strconv.Itoa(os.Getpid())+"\n" {
+		t.Fatalf("serve.lock holds %q, %v; want this process's id", got, err)
+	}
+	if _, err := holdHome(home, "agent@k"); err == nil || !strings.Contains(err.Error(), "already serving agent@k") {
+		t.Fatalf("a second daemon took the same home: %v", err)
+	}
+	f, err := os.Open(path)
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer f.Close()
+	if syscall.Flock(int(f.Fd()), syscall.LOCK_EX|syscall.LOCK_NB) == nil {
+		t.Fatal("a reader took the lock while the daemon holds it")
+	}
+	release()
+	again, err := holdHome(home, "agent@k")
+	if err != nil {
+		t.Fatalf("the lock is still held after release: %v", err)
+	}
+	again()
 }

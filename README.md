@@ -252,7 +252,12 @@ A successful outcome looks like:
 
 ## Operation and troubleshooting
 
-Run one `juice-agent serve <login>` process per agent. The daemon writes structured JSON logs to
+Run one `juice-agent serve <login>` process per agent. The daemon enforces this: while it serves,
+it holds `$JUICE_HOME/agents/<login>/serve.lock`, which contains its process ID, and a second
+`serve` of the same login exits with "another juice-agent is already serving <login>". The file
+remains after the daemon exits, so its process ID may be stale. A program that stops the daemon by
+that ID must first check that it cannot take the lock itself. Otherwise, stop the daemon with
+Ctrl-C or through its supervisor. The daemon writes structured JSON logs to
 stderr. On SIGTERM or SIGINT it stops taking new work and lets queued and running jobs finish.
 At startup, it marks interrupted jobs in the stored histories.
 
@@ -263,6 +268,7 @@ them when needed. It does not need the account's password in configuration.
 | --- | --- |
 | Kernel is not recorded | Run `juice kernel add <url>`. |
 | Session is missing or revoked | Run `juice auth login <login>`. |
+| "another juice-agent is already serving" | A daemon for that login is running. Stop it before starting another. |
 | Session belongs to another account | Log in to the intended account and restart the daemon. It will not adopt another account's session while running. |
 | Task is waiting | Check requester approval, the task's required caller, and the daemon's logs for execution or completion errors. |
 

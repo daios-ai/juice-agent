@@ -10,6 +10,7 @@ import (
 	"fmt"
 	"os"
 	"os/signal"
+	"path/filepath"
 	"strings"
 	"sync"
 	"syscall"
@@ -219,6 +220,14 @@ func runServe(args []string) error {
 		return err
 	}
 
+	// One daemon per home: a second would take the same tasks, append to the same
+	// persona files and mark the first one's running jobs interrupted.
+	release, err := holdHome(cfg.Home, args[0])
+	if err != nil {
+		return err
+	}
+	defer release()
+
 	if marked, err := Recover(cfg.PersonasDir); err == nil && len(marked) > 0 {
 		log.event("recovery", map[string]any{"interrupted": marked})
 	}
@@ -234,6 +243,31 @@ func runServe(args []string) error {
 	in.Shutdown()
 	log.event("stopped", nil)
 	return nil
+}
+
+// holdHome takes the agent home's lock, serve.lock, for as long as this process
+// serves it, as a kernel holds its own (ecosystem §3). It writes its process id
+// into the file so whatever supervises the daemon can signal it. The lock, not the
+// number, says whether a daemon is serving: the file outlives the process, the
+// lock does not, so a reader that can take the lock knows the number is stale.
+func holdHome(home, login string) (func(), error) {
+	path := filepath.Join(home, "serve.lock")
+	f, err := os.OpenFile(path, os.O_CREATE|os.O_RDWR, 0o600)
+	if err != nil {
+		return nil, err
+	}
+	if err := syscall.Flock(int(f.Fd()), syscall.LOCK_EX|syscall.LOCK_NB); err != nil {
+		f.Close()
+		return nil, fmt.Errorf("another juice-agent is already serving %s", login)
+	}
+	if err = f.Truncate(0); err == nil {
+		_, err = fmt.Fprintf(f, "%d\n", os.Getpid())
+	}
+	if err != nil {
+		f.Close()
+		return nil, fmt.Errorf("write %s: %w", path, err)
+	}
+	return func() { syscall.Flock(int(f.Fd()), syscall.LOCK_UN); f.Close() }, nil
 }
 
 // runTask runs one job as the login in args[0] with the prompt in args[1], in

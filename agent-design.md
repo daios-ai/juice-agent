@@ -4,7 +4,7 @@ Version: 0.1.2
 Status: design document
 Codename: `juice-agent`
 
-This document is aligned with `requirements.md` 0.5.0: all work arrives as kernel tasks, each task
+This document is aligned with `requirements.md` 0.6.0: all work arrives as kernel tasks, each task
 joins a persona keyed from the task alone (§6), the harness depends on two configured actions
 (reasoning and action lookup), and the channel layer, the maker and the learned memory file are gone.
 
@@ -319,7 +319,7 @@ definition — no platform registration, no artifact.
 An agent has one human-authored file, `agent.md`: persona, standing instructions and domain
 knowledge (pi's `AGENTS.md`). It is legible, read at every job start, never written by the agent, and
 the only state shared by all personas. The agent home is `$JUICE_HOME/agents/<login>/`, holding
-`agent.md`, an optional `config.json` and `personas/`, so a differently-behaved agent is a login and
+`agent.md`, an optional `config.json`, `personas/` and `serve.lock`, so a differently-behaved agent is a login and
 a directory, not new code.
 
 **System prompt.** Before each job the policy layer (not the pure loop) assembles one `system`
@@ -380,10 +380,13 @@ later polls without running the job again.
 `juice-agent serve <login>` runs continuously: resolve the agent home from the login → load config
 → open the login's session from the juice CLI's records and check that `GET /v1/me` answers as that
 login's account → assemble the harness tools (`reply`, `subtask`), which are plain-named and
-intercepted, never registered on the platform (§4) → run startup recovery over `personas/` → start
+intercepted, never registered on the platform (§4) → take the home's `serve.lock`, as a kernel
+holds its own (ecosystem §3), so a second daemon for the login is refused rather than taking the
+same tasks and writing the same persona files → run startup recovery over `personas/` → start
 intake and the worker pool. Each job reads `agent.md` into its system prompt and settles with the
 rating pass (§5b). `SIGTERM`/`SIGINT` drains as `juice kernel serve` does: stop intake, let in-flight
-jobs finish and complete their tasks, persist, exit. There is no `juice-agent stop`.
+jobs finish and complete their tasks, persist, exit. There is no `juice-agent stop`: a supervisor signals the pid in `serve.lock`, once
+it has failed to take the lock itself.
 
 The design follows the ecosystem standard rather than inventing a credential model. A login,
 `handle@kernel`, is what every juice-family program names; the juice CLI obtains its session and

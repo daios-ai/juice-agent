@@ -1,6 +1,6 @@
 # Juice Agent Requirements
 
-Version: 0.5.0
+Version: 0.6.0
 Status: implementation requirements
 Codename: `juice-agent`
 
@@ -11,6 +11,12 @@ contract `juicedocs/requirements.md` and the ecosystem standard `juicedocs/ecosy
 A requirement here must violate neither. Citations use the kernel's own labels: *kernel §N* for a
 section, *kernel D/P/G/U N* for a design decision, protocol clause, guarantee, or user story, and
 *ecosystem §N* for the standard.
+
+Revision 0.6.0 allows one daemon per agent. `serve` holds `serve.lock` in the agent's home under an
+exclusive `flock` for as long as it serves, with its process id in the file, as a kernel holds its
+own (ecosystem §3). A second `serve` of the login is refused before recovery, so two daemons can no
+longer take the same tasks, append to the same persona files, or mark each other's jobs
+interrupted (§11).
 
 Revision 0.5.0 makes the budget cover every call made for a job. The harness's own calls of the two
 affordances (each turn's reasoning, the opening lookup, compaction, rating) are priced like any
@@ -398,12 +404,13 @@ outcome as JSON; successive one-shot runs continue that persona.
 $JUICE_HOME/agents/<login>/        one agent, e.g. agents/research@work/
 ├── agent.md                       human-authored persona and knowledge (§9); never written by the daemon
 ├── config.json                    optional; never written by the daemon
+├── serve.lock                     held by the serving daemon under an exclusive flock; its pid
 └── personas/                      one append-only JSONL per persona (§7, §10)
 ```
 
 1. The root is `$JUICE_HOME` (default `~/.juice`); the home is fixed, never cwd-relative.
 2. The daemon `MkdirAll`s the home and its `personas/` (mode `0700`) at startup and writes a blank
-   `agent.md` if absent. It never truncates a file and never writes `config.json`: a written file
+   `agent.md` if absent. It never truncates a file but `serve.lock`, and never writes `config.json`: a written file
    would freeze the defaults of the version that wrote it.
 3. Files of earlier layouts (`persona.md`, `knowledge.md`, `memory.md`, `data/`) are not read; the
    README states the move.
@@ -424,9 +431,18 @@ second). A bare `juice-agent` prints usage, wrapped to stderr's width up to 80
 columns (80 when stderr is not a terminal); each command line stays whole, its description wrapped
 below it. Serving resolves the home from the login → creates the
 home and blank files if absent → loads config → opens the session and verifies the account (above)
-→ assembles the executor → runs startup recovery over `personas/` (mark interrupted jobs) → starts
+→ assembles the executor → takes the home's lock → runs startup recovery over `personas/` (mark interrupted jobs) → starts
 intake and the worker pool. Each job settles with the rating pass (§8). `SIGTERM`/`SIGINT` must drain: stop intake, let in-flight turns
-finish, persist, exit 0. There is no `juice-agent stop`. Harness tools are not registered on the
+finish, persist, exit 0. There is no `juice-agent stop`.
+
+**One daemon per home** (ecosystem §3, applied to an agent's home, §6). `serve` opens
+`serve.lock` in the home, takes an exclusive non-blocking `flock`, and writes its process id into
+it; the lock is held until the process exits, and the file is never removed. A second `serve` for
+the login is refused with "another juice-agent is already serving <login>" before recovery, so it
+neither takes the first one's tasks, nor appends to its persona files, nor marks its running jobs
+interrupted. The lock, not the number, says whether a daemon is serving: the file outlives the
+process, the lock does not, so a program that signals the pid must first fail to take the lock.
+`task` takes no lock: it polls no tasks, runs no recovery and writes only the `cli` persona. Harness tools are not registered on the
 platform, so startup performs no bootstrap round-trip for them.
 
 The installer (`make install`) writes only `$JUICE_HOME/bin/juice-agent`, where the family's
@@ -644,7 +660,9 @@ registered; restart), `init` (a first launch creates the home with a blank `agen
 `personas/`, none of the retired files and no `config.json`, serves without config, and never
 truncates on relaunch), `config` (retired keys refused, naming the file; an affordance of the wrong shape refused, naming the key,
 the address and the field), `no_session` (the three
-startup refusals), `recovery`, `drain`, `tasks` (a task addressed to the agent is completed, its reply
+startup refusals), `recovery`, `drain`, `lock` (the lock holds the daemon's pid; a second `serve`
+is refused, naming the login, and leaves the pid alone; SIGTERM to that pid drains the daemon; the
+lock is free once it exits), `tasks` (a task addressed to the agent is completed, its reply
 rides in the completion's arguments, the completion runs as the sender, and a task addressed to
 another stays waiting), `budget` (a reasoning action priced at 7 is paid each turn: `spent` is 7 and
 the agent's balance falls by 7; its owner then raises the price above the budget while the daemon

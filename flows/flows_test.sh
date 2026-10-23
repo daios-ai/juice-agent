@@ -142,6 +142,33 @@ flow_drain() {
     grep -q '"event":"stopped"' "$dir/agentd.log" && ok drain.logged_stopped || fail drain.logged_stopped "no stopped event"
 }
 
+flow_lock() {
+    echo "=== FLOW lock (one daemon per agent: serve.lock holds its pid under its flock) ==="
+    local dir; dir=$(new_dir)
+    start_kernel "$dir"; create_agent
+    start_agentd "$dir" || { fail lock.agentd "no daemon"; return; }
+    local lock; lock="$(agent_home)/serve.lock"
+    assert_eq lock.holds_pid "$AGENTD_PID" "$(cat "$lock" 2>/dev/null)"
+
+    local out rc
+    # Bounded, so a second daemon that is wrongly admitted fails the flow instead of hanging it.
+    out=$(JUICE_HOME="$(client_home agent)" timeout 10 "$AGENTD" serve "$(login agent)" 2>&1); rc=$?
+    assert_ne lock.second_refused 0 "$rc"
+    assert_contains lock.names_login "already serving $(login agent)" "$out"
+
+    # The refused daemon left the pid alone, so the pid in the lock is the serving daemon's.
+    [ "$(cat "$lock" 2>/dev/null)" = "$AGENTD_PID" ] && ok lock.pid_kept \
+        || { fail lock.pid_kept "the lock no longer holds $AGENTD_PID"; return; }
+    kill -TERM "$(cat "$lock")" 2>/dev/null
+    wait "$AGENTD_PID"; rc=$?
+    assert_eq lock.term_drains 0 "$rc"
+
+    JUICE_HOME="$(client_home agent)" "$AGENTD" serve "$(login agent)" >"$dir/agentd2.log" 2>&1 &
+    track_pid $!
+    wait_line "$dir/agentd2.log" '"event":"\(serving\)"' >/dev/null \
+        && ok lock.free_after_exit || fail lock.free_after_exit "$(cat "$dir/agentd2.log")"
+}
+
 flow_tasks() {
     echo "=== FLOW tasks (intake + completion mechanics) ==="
     local dir; dir=$(new_dir)
@@ -497,7 +524,7 @@ flow_thread_conversation() {
 }
 
 # Mechanism flows (deterministic assertions) run first; LLM flows (real Ollama) follow.
-ALL=(flow_bootstrap flow_init flow_config flow_no_session flow_recovery flow_drain flow_tasks flow_budget flow_approval
+ALL=(flow_bootstrap flow_init flow_config flow_no_session flow_recovery flow_drain flow_lock flow_tasks flow_budget flow_approval
      flow_personas flow_threads flow_named flow_session_identity flow_usage
      flow_answer flow_agent_md flow_rating flow_conversation flow_thread_conversation)
 
