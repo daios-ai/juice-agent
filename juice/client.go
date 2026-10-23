@@ -10,7 +10,7 @@
 //
 // The client holds no secret of its own. It acts as one login, handle@kernel,
 // read from the juice-family client records under $JUICE_HOME/client/ (ecosystem
-// standard §4): the kernel's endpoint from config.json, the session from
+// standard §5): the kernel's endpoint from config.json, the session from
 // credentials/<login>.json, which it rotates under that file's lock.
 package juice
 
@@ -122,7 +122,7 @@ func (c *Client) noSession() error {
 // Login is the client's login, handle@kernel.
 func (c *Client) Login() string { return c.login }
 
-// Principal is the account's recorded principal id (ecosystem standard §4).
+// Principal is the account's recorded principal id (ecosystem standard §5).
 func (c *Client) Principal() string { return c.principal }
 
 // readCredentials reads a credential file as a map, so a rewrite keeps every

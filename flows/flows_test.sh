@@ -58,7 +58,7 @@ flow_recovery() {
 }
 
 flow_init() {
-    echo "=== FLOW init (home under agents/<login>; blank agent.md; personas/; no config written) ==="
+    echo "=== FLOW init (home under agents/<login>; blank agent.md; personas/; config.json and its schema written) ==="
     local dir; dir=$(new_dir)
     start_kernel "$dir"; create_agent
     local home; home=$(agent_home)
@@ -72,13 +72,19 @@ flow_init() {
     local retired=""
     for f in persona.md knowledge.md memory.md data; do [ -e "$home/$f" ] && retired="$retired $f"; done
     [ -z "$retired" ] && ok init.no_retired_files || fail init.no_retired_files "the daemon created:$retired"
-    [ -e "$home/config.json" ] && fail init.no_config_written "the daemon wrote config.json" || ok init.no_config_written
-    # With no config at all, the daemon still takes tasks.
+    # First start writes every key, $schema first, the affordances the login's kernel's natives.
+    local keys; keys=$(python3 -c "import sys,json; print(' '.join(json.load(open(sys.argv[1]))))" "$home/config.json" 2>/dev/null)
+    assert_eq init.config_written '$schema reason action_lookup default_budget max_turns concurrency poll_seconds compact_bytes rate_tasks' "$keys"
+    assert_eq init.config_reason "sys@$(kname "$DB")/llm/chat" "$(jfield reason < "$home/config.json")"
+    [ -f "$(client_home agent)/schemas/juice-agent.schema.json" ] && ok init.schema_written || fail init.schema_written "no schema"
+    # With the file first start wrote, the daemon takes tasks.
     local tid; tid=$(message agent "no config")
-    assert_eq init.serves_without_config done "$(await_task "$tid" 120)"
+    assert_eq init.serves_with_written_config done "$(await_task "$tid" 120)"
 
-    # An operator edit must survive a restart (init never truncates).
+    # An operator edit must survive a restart (init never truncates). A partial config.json, as a
+    # hand or an older release writes it, gets exactly the keys first start creates written in.
     printf 'INIT-MARKER-9Z\n' > "$home/agent.md"
+    echo '{ "max_turns": 7 }' > "$home/config.json"
     kill -9 "$pid" 2>/dev/null; wait "$pid" 2>/dev/null
     JUICE_HOME="$(client_home agent)" "$AGENTD" serve "$(login agent)" >"$dir/agentd2.log" 2>&1 &
     track_pid $!
@@ -86,6 +92,9 @@ flow_init() {
     grep -q 'INIT-MARKER-9Z' "$home/agent.md" \
         && ok init.non_truncating \
         || fail init.non_truncating "agent.md truncated on restart"
+    keys=$(python3 -c "import sys,json; print(' '.join(json.load(open(sys.argv[1]))))" "$home/config.json" 2>/dev/null)
+    assert_eq init.partial_config_completed '$schema action_lookup max_turns reason' "$keys"
+    assert_eq init.operator_value_kept 7 "$(jfield max_turns < "$home/config.json")"
 }
 
 flow_config() {
@@ -202,7 +211,7 @@ flow_budget() {
     local dir; dir=$(new_dir)
     start_kernel "$dir"; create_agent; create_user alice alice-pass
     # alice's reasoning action answers every turn with the reply, at 7 base units.
-    local reason; reason=$(replying_reason alice 7)
+    replying_reason alice 7; local reason="$REASON"
     assert_nonempty budget.reason "$reason"
     start_agentd "$dir" "\"reason\": \"$reason\"" || { fail budget.agentd "no daemon"; return; }
     local before after tid spent

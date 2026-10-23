@@ -91,19 +91,25 @@ Each agent has a directory named after its login under `$JUICE_HOME/agents/`:
 ```text
 ~/.juice/agents/agent@work/
 ├── agent.md       # your instructions and background knowledge
-├── config.json    # optional configuration
+├── config.json    # configuration, written at first launch
 └── personas/      # conversation histories
 ```
 
-On first launch, the daemon creates the directory, a blank `agent.md`, and `personas/`.
-It preserves existing files and does not create `config.json`. Edit `agent.md` to describe the
-agent's role, instructions, and relevant background. Changes take effect at the next job.
+On first launch, the daemon creates the directory, a blank `agent.md`, `personas/`, and
+`config.json` with every setting at its default. It preserves existing files. Edit `agent.md` to
+describe the agent's role, instructions, and relevant background. Changes take effect at the next
+job.
 
-Configuration is optional. Omitted keys use their defaults; unknown keys or invalid JSON prevent
-startup. The following shows all defaults for an account on `work`:
+At every start the daemon also writes `$JUICE_HOME/schemas/juice-agent.schema.json`, which describes
+every setting and its default. The `$schema` key at the top of `config.json` points to it, so an
+editor that supports JSON Schema completes and checks the keys as you type. A key you remove takes
+its default. Unknown keys (key names are case-sensitive), `null` values, values of the wrong type,
+and invalid JSON prevent startup, and the error names the key. The file written for an account on
+`work` is:
 
 ```json
 {
+  "$schema": "../../schemas/juice-agent.schema.json",
   "reason": "sys@work/llm/chat",
   "action_lookup": "sys@work/lookup",
   "default_budget": 100,
@@ -126,8 +132,9 @@ startup. The following shows all defaults for an account on `work`:
 | `compact_bytes` | Conversation size in bytes that triggers summarisation of older turns. |
 | `rate_tasks` | Whether to rate tool calls after each job. |
 
-The default `reason` and `action_lookup` addresses use the account's kernel name. Other tools are
-found during execution.
+`reason` and `action_lookup` have no default: the first launch writes the kernel's own actions for
+the account's kernel, and if the file lacks either key, or `$schema`, the daemon adds it at startup,
+leaving every other setting as you wrote it. Other tools are found during execution.
 
 ### Replacing `reason` or `action_lookup`
 
@@ -275,6 +282,13 @@ them when needed. It does not need the account's password in configuration.
 Logs include job, persona, action, and transaction identifiers where applicable. The `persona_opened`
 event reports how much earlier history a job loaded. Conversation files under `personas/` retain
 the local record; `juice tx list --as <login>` shows the kernel's record of calls, charges, and ratings.
+
+## Upgrading from 0.6
+
+At its first start, the new version writes `$schema`, `reason`, and `action_lookup` into an existing
+`config.json` that lacks them, using the kernel's own actions, and leaves your other settings as
+they are. A `null` value or a key written in a different case, such as `MAX_TURNS`, was accepted
+before and now prevents startup; correct it to the key's exact name or remove it.
 
 ## Upgrading from 0.3
 

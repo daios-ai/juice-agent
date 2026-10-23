@@ -73,7 +73,7 @@ const usageNote = "A login is an account on a kernel, handle@kernel, held by the
 	"  juice kernel add <url>\n" +
 	"  juice auth login <handle>@<kernel>\n\n" +
 	"The agent's home is $JUICE_HOME/agents/<login>/ (JUICE_HOME default ~/.juice), holding " +
-	"agent.md, an optional config.json, and personas/."
+	"agent.md, config.json, and personas/."
 
 func usage() { fmt.Fprint(os.Stderr, usageText(helpWidth(term.GetSize))) }
 
@@ -141,9 +141,6 @@ func setup(ctx context.Context, log *logger, login string) (*Executor, *juice.Cl
 	cfg, err := ResolveConfig(login)
 	if err != nil {
 		return nil, nil, cfg, fmt.Errorf("config: %w", err)
-	}
-	if err := cfg.EnsureHome(); err != nil {
-		return nil, nil, cfg, fmt.Errorf("ensure home %s: %w", cfg.Home, err)
 	}
 	cl, err := juice.New(login, juiceHome(), cfg.Reason, cfg.ActionLookup)
 	if err != nil {
@@ -246,7 +243,7 @@ func runServe(args []string) error {
 }
 
 // holdHome takes the agent home's lock, serve.lock, for as long as this process
-// serves it, as a kernel holds its own (ecosystem §3). It writes its process id
+// serves it, as a kernel holds its own (ecosystem §4). It writes its process id
 // into the file so whatever supervises the daemon can signal it. The lock, not the
 // number, says whether a daemon is serving: the file outlives the process, the
 // lock does not, so a reader that can take the lock knows the number is stale.

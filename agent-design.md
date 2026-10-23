@@ -4,7 +4,7 @@ Version: 0.1.2
 Status: design document
 Codename: `juice-agent`
 
-This document is aligned with `requirements.md` 0.6.0: all work arrives as kernel tasks, each task
+This document is aligned with `requirements.md` 0.7.0: all work arrives as kernel tasks, each task
 joins a persona keyed from the task alone (§6), the harness depends on two configured actions
 (reasoning and action lookup), and the channel layer, the maker and the learned memory file are gone.
 
@@ -319,7 +319,7 @@ definition — no platform registration, no artifact.
 An agent has one human-authored file, `agent.md`: persona, standing instructions and domain
 knowledge (pi's `AGENTS.md`). It is legible, read at every job start, never written by the agent, and
 the only state shared by all personas. The agent home is `$JUICE_HOME/agents/<login>/`, holding
-`agent.md`, an optional `config.json`, `personas/` and `serve.lock`, so a differently-behaved agent is a login and
+`agent.md`, `config.json`, `personas/` and `serve.lock`, so a differently-behaved agent is a login and
 a directory, not new code.
 
 **System prompt.** Before each job the policy layer (not the pure loop) assembles one `system`
@@ -377,11 +377,12 @@ later polls without running the job again.
 
 ## 7. Daemon lifecycle and configuration
 
-`juice-agent serve <login>` runs continuously: resolve the agent home from the login → load config
+`juice-agent serve <login>` runs continuously: resolve the agent home from the login → write the config schema and, when
+absent, `config.json` → load config
 → open the login's session from the juice CLI's records and check that `GET /v1/me` answers as that
 login's account → assemble the harness tools (`reply`, `subtask`), which are plain-named and
 intercepted, never registered on the platform (§4) → take the home's `serve.lock`, as a kernel
-holds its own (ecosystem §3), so a second daemon for the login is refused rather than taking the
+holds its own (ecosystem §4), so a second daemon for the login is refused rather than taking the
 same tasks and writing the same persona files → run startup recovery over `personas/` → start
 intake and the worker pool. Each job reads `agent.md` into its system prompt and settles with the
 rating pass (§5b). `SIGTERM`/`SIGINT` drains as `juice kernel serve` does: stop intake, let in-flight
@@ -395,11 +396,17 @@ under the same lock the CLI uses. The daemon therefore holds no password, offers
 prompt, and needs no terminal library. An agent's home is `$JUICE_HOME/agents/<login>/`, so its
 `agent.md` and personas survive any kernel.
 
-Config is an optional `<home>/config.json` — kernel-style: flat keys, safe defaults, an unknown key
-rejected at startup, no secrets. The daemon never writes it, so defaults change with the binary:
+Config is `<home>/config.json`, configured as every component is (ecosystem §3): flat keys, one
+default value in the program from which `schemas/juice-agent.schema.json` is generated at every
+start, the file laid over the defaults, an unknown key, a `null` or a wrong type refused at startup,
+no secrets. First start writes the file whole, so every setting is visible; a later release's new
+default reaches a file only where the key is absent. `reason` and `action_lookup` have no default,
+since theirs would name the login's kernel; first start writes them, and a file lacking them, or
+`$schema`, gets exactly those written in:
 
 ```json
 {
+  "$schema": "../../schemas/juice-agent.schema.json",
   "reason": "sys@<kernel>/llm/chat",
   "action_lookup": "sys@<kernel>/lookup",
   "default_budget": 100,

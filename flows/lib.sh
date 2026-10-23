@@ -176,13 +176,14 @@ chat_action() {
 dead_reason() { chat_action agent dead-chat "http://127.0.0.1:1/" 0; }
 
 # replying_reason handle price — handle's reasoning action at price base units
-# whose every reply selects the reply tool with the answer "done"; echo its
-# address. A job reasoning through it takes exactly one paid turn. The backend's
-# output goes to /dev/null, so a $(...) around this call does not wait on it.
+# whose every reply selects the reply tool with the answer "done"; sets REASON to
+# its address. A job reasoning through it takes exactly one paid turn. It sets a
+# variable rather than echoing, so the backend starts in the flow's own shell,
+# where the harness records it and stops it with the flow.
 replying_reason() {
     local port; port=$(backend_port)
     start_backend "$port" 200 '{"choices":[{"message":{"content":"{\"action\":\"reply\",\"args\":{\"answer\":\"done\"}}"}}]}' >/dev/null
-    chat_action "$1" chat "http://127.0.0.1:$port/" "$2"
+    REASON=$(chat_action "$1" chat "http://127.0.0.1:$port/" "$2")
 }
 
 # completion_of id field — a field of the args task id was completed with, read

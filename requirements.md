@@ -1,6 +1,6 @@
 # Juice Agent Requirements
 
-Version: 0.6.0
+Version: 0.7.0
 Status: implementation requirements
 Codename: `juice-agent`
 
@@ -12,9 +12,16 @@ A requirement here must violate neither. Citations use the kernel's own labels: 
 section, *kernel D/P/G/U N* for a design decision, protocol clause, guarantee, or user story, and
 *ecosystem §N* for the standard.
 
+Revision 0.7.0 follows the ecosystem standard's configuration rule (ecosystem §3) and its new
+section numbers. Every start writes `config.json`'s JSON Schema, generated from the one default value
+in the program; first start writes the file whole, `$schema` first; `reason` and `action_lookup`
+have no default, since theirs names the login's kernel, and are written into a file that lacks them.
+A `null`, a key not named exactly, or a value of the wrong type stops the start, naming the key, and
+a refused file is never rewritten (§11).
+
 Revision 0.6.0 allows one daemon per agent. `serve` holds `serve.lock` in the agent's home under an
 exclusive `flock` for as long as it serves, with its process id in the file, as a kernel holds its
-own (ecosystem §3). A second `serve` of the login is refused before recovery, so two daemons can no
+own (ecosystem §4). A second `serve` of the login is refused before recovery, so two daemons can no
 longer take the same tasks, append to the same persona files, or mark each other's jobs
 interrupted (§11).
 
@@ -43,7 +50,7 @@ suspended call is a *task* (kernel D6); the agent's own unit of work is therefor
 action's terms and its `evidence` (kernel D20, never summed or scored, U39) come from an
 authoritative read, and the `quote_hash` from that read pins the terms on dispatch. The agent is
 named by its login and holds no secret: it reads the kernel's address and its session from the juice
-CLI's client records (ecosystem §4) and lives at `$JUICE_HOME/agents/<login>/` (ecosystem §2, §6).
+CLI's client records (ecosystem §5) and lives at `$JUICE_HOME/agents/<login>/` (ecosystem §2, §7).
 
 ## 1. Purpose and position
 
@@ -75,7 +82,7 @@ sender can read.
 
 `juice-agent` is therefore a Go daemon implementing a general task-solving agent whose entire
 capability surface is a Juice kernel's action catalog. It is an ordinary kernel client: it
-acts as one login, `handle@kernel` (ecosystem §4), and derives every agent affordance from that one
+acts as one login, `handle@kernel` (ecosystem §5), and derives every agent affordance from that one
 fact — reasoning and discovery from two configured actions (by default the `llm/chat` and `lookup`
 natives), tools from the actions callable under `CanCall` (kernel D5), dispatch from `POST /v1/run`,
 budget from its wallet, address from its login, and accountability from the transaction role law
@@ -300,7 +307,7 @@ state shared by all personas. The agent writes no cross-persona memory: what it 
 conversation never reaches another (§10).
 
 `agent.md` is a fixed filename in the **agent home**, `$JUICE_HOME/agents/<login>/` (ecosystem §2,
-§6), which also holds the optional `config.json` and `personas/`. `juice-agent serve research@work`
+§7), which also holds `config.json` and `personas/`. `juice-agent serve research@work`
 resolves this home, so a differently-behaved agent is a login and a directory, not new code.
 
 **Initialization.** The first time an agent is launched, the daemon creates its home (§11) and writes
@@ -375,7 +382,7 @@ outcome as JSON; successive one-shot runs continue that persona.
 
 ## 11. Daemon lifecycle and configuration
 
-### Identity and session (ecosystem §4, §5)
+### Identity and session (ecosystem §5, §6)
 
 1. The agent is named by its **login**, `handle@kernel`, the one positional argument after the verb.
    Both halves are local names (letters, digits, dot, dash, underscore; at most 64 characters; no
@@ -403,25 +410,37 @@ outcome as JSON; successive one-shot runs continue that persona.
 ```text
 $JUICE_HOME/agents/<login>/        one agent, e.g. agents/research@work/
 ├── agent.md                       human-authored persona and knowledge (§9); never written by the daemon
-├── config.json                    optional; never written by the daemon
+├── config.json                    written whole at first start (ecosystem §3); then the operator's
 ├── serve.lock                     held by the serving daemon under an exclusive flock; its pid
 └── personas/                      one append-only JSONL per persona (§7, §10)
+$JUICE_HOME/schemas/juice-agent.schema.json   config.json's JSON Schema, rewritten at every start
 ```
 
 1. The root is `$JUICE_HOME` (default `~/.juice`); the home is fixed, never cwd-relative.
 2. The daemon `MkdirAll`s the home and its `personas/` (mode `0700`) at startup and writes a blank
-   `agent.md` if absent. It never truncates a file but `serve.lock`, and never writes `config.json`: a written file
-   would freeze the defaults of the version that wrote it.
+   `agent.md` if absent. It never truncates a file but `serve.lock`, and writes `config.json` only
+   as the next section says.
 3. Files of earlier layouts (`persona.md`, `knowledge.md`, `memory.md`, `data/`) are not read; the
    README states the move.
 4. **Intake always runs.** A non-positive `poll_seconds` or `concurrency` falls back to its default.
 
 ### Config
 
-`config.json` is optional and every key is optional; a key it omits keeps its default. An unknown
-key or malformed JSON is an error at startup, so a retired key (`channels`, `memory_bytes`, `maker`,
-`max_repeats`, `candidate_limit`, `lookup_limit`) cannot be silently ignored. **No secrets live in config.** The only environment
-input is `JUICE_HOME`.
+`config.json` follows ecosystem §3. Every start, `serve` and `task` alike, writes the file's JSON
+Schema to `$JUICE_HOME/schemas/juice-agent.schema.json`, generated from the one default value in the
+program: every key described, each stating its default but `reason` and `action_lookup`. Those two
+name the login's kernel, which one schema for every agent cannot state, so they have no default and
+first start creates them. First start writes the whole file, `$schema` first
+(`../../schemas/juice-agent.schema.json`), every other key at its default and the two affordances
+as the natives of the login's kernel. A file that lacks `$schema`, `reason` or `action_lookup` — one
+written before this rule, by hand or by an interface — gets exactly those keys written in at start,
+every other key kept and no default added; the file is otherwise never written. The file is laid
+over the defaults: a key it omits keeps its default, and since every key is flat, decoding onto the
+defaults is the standard's merge. A key the schema does not name (matched exactly, so `MAX_TURNS` is
+not `max_turns`), a `null`, a value of the wrong type, an empty affordance or malformed JSON stops
+the start, naming the key, so a retired key (`channels`, `memory_bytes`, `maker`, `max_repeats`,
+`candidate_limit`, `lookup_limit`) cannot be silently ignored. **No secrets live in config.** The
+only environment input is `JUICE_HOME`.
 
 ### Lifecycle
 
@@ -430,20 +449,21 @@ positional after it (`task` and `bench` take it as their first positional, the p
 second). A bare `juice-agent` prints usage, wrapped to stderr's width up to 80
 columns (80 when stderr is not a terminal); each command line stays whole, its description wrapped
 below it. Serving resolves the home from the login → creates the
-home and blank files if absent → loads config → opens the session and verifies the account (above)
+home and blank files if absent → writes the schema and, when absent, `config.json` or its created
+keys → loads config → opens the session and verifies the account (above)
 → assembles the executor → takes the home's lock → runs startup recovery over `personas/` (mark interrupted jobs) → starts
 intake and the worker pool. Each job settles with the rating pass (§8). `SIGTERM`/`SIGINT` must drain: stop intake, let in-flight turns
-finish, persist, exit 0. There is no `juice-agent stop`.
+finish, persist, exit 0. There is no `juice-agent stop`. Harness tools are not registered on the
+platform, so startup performs no bootstrap round-trip for them.
 
-**One daemon per home** (ecosystem §3, applied to an agent's home, §6). `serve` opens
+**One daemon per home** (ecosystem §4, applied to an agent's home, §7). `serve` opens
 `serve.lock` in the home, takes an exclusive non-blocking `flock`, and writes its process id into
 it; the lock is held until the process exits, and the file is never removed. A second `serve` for
 the login is refused with "another juice-agent is already serving <login>" before recovery, so it
 neither takes the first one's tasks, nor appends to its persona files, nor marks its running jobs
 interrupted. The lock, not the number, says whether a daemon is serving: the file outlives the
 process, the lock does not, so a program that signals the pid must first fail to take the lock.
-`task` takes no lock: it polls no tasks, runs no recovery and writes only the `cli` persona. Harness tools are not registered on the
-platform, so startup performs no bootstrap round-trip for them.
+`task` takes no lock: it polls no tasks, runs no recovery and writes only the `cli` persona.
 
 The installer (`make install`) writes only `$JUICE_HOME/bin/juice-agent`, where the family's
 executables live (ecosystem §2); `make uninstall` removes the binary only.
@@ -452,8 +472,8 @@ executables live (ecosystem §2); `make uninstall` removes the binary only.
 
 | Key              | Default                  | Meaning                                                                  |
 | ---------------- | ------------------------ | ------------------------------------------------------------------------ |
-| `reason`         | `sys@<kernel>/llm/chat`  | the reasoning affordance: any action meeting the reason contract         |
-| `action_lookup`  | `sys@<kernel>/lookup`    | the action-lookup affordance: any action meeting its contract            |
+| `reason`         | none; first start writes `sys@<kernel>/llm/chat` | the reasoning affordance: any action meeting the reason contract         |
+| `action_lookup`  | none; first start writes `sys@<kernel>/lookup` | the action-lookup affordance: any action meeting its contract            |
 | `default_budget` | `100`                    | base units a job may spend — the primary runaway rail                    |
 | `max_turns`      | `32`                     | secondary rail bounding zero-price loops                                 |
 | `concurrency`    | `4`                      | worker-pool size: personas served at once                                |
@@ -657,8 +677,10 @@ kernel ships with** (no fake model). Each account is created, funded and logged 
 CLI, and the daemon runs as that login over the CLI's records; the agent's operator approves the
 senders a flow uses. Mechanism flows make deterministic assertions: `bootstrap` (no harness tool is
 registered; restart), `init` (a first launch creates the home with a blank `agent.md` and
-`personas/`, none of the retired files and no `config.json`, serves without config, and never
-truncates on relaunch), `config` (retired keys refused, naming the file; an affordance of the wrong shape refused, naming the key,
+`personas/` and none of the retired files, writes `config.json` with every key, `$schema` first and
+the kernel's natives as the affordances, and the schema; it serves, never truncates on relaunch,
+and a partial `config.json` gets exactly `$schema`, `reason` and `action_lookup` written in, the
+operator's value kept), `config` (retired keys refused, naming the file; an affordance of the wrong shape refused, naming the key,
 the address and the field), `no_session` (the three
 startup refusals), `recovery`, `drain`, `lock` (the lock holds the daemon's pid; a second `serve`
 is refused, naming the login, and leaves the pid alone; SIGTERM to that pid drains the daemon; the
