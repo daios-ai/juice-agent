@@ -46,6 +46,12 @@ func main() {
 		err = runTask(rest)
 	case "bench":
 		err = runBench(rest)
+	case "setup": // the installer's, so absent from usage (ecosystem §3)
+		if len(rest) != 0 {
+			err = fmt.Errorf("usage: juice-agent setup")
+		} else {
+			_, err = writeSchema()
+		}
 	case "version", "--version", "-v":
 		fmt.Printf("juice-agent %s (%s)\n", version, commit)
 		return

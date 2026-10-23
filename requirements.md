@@ -1,6 +1,6 @@
 # Juice Agent Requirements
 
-Version: 0.7.0
+Version: 0.8.0
 Status: implementation requirements
 Codename: `juice-agent`
 
@@ -11,6 +11,10 @@ contract `juicedocs/requirements.md` and the ecosystem standard `juicedocs/ecosy
 A requirement here must violate neither. Citations use the kernel's own labels: *kernel §N* for a
 section, *kernel D/P/G/U N* for a design decision, protocol clause, guarantee, or user story, and
 *ecosystem §N* for the standard.
+
+Revision 0.8.0 adds the standard's `setup` command (ecosystem §3): `juice-agent setup`, hidden
+from usage, writes the schema; `make install` runs it after placing the binary, and every start runs
+it (§11).
 
 Revision 0.7.0 follows the ecosystem standard's configuration rule (ecosystem §3) and its new
 section numbers. Every start writes `config.json`'s JSON Schema, generated from the one default value
@@ -413,7 +417,7 @@ $JUICE_HOME/agents/<login>/        one agent, e.g. agents/research@work/
 ├── config.json                    written whole at first start (ecosystem §3); then the operator's
 ├── serve.lock                     held by the serving daemon under an exclusive flock; its pid
 └── personas/                      one append-only JSONL per persona (§7, §10)
-$JUICE_HOME/schemas/juice-agent.schema.json   config.json's JSON Schema, rewritten at every start
+$JUICE_HOME/schemas/juice-agent.schema.json   config.json's JSON Schema, rewritten by setup
 ```
 
 1. The root is `$JUICE_HOME` (default `~/.juice`); the home is fixed, never cwd-relative.
@@ -426,8 +430,8 @@ $JUICE_HOME/schemas/juice-agent.schema.json   config.json's JSON Schema, rewritt
 
 ### Config
 
-`config.json` follows ecosystem §3. Every start, `serve` and `task` alike, writes the file's JSON
-Schema to `$JUICE_HOME/schemas/juice-agent.schema.json`, generated from the one default value in the
+`config.json` follows ecosystem §3. Setup writes the file's JSON Schema to
+`$JUICE_HOME/schemas/juice-agent.schema.json`, generated from the one default value in the
 program: every key described, each stating its default but `reason` and `action_lookup`. Those two
 name the login's kernel, which one schema for every agent cannot state, so they have no default and
 first start creates them. First start writes the whole file, `$schema` first
@@ -449,7 +453,7 @@ positional after it (`task` and `bench` take it as their first positional, the p
 second). A bare `juice-agent` prints usage, wrapped to stderr's width up to 80
 columns (80 when stderr is not a terminal); each command line stays whole, its description wrapped
 below it. Serving resolves the home from the login → creates the
-home and blank files if absent → writes the schema and, when absent, `config.json` or its created
+home and blank files if absent → runs setup (writes the schema) and, when absent, `config.json` or its created
 keys → loads config → opens the session and verifies the account (above)
 → assembles the executor → takes the home's lock → runs startup recovery over `personas/` (mark interrupted jobs) → starts
 intake and the worker pool. Each job settles with the rating pass (§8). `SIGTERM`/`SIGINT` must drain: stop intake, let in-flight turns
@@ -465,8 +469,12 @@ interrupted. The lock, not the number, says whether a daemon is serving: the fil
 process, the lock does not, so a program that signals the pid must first fail to take the lock.
 `task` takes no lock: it polls no tasks, runs no recovery and writes only the `cli` persona.
 
-The installer (`make install`) writes only `$JUICE_HOME/bin/juice-agent`, where the family's
-executables live (ecosystem §2); `make uninstall` removes the binary only.
+**Setup** (ecosystem §3). `juice-agent setup`, absent from usage and taking no argument, writes the
+schema and nothing else: juice-agent ships no defaults, and an agent's home and its `config.json`
+are first start's. The installer (`make install`) writes `$JUICE_HOME/bin/juice-agent`, where the
+family's executables live (ecosystem §2), and then runs `juice-agent setup`, so `schemas/` holds the
+installed binary's schema before any agent starts; `serve` and `task` run it at every start.
+`make uninstall` removes the binary only.
 
 ### Config keys
 
@@ -676,7 +684,8 @@ and task listing with `requester` and completion. Every production file has its 
 kernel ships with** (no fake model). Each account is created, funded and logged in with the juice
 CLI, and the daemon runs as that login over the CLI's records; the agent's operator approves the
 senders a flow uses. Mechanism flows make deterministic assertions: `bootstrap` (no harness tool is
-registered; restart), `init` (a first launch creates the home with a blank `agent.md` and
+registered; restart), `init` (`setup` writes only the schema into a fresh installation and is
+absent from usage; a first launch creates the home with a blank `agent.md` and
 `personas/` and none of the retired files, writes `config.json` with every key, `$schema` first and
 the kernel's natives as the affordances, and the schema; it serves, never truncates on relaunch,
 and a partial `config.json` gets exactly `$schema`, `reason` and `action_lookup` written in, the

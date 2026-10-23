@@ -88,20 +88,16 @@ func ResolveConfig(login string) (Config, error) {
 	if err := cfg.EnsureHome(); err != nil {
 		return cfg, fmt.Errorf("ensure home %s: %w", cfg.Home, err)
 	}
-	schema, err := configSchema()
+	schema, err := writeSchema()
 	if err != nil {
 		return cfg, err
-	}
-	b, _ := json.MarshalIndent(schema, "", "  ")
-	if err := writeFile(filepath.Join(juiceHome(), "schemas", "juice-agent.schema.json"), append(b, '\n'), true); err != nil {
-		return cfg, fmt.Errorf("schema: %w", err)
 	}
 
 	path := filepath.Join(cfg.Home, "config.json")
 	created := map[string]string{"$schema": def.Schema, "reason": "sys@" + kernel + "/llm/chat", "action_lookup": "sys@" + kernel + "/lookup"}
 	first := def
 	first.Reason, first.ActionLookup = created["reason"], created["action_lookup"]
-	b, _ = json.MarshalIndent(first, "", "  ")
+	b, _ := json.MarshalIndent(first, "", "  ")
 	if err := writeFile(path, append(b, '\n'), false); err != nil {
 		return cfg, err
 	}
@@ -152,6 +148,21 @@ func ResolveConfig(login string) (Config, error) {
 		cfg.Concurrency = def.Concurrency
 	}
 	return cfg, nil
+}
+
+// writeSchema writes config.json's JSON Schema to $JUICE_HOME/schemas/, every time,
+// since it describes this binary (ecosystem §3). It is all setup writes: juice-agent
+// ships no defaults, and an agent's home is first start's.
+func writeSchema() (map[string]any, error) {
+	schema, err := configSchema()
+	if err != nil {
+		return nil, err
+	}
+	b, _ := json.MarshalIndent(schema, "", "  ")
+	if err := writeFile(filepath.Join(juiceHome(), "schemas", "juice-agent.schema.json"), append(b, '\n'), true); err != nil {
+		return nil, fmt.Errorf("schema: %w", err)
+	}
+	return schema, nil
 }
 
 // configSchema describes config.json as a JSON Schema in the kernel's subset (kernel

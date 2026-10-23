@@ -30,11 +30,13 @@ bench: build
 clean:
 	rm -f $(BINARY)
 
-# The juice family's executables live in $JUICE_HOME/bin (ecosystem standard §2).
+# The juice family's executables live in $JUICE_HOME/bin (ecosystem standard §2);
+# setup then writes the binary's schema into $JUICE_HOME/schemas (§3).
 install: build
-	mkdir -p $(JUICE_HOME)/bin
-	install -m 755 $(BINARY) $(JUICE_HOME)/bin/$(BINARY)
+	mkdir -p "$(JUICE_HOME)/bin"
+	install -m 755 $(BINARY) "$(JUICE_HOME)/bin/$(BINARY)"
+	JUICE_HOME="$(JUICE_HOME)" "$(JUICE_HOME)/bin/$(BINARY)" setup
 
 # Removes the installed binary only; agent homes are left intact.
 uninstall:
-	rm -f $(JUICE_HOME)/bin/$(BINARY)
+	rm -f "$(JUICE_HOME)/bin/$(BINARY)"

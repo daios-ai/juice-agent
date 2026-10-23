@@ -60,6 +60,14 @@ flow_recovery() {
 flow_init() {
     echo "=== FLOW init (home under agents/<login>; blank agent.md; personas/; config.json and its schema written) ==="
     local dir; dir=$(new_dir)
+    # Setup, which the installer runs, writes the schema into a fresh installation and nothing
+    # else; usage does not list it.
+    local fresh="$dir/fresh"
+    JUICE_HOME="$fresh" "$AGENTD" setup \
+        && assert_eq init.setup_writes_schema "$fresh/schemas/juice-agent.schema.json" "$(find "$fresh" -type f)" \
+        || fail init.setup_writes_schema "setup failed"
+    "$AGENTD" 2>&1 | grep -q setup && fail init.setup_hidden "usage lists setup" || ok init.setup_hidden
+
     start_kernel "$dir"; create_agent
     local home; home=$(agent_home)
 

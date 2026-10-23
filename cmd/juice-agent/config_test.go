@@ -59,6 +59,33 @@ func TestFirstStartWritesEveryKey(t *testing.T) {
 	}
 }
 
+// Setup writes the schema and nothing else: no agent home, since that is first
+// start's, and the same bytes a start writes.
+func TestSetupWritesOnlyTheSchema(t *testing.T) {
+	root := setJuiceHome(t)
+	if _, err := writeSchema(); err != nil {
+		t.Fatal(err)
+	}
+	var files []string
+	filepath.WalkDir(root, func(p string, d os.DirEntry, _ error) error {
+		if !d.IsDir() {
+			files = append(files, p)
+		}
+		return nil
+	})
+	path := filepath.Join(root, "schemas", "juice-agent.schema.json")
+	if len(files) != 1 || files[0] != path {
+		t.Fatalf("setup wrote %v, want only %s", files, path)
+	}
+	setup, _ := os.ReadFile(path)
+	if _, err := ResolveConfig("a@k"); err != nil {
+		t.Fatal(err)
+	}
+	if start, _ := os.ReadFile(path); string(start) != string(setup) {
+		t.Fatalf("start wrote %s, setup %s", start, setup)
+	}
+}
+
 // The schema is generated from the defaults: every setting described and, but for
 // the two affordances first start creates, stating its default.
 func TestTheSchemaStatesEveryDefault(t *testing.T) {

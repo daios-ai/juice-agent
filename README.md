@@ -22,7 +22,8 @@ and write its instructions in `agent.md`.
 make install
 ```
 
-This builds the executable and installs it in `$JUICE_HOME/bin`, defaulting to `~/.juice/bin`.
+This builds the executable, installs it in `$JUICE_HOME/bin`, defaulting to `~/.juice/bin`, and
+writes its configuration schema to `$JUICE_HOME/schemas/juice-agent.schema.json`.
 Add that directory to your `PATH` if necessary. To build without installing, run `make build`;
 the executable is written to `./juice-agent`.
 
@@ -100,7 +101,7 @@ On first launch, the daemon creates the directory, a blank `agent.md`, `personas
 describe the agent's role, instructions, and relevant background. Changes take effect at the next
 job.
 
-At every start the daemon also writes `$JUICE_HOME/schemas/juice-agent.schema.json`, which describes
+Installation and every start write `$JUICE_HOME/schemas/juice-agent.schema.json`, which describes
 every setting and its default. The `$schema` key at the top of `config.json` points to it, so an
 editor that supports JSON Schema completes and checks the keys as you type. A key you remove takes
 its default. Unknown keys (key names are case-sensitive), `null` values, values of the wrong type,
