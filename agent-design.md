@@ -4,7 +4,7 @@ Version: 0.1.2
 Status: design document
 Codename: `juice-agent`
 
-This document is aligned with `requirements.md` 0.8.0: all work arrives as kernel tasks, each task
+This document is aligned with `requirements.md` 0.9.0: all work arrives as kernel tasks, each task
 joins a persona keyed from the task alone (§6), the harness depends on two configured actions
 (reasoning and action lookup), and the channel layer, the maker and the learned memory file are gone.
 
@@ -216,9 +216,9 @@ daemon *is* unattended, so it takes both rails — but the primary one is econom
 2. **Turn cap (secondary, default 32).** Required because zero-price actions (lookup,
    a model priced at 0, refused selections) escape the money rail. A configurable hard cap; hitting
    it fails the task honestly with `reason = turn-cap`.
-3. **Repeat guard (§4c).** Catches the case the other two miss: a *free, succeeding* action selected
-   over and over (a real observed failure — an agent posted the same chat message 31× and never
-   stopped).
+3. **Repeat guard (§4c).** Catches the case the other two miss: a *free, succeeding* call selected
+   again with the same arguments (a real observed failure — an agent posted the same chat message
+   31× and never stopped).
 
 Retries (3×, exponential 2s/4s/8s) live in the policy layer (outside the pure loop), as in pi, and apply
 only to transport-level and retryable kernel errors (network, 5xx, 429, `ErrTimeout`) — never to
@@ -228,32 +228,39 @@ only to transport-level and retryable kernel errors (network, 5xx, 429, `ErrTime
 
 Budget and the turn cap both fail against a cheap action that *succeeds* on every call: the model
 keeps re-selecting the same action, never selects `reply`, and the task reads `failed / turn-cap`
-even though it functionally succeeded — with the side-effect spammed. Two live runs fixed the design.
-An exact-content detector is useless: shown its own prior output in the transcript, a sampled model
-*paraphrases* rather than repeats verbatim (one run posted the same reply 19 times, 16 distinct
-strings, zero byte-identical pairs). So the signal is the **action**, not its arguments.
+even though it functionally succeeded — with the side-effect spammed. The guard catches the one
+case it can prove: a call whose outcome is already known.
 
-- **Detect on the last action.** A selection whose action equals the last *dispatched* action is a
-  repeat (arguments ignored). `reply` is exempt — it is the exit we *want* the model to take.
+- **Detect on the last call.** A selection is a repeat iff it names the last *dispatched* action
+  with the **same arguments** (compared as canonical JSON) and that call **did not fail**. `reply`
+  is exempt — it is the exit we *want* the model to take. A different argument is new work (three
+  pages fetched, two people messaged) and dispatches; a retry after a failure is the model's call
+  and dispatches. A kernel `timeout` is a failure when it settled (it reports a `tx_id`); only a
+  `timeout` with no settlement is a cross-kernel call the kernel parked and will settle — still
+  executing, so running it again would run it twice.
 - **Drop and re-query, don't append.** A repeat is **neither persisted nor dispatched**: the loop
-  discards it, ensures a single reworded nudge sits at the tail — *"you just ran `<action>`, which
-  already completed; are you sure, or is the task complete? if complete, select `reply`"* — and
-  re-queries. This keeps the chat clean and, crucially, avoids **self-priming**: an autoregressive
-  model continues the patterns it sees, so leaving repeats in context makes the next repeat more
-  likely. Because the repeat never dispatches, the side-effect is bounded to the **one** legitimate
-  call.
-- **The model's answer is the signal.** Back down (`reply`, or a different action) → resolved
-  gracefully, the common case. Persist in the same action → dropped again.
+  discards it, ensures a single reworded nudge sits at the tail — *"you already ran `<action>` with
+  these same arguments; its result is above or still pending; select `reply` if done, otherwise
+  change the arguments or choose another action"* — and re-queries. This keeps the chat clean and,
+  crucially, avoids **self-priming**: an autoregressive model continues the patterns it sees, so
+  leaving repeats in context makes the next repeat more likely. Because the repeat never dispatches,
+  the side-effect is bounded to the **one** legitimate call.
+- **The model's answer is the signal.** Back down (`reply`, other arguments, another action) →
+  resolved gracefully, the common case. Persist in the same call → dropped again.
 - **Turn-counted, hard floor.** Each re-query costs a turn (the model pays for its own fumble), so
   `max_turns` bounds the rephrase loop. After `max_repeats` consecutive repeats (default 3) the frame
   hard-stops with `reason = repeat-loop` (a bracket rolls up `{error: repeat-loop}` its parent can
   act on). State is per-frame, so a bracket's repeats are its own and never trip the parent.
 
-This is opencode's confirm-before-repeat (it asks the *human* at 3 identical calls) turned into a
-*model*-in-the-loop rephrase-and-retry, with a deterministic floor underneath as the guarantee — a
-shape none of pi (no rail), opencode (human prompt), or OpenClaw (count breaker at 30) has.
-`max_repeats < 0` disables it. A known cost: a legitimate run of the same action over different
-inputs is nudged and, past the floor, hard-stopped; exempting specific actions is a future refinement.
+An earlier version matched on the action name alone, arguments ignored, because a sampled model
+*paraphrases* rather than repeats verbatim (one run posted the same reply 19 times, 16 distinct
+strings, zero byte-identical pairs). In use that rule failed most multi-step tasks, which consist
+of one action over several inputs, and its nudge — claiming the action "already completed" — pushed
+a compliant model either to reply early or to re-select and be hard-stopped. A paraphrased re-post
+is now left to the turn cap and the budget, the rails that bound every zero-price loop; the guard
+no longer trades correct runs for that one case. This is opencode's confirm-before-repeat (it asks
+the *human* at 3 identical calls) turned into a *model*-in-the-loop rephrase-and-retry, with a
+deterministic floor underneath as the guarantee. `max_repeats < 0` disables it.
 
 ## 5. Persistence and compaction
 
@@ -372,8 +379,13 @@ certified; the requester's code wrote the words and receives the reply, so both 
 
 **Delivery.** A job's answer completes its task, shaped onto the task's `allowed_input` so that the
 onward action's own schema, not knowledge of the application, decides where the text goes. A failed
-job still completes, releasing the sender's process. A transient completion failure is resent at
-later polls without running the job again.
+job still completes, releasing the sender's process, and explains itself: a reason code alone
+(`turn-cap`, `budget`) tells the requester nothing they can act on, so the policy layer asks the
+model once, over the job's view, what it attempted, what went wrong and what would be needed, and
+delivers that text where the answer would go. The call sits beside the rating pass — after the
+loop, never inside it — and is paid from the same budget, so a job that cannot pay for its account
+delivers the code alone. A transient completion failure is resent at later polls without running
+the job again.
 
 ## 7. Daemon lifecycle and configuration
 

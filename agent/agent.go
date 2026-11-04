@@ -11,6 +11,7 @@ import (
 	"context"
 	"crypto/rand"
 	"encoding/hex"
+	"encoding/json"
 	"errors"
 	"fmt"
 	"strings"
@@ -69,6 +70,14 @@ var ErrTermsChanged = errors.New("terms changed")
 // the opening lookup, compaction, rating) does not fit what the job has left, so
 // it was not made.
 var ErrBudget = errors.New("budget exceeded")
+
+// ErrTimeout is the Runner's report of the kernel's `timeout`. The kernel gives
+// that code to two outcomes: a call that timed out and settled as a failure
+// (its RunResult carries the transaction and charge), and a cross-kernel call
+// dispatched and parked with no settlement yet (no transaction; the kernel will
+// settle it). Only the parked one is still executing, so only it makes an
+// identical re-selection a repeat (§6) rather than a retry.
+var ErrTimeout = errors.New("call timed out")
 
 // Meter is a job's spending: every priced call the job makes, whether the model
 // chose it or the harness made it, is checked against Budget before it runs and
@@ -192,12 +201,15 @@ const (
 )
 
 // Outcome is what a completed loop reports back through its channel.
+// Explanation is the policy layer's: the model's own account of a failed job,
+// written after the loop (never by it) and delivered to the requester.
 type Outcome struct {
-	Status Status         `json:"status"`
-	Answer map[string]any `json:"answer,omitempty"`
-	Reason string         `json:"reason,omitempty"`
-	Spent  int            `json:"spent"`
-	Turns  int            `json:"turns"`
+	Status      Status         `json:"status"`
+	Answer      map[string]any `json:"answer,omitempty"`
+	Reason      string         `json:"reason,omitempty"`
+	Explanation string         `json:"explanation,omitempty"`
+	Spent       int            `json:"spent"`
+	Turns       int            `json:"turns"`
 }
 
 // Tool is a plain-named harness capability offered to the model alongside the
@@ -225,9 +237,10 @@ type Config struct {
 	// MaxDecideErrors bounds consecutive invalid model selections before the run
 	// fails; each is fed back for self-correction. Default 3 when zero.
 	MaxDecideErrors int
-	// MaxRepeats bounds how many times the model may confirm-and-repeat an
-	// identical (action, args) selection after being challenged, before the frame
-	// hard-stops (§4c). Default 3 when zero; negative disables the repeat guard.
+	// MaxRepeats bounds how many times the model may re-select the last dispatched
+	// call — same action, same args, and that call did not fail — after being
+	// challenged, before the frame hard-stops (§6). Default 3 when zero; negative
+	// disables the repeat guard.
 	MaxRepeats int
 	// Intrinsics maps a harness tool name to its handler. reply is terminal;
 	// publish/subtask are non-terminal.
@@ -299,22 +312,32 @@ func runFrame(ctx context.Context, cfg Config, deps Deps, cnt *counters, depth i
 	}
 	decideErrors := 0
 
-	// Repeat guard (§4c): a repeated *action* (reply exempt) is neither persisted
-	// nor dispatched — the loop drops it and re-queries after a single reworded
-	// nudge, so the repeat never enters the chat (no pollution, no self-priming)
-	// and the side-effect is bounded to the one legitimate call. lastAction is the
-	// last dispatched action ("" at frame start never matches); repeatStreak counts
-	// consecutive drops; nudged keeps the nudge to one line per stuck point.
+	// Repeat guard (§6): a selection that re-runs the last dispatched call — the
+	// same action with the same args, when that call did not fail — is neither
+	// persisted nor dispatched: its result is already known (or, for a call the
+	// kernel parked, pending), so running it again changes nothing. The loop drops
+	// it and re-queries after a single reworded nudge, so the repeat never enters
+	// the chat (no self-priming) and the side effect is bounded to the one
+	// legitimate call. A different argument is new work; a retry after a failure
+	// is the model's call. last is the last dispatched call (empty at frame start
+	// never matches); repeatStreak counts consecutive drops; nudged keeps the
+	// nudge to one line per stuck point.
 	maxRepeats := cfg.MaxRepeats
 	if maxRepeats == 0 {
 		maxRepeats = 3
 	}
-	var lastAction string
+	var last struct {
+		action, args string
+		ok           bool
+	}
 	repeatStreak := 0
 	nudged := false
-	// progressed marks a genuinely dispatched action, resetting the repeat guard so
-	// the next identical action is measured from here.
-	progressed := func(action string) { lastAction, repeatStreak, nudged = action, 0, false }
+	// progressed records a genuinely dispatched call, resetting the repeat guard so
+	// the next identical selection is measured from here.
+	progressed := func(action string, args map[string]any, ok bool) {
+		last.action, last.args, last.ok = action, canonicalArgs(args), ok
+		repeatStreak, nudged = 0, false
+	}
 
 	// feedback records a self-correction nudge and reports whether the cap is now
 	// exceeded (so the caller ends the frame).
@@ -373,11 +396,12 @@ func runFrame(ctx context.Context, cfg Config, deps Deps, cnt *counters, depth i
 		}
 		decideErrors = 0
 
-		// Repeat guard (§4c): a repeated action is dropped before it is persisted or
+		// Repeat guard (§6): a repeat is dropped before it is persisted or
 		// dispatched; the loop re-queries after a single reworded nudge. Each retry
 		// already cost a turn (counted when Decide returned), so MaxTurns bounds the
 		// rephrase loop; maxRepeats consecutive drops end the frame with repeat-loop.
-		if maxRepeats >= 0 && sel.Action != cfg.ReplyTool && sel.Action == lastAction {
+		if maxRepeats >= 0 && sel.Action != cfg.ReplyTool && last.ok &&
+			sel.Action == last.action && canonicalArgs(sel.Args) == last.args {
 			repeatStreak++
 			if repeatStreak > maxRepeats {
 				return exhausted("repeat-loop")
@@ -385,9 +409,10 @@ func runFrame(ctx context.Context, cfg Config, deps Deps, cnt *counters, depth i
 			logf("repeat_retry", map[string]any{"turn": cnt.turns, "depth": depth, "action": sel.Action, "streak": repeatStreak})
 			if !nudged {
 				if err := deps.Transcript.Append(ctx, Message{Role: RoleSystem, Kind: "repeat-challenge",
-					Content: fmt.Sprintf("You just ran %q, which already completed. Are you sure you want to "+
-						"run it again? If the task is complete, select the %q tool with your answer; otherwise "+
-						"select the action that moves things forward.", sel.Action, cfg.ReplyTool)}); err != nil {
+					Content: fmt.Sprintf("You already ran %q with these same arguments; its result is above "+
+						"or still pending, and running it again will not change it. If the task is complete, "+
+						"select the %q tool with your answer; otherwise change the arguments or choose another "+
+						"action.", sel.Action, cfg.ReplyTool)}); err != nil {
 					return nil, StatusFailed, "", err
 				}
 				nudged = true
@@ -447,7 +472,8 @@ func runFrame(ctx context.Context, cfg Config, deps Deps, cnt *counters, depth i
 			if err := deps.Transcript.Append(ctx, Message{Role: RoleTool, Action: sel.Action, Result: res}); err != nil {
 				return nil, StatusFailed, "", err
 			}
-			progressed(sel.Action)
+			_, rolledUpError := res["error"]
+			progressed(sel.Action, sel.Args, !rolledUpError)
 
 		// other harness tool (publish) → intrinsic handler.
 		case cfg.Intrinsics[sel.Action].Handle != nil:
@@ -460,7 +486,7 @@ func runFrame(ctx context.Context, cfg Config, deps Deps, cnt *counters, depth i
 			if terminal {
 				return res, StatusAnswered, "", nil
 			}
-			progressed(sel.Action)
+			progressed(sel.Action, sel.Args, ierr == nil)
 
 		// catalog action → dispatch (budget-gated). Only an offered candidate is
 		// dispatched: its price is what the budget gate charges, so an action the
@@ -505,7 +531,11 @@ func runFrame(ctx context.Context, cfg Config, deps Deps, cnt *counters, depth i
 			}); err != nil {
 				return nil, StatusFailed, "", err
 			}
-			progressed(sel.Action)
+			// A timeout that reports no settlement is a parked call: it is executing
+			// and will settle, so re-selecting it would run it a second time. A
+			// timeout that settled is a failure like any other.
+			parked := errors.Is(rerr, ErrTimeout) && rr.TxID == ""
+			progressed(sel.Action, sel.Args, rerr == nil || parked)
 			logf("dispatch", map[string]any{"action": sel.Action, "price": price, "charge": charge, "tx_id": rr.TxID, "error": rerr != nil})
 		}
 	}
@@ -715,6 +745,16 @@ func missingRequired(schema map[string]any, args map[string]any) string {
 		}
 	}
 	return ""
+}
+
+// canonicalArgs renders args for equality: encoding/json writes map keys in
+// sorted order, so two selections with the same arguments render alike.
+func canonicalArgs(args map[string]any) string {
+	b, err := json.Marshal(args)
+	if err != nil {
+		return fmt.Sprintf("%v", args)
+	}
+	return string(b)
 }
 
 // RunKey names one call for the kernel (external_key): random, so no two calls

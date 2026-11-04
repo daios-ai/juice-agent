@@ -28,6 +28,41 @@ func (r *fakeRater) ChatJSON(_ context.Context, msgs []agent.Message, _ map[stri
 	r.asked = msgs
 	return r.judgment, nil
 }
+// explainChatter answers a Chat with one canned text, or an error, and keeps
+// what it was asked.
+type explainChatter struct {
+	text  string
+	err   error
+	asked []agent.Message
+}
+
+func (c *explainChatter) Chat(_ context.Context, msgs []agent.Message) (string, error) {
+	c.asked = msgs
+	return c.text, c.err
+}
+
+func TestExplainFailureAsksOverTheViewAndTrims(t *testing.T) {
+	view := []agent.Message{{Role: agent.RoleUser, Content: "alice@k: what time is it?"}}
+	c := &explainChatter{text: "  I ran the time action but kept selecting it again.\n"}
+	got := explainFailure(context.Background(), view, "repeat-loop", c, nil)
+	if got != "I ran the time action but kept selecting it again." {
+		t.Fatalf("explanation = %q, want the trimmed text", got)
+	}
+	if n := len(c.asked); n != 2 || c.asked[0].Content != view[0].Content ||
+		!strings.Contains(c.asked[1].Content, "reason: repeat-loop") {
+		t.Fatalf("asked %+v, want the view and then the question naming the reason", c.asked)
+	}
+}
+
+func TestExplainFailureIsEmptyWhenTheCallFails(t *testing.T) {
+	var events []string
+	log := func(ev string, _ map[string]any) { events = append(events, ev) }
+	c := &explainChatter{err: agent.ErrBudget}
+	if got := explainFailure(context.Background(), nil, "budget", c, log); got != "" || len(events) != 1 || events[0] != "explain_error" {
+		t.Fatalf("explanation %q, events %v; want empty and explain_error logged", got, events)
+	}
+}
+
 func (r *fakeRater) Rate(_ context.Context, txID string, rating int, note string) error {
 	r.rated[txID] = struct {
 		rating int

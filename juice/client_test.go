@@ -318,8 +318,27 @@ func TestRunFailureReturnsItsSettlement(t *testing.T) {
 func TestRunFailureIsKernelError(t *testing.T) {
 	c := startFake(t, newFakeKernel())
 	_, err := c.Run(context.Background(), "does@k/not-exist", nil, "", "")
-	if Code(err) != "execution_failed" || IsRetryable(err) || errors.Is(err, agent.ErrTermsChanged) {
+	if Code(err) != "execution_failed" || IsRetryable(err) || errors.Is(err, agent.ErrTermsChanged) || errors.Is(err, agent.ErrTimeout) {
 		t.Fatalf("err = %v", err)
+	}
+}
+
+// A kernel timeout is reported to the loop as agent.ErrTimeout, and no other
+// code is; a parked one carries no settlement, a settled one its tx_id.
+func TestTimeoutIsErrTimeout(t *testing.T) {
+	f := newFakeKernel()
+	f.runErrs["x@k/parked"] = map[string]any{"error": "parked", "code": "timeout",
+		"meta": map[string]any{"process_id": "p1", "pending_since": "2026-01-01T00:00:00Z"}}
+	f.runErrs["x@k/slow"] = map[string]any{"error": "wasm execution timed out", "code": "timeout",
+		"meta": map[string]any{"tx_id": "tx-s", "charge": 2}}
+	c := startFake(t, f)
+	rr, err := c.Run(context.Background(), "x@k/parked", nil, "", "")
+	if !errors.Is(err, agent.ErrTimeout) || errors.Is(err, agent.ErrTermsChanged) || IsRetryable(err) || rr.TxID != "" {
+		t.Fatalf("parked: %+v, %v; want agent.ErrTimeout, not retryable, no settlement", rr, err)
+	}
+	rr, err = c.Run(context.Background(), "x@k/slow", nil, "", "")
+	if !errors.Is(err, agent.ErrTimeout) || rr.TxID != "tx-s" || rr.Charge != 2 {
+		t.Fatalf("settled: %+v, %v; want agent.ErrTimeout with tx-s charged 2", rr, err)
 	}
 }
 

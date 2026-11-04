@@ -161,16 +161,26 @@ func (in *Intake) scan(ctx context.Context) {
 // deliver completes the originating task with the job's answer. Completing runs
 // the task's onward action as its requester (kernel D6); for a sink the reply
 // rides in the completion's args, readable by the sender. A failed job still
-// completes, so the sender's process is released and the exchange never dangles.
+// completes, so the sender's process is released and the exchange never dangles:
+// its explanation, when the job could pay for one, is shaped like an answer, and
+// an unconstrained onward (a sink) also carries the status and reason; an onward
+// declaring a text field receives the explanation alone, so its schema still
+// accepts the completion. Without an explanation the status and reason go alone.
 func (in *Intake) deliver(p pending, out agent.Outcome) {
-	args := out.Answer
-	if args == nil {
+	var args map[string]any
+	switch {
+	case out.Answer != nil:
+		args = shapeReply(out.Answer, p.allowedInput)
+	case out.Explanation != "":
+		args = shapeReply(map[string]any{"answer": out.Explanation}, p.allowedInput)
+		if _, sink := args["answer"]; sink {
+			args["status"], args["reason"] = string(out.Status), out.Reason
+		}
+	default:
 		args = map[string]any{"status": string(out.Status)}
 		if out.Reason != "" {
 			args["reason"] = out.Reason
 		}
-	} else {
-		args = shapeReply(args, p.allowedInput)
 	}
 	in.complete(context.Background(), p.taskID, owed{persona: p.job.Persona, args: args})
 }

@@ -4,6 +4,7 @@ import (
 	"context"
 	"math"
 	"strconv"
+	"strings"
 
 	"github.com/daios-ai/juice-agent/agent"
 )
@@ -158,6 +159,27 @@ func parseJudgments(val any) map[int]judgment {
 		out[idx] = judgment{rating: rating, note: note}
 	}
 	return out
+}
+
+// explainFailure asks the model, once, to account for a job that failed: what it
+// attempted, what went wrong, and what would be needed. The text is delivered to
+// the requester in place of an answer. It runs after the loop, in the policy
+// layer, and is paid from the job's budget like the rating pass; a call the
+// budget cannot pay, or that fails, leaves the explanation empty and the job
+// delivers its reason code alone.
+func explainFailure(ctx context.Context, messages []agent.Message, reason string, c Chatter, log func(string, map[string]any)) string {
+	if log == nil {
+		log = func(string, map[string]any) {}
+	}
+	ask := agent.Message{Role: agent.RoleUser, Content: "You could not complete this task (reason: " + reason +
+		"). In two or three sentences, tell the requester what you attempted, what went wrong, and what " +
+		"would be needed to succeed. Do not select a tool; reply in plain text."}
+	text, err := c.Chat(ctx, append(append([]agent.Message{}, messages...), ask))
+	if err != nil {
+		log("explain_error", map[string]any{"reason": reason, "error": err.Error()})
+		return ""
+	}
+	return strings.TrimSpace(text)
 }
 
 // toInt reads a JSON number as an int, refusing a fractional one.

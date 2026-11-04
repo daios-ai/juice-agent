@@ -844,7 +844,7 @@ func TestSubtaskChildNotOfferedSubtaskTool(t *testing.T) {
 	}
 }
 
-// --- repeat guard (§4c) -----------------------------------------------------
+// --- repeat guard (§6) -----------------------------------------------------
 
 func countKind(msgs []Message, kind string) int {
 	n := 0
@@ -884,31 +884,44 @@ func TestRepeatChallengeThenBackDown(t *testing.T) {
 	}
 }
 
-// paraphrasingDecider keeps selecting the same action but with a *different*
-// argument every turn — the real doom loop (a sampled model rewords rather than
-// repeats verbatim). It optionally backs down with reply after `backdownAfter`
-// selections (0 = never backs down).
-type paraphrasingDecider struct {
+// sameCallDecider re-selects one identical (action, args) call every turn — the
+// repeat the guard is for. It optionally backs down with reply after
+// `backdownAfter` selections (0 = never backs down).
+type sameCallDecider struct {
 	action        string
 	n             int
 	backdownAfter int
 }
 
-func (d *paraphrasingDecider) Decide(_ context.Context, _ []Message, _ []Candidate, _ []Tool) (*Selection, error) {
+func (d *sameCallDecider) Decide(_ context.Context, _ []Message, _ []Candidate, _ []Tool) (*Selection, error) {
 	d.n++
 	if d.backdownAfter > 0 && d.n > d.backdownAfter {
 		return &Selection{Action: "reply", Args: map[string]any{"answer": "done"}}, nil
 	}
-	// Distinct text each turn, so an args-based guard would never match.
-	return &Selection{Action: d.action, Args: map[string]any{"text": fmt.Sprintf("phrasing %d", d.n)}}, nil
+	return &Selection{Action: d.action, Args: map[string]any{"text": "hello"}}, nil
 }
 
-func TestParaphraseLoopIntercepted(t *testing.T) {
-	// The case the old byte-identity guard missed: same action, different args every
-	// turn. Detection is action-based, so the repeats are dropped (never dispatched)
-	// and the model, nudged, backs down with reply. Exactly ONE dispatch.
-	dec := &paraphrasingDecider{action: "chat/message", backdownAfter: 3}
-	cat := &fakeCatalog{seed: []Candidate{{Ref: "chat/message"}}}
+// varyingArgsDecider selects one action with a different argument every turn —
+// a legitimate run of the same action over several inputs — then replies.
+type varyingArgsDecider struct {
+	action string
+	n      int
+	calls  int
+}
+
+func (d *varyingArgsDecider) Decide(_ context.Context, _ []Message, _ []Candidate, _ []Tool) (*Selection, error) {
+	d.n++
+	if d.n > d.calls {
+		return &Selection{Action: "reply", Args: map[string]any{"answer": "done"}}, nil
+	}
+	return &Selection{Action: d.action, Args: map[string]any{"url": fmt.Sprintf("https://x/%d", d.n)}}, nil
+}
+
+func TestSameActionDifferentArgsDispatches(t *testing.T) {
+	// The same action over three distinct inputs is work, not a repeat: every
+	// call dispatches, nothing is nudged, and the job answers.
+	dec := &varyingArgsDecider{action: "web", calls: 3}
+	cat := &fakeCatalog{seed: []Candidate{{Ref: "web"}}}
 	run := &recordingRunner{}
 	tr := &memTranscript{}
 
@@ -919,19 +932,107 @@ func TestParaphraseLoopIntercepted(t *testing.T) {
 	if out.Status != StatusAnswered {
 		t.Fatalf("status = %q, want answered", out.Status)
 	}
+	if len(run.calls) != 3 {
+		t.Fatalf("dispatched %v, want three (distinct args are not repeats)", run.calls)
+	}
+	if n := countKind(tr.msgs, "repeat-challenge"); n != 0 {
+		t.Fatalf("repeat-challenge messages = %d, want 0", n)
+	}
+}
+
+// failOnceRunner fails the first call of each action and succeeds afterwards.
+type failOnceRunner struct {
+	recordingRunner
+	failed map[string]bool
+	err    error
+}
+
+func (r *failOnceRunner) Run(ctx context.Context, action string, args map[string]any, quoteHash, key string) (RunResult, error) {
+	if !r.failed[action] {
+		r.failed[action] = true
+		r.calls = append(r.calls, action)
+		return RunResult{}, r.err
+	}
+	return r.recordingRunner.Run(ctx, action, args, quoteHash, key)
+}
+
+func TestRetryAfterFailureNotARepeat(t *testing.T) {
+	// The first call fails at the kernel; the model re-selects the identical call.
+	// A retry after a failure is the model's call: it dispatches, with no nudge.
+	dec := &sameCallDecider{action: "web", backdownAfter: 2}
+	cat := &fakeCatalog{seed: []Candidate{{Ref: "web"}}}
+	run := &failOnceRunner{failed: map[string]bool{}, err: errors.New("execution_failed: upstream 503")}
+	tr := &memTranscript{}
+
+	out, err := Run(context.Background(), Job{Budget: 1000}, baseConfig(), newDeps(dec, cat, run, tr))
+	if err != nil {
+		t.Fatal(err)
+	}
+	if out.Status != StatusAnswered {
+		t.Fatalf("status = %q, want answered", out.Status)
+	}
+	if len(run.calls) != 2 {
+		t.Fatalf("dispatched %v, want two (a retry after a failure is not a repeat)", run.calls)
+	}
+	if n := countKind(tr.msgs, "repeat-challenge"); n != 0 {
+		t.Fatalf("repeat-challenge messages = %d, want 0", n)
+	}
+}
+
+func TestRepeatAfterParkedCallIsCaught(t *testing.T) {
+	// A timeout reporting no settlement is a parked call: the kernel dispatched
+	// it and will settle it, so the identical re-selection is a repeat — dropped
+	// and nudged, never dispatched a second time.
+	dec := &sameCallDecider{action: "slow", backdownAfter: 2}
+	cat := &fakeCatalog{seed: []Candidate{{Ref: "slow"}}}
+	run := &recordingRunner{errs: map[string]error{"slow": ErrTimeout}}
+	tr := &memTranscript{}
+
+	out, err := Run(context.Background(), Job{Budget: 1000}, baseConfig(), newDeps(dec, cat, run, tr))
+	if err != nil {
+		t.Fatal(err)
+	}
+	if out.Status != StatusAnswered {
+		t.Fatalf("status = %q, want answered", out.Status)
+	}
 	if len(run.calls) != 1 {
-		t.Fatalf("dispatched %v, want exactly one (paraphrased repeats dropped, not run)", run.calls)
+		t.Fatalf("dispatched %v, want one (a parked call is not re-run)", run.calls)
 	}
 	if n := countKind(tr.msgs, "repeat-challenge"); n != 1 {
-		t.Fatalf("repeat-challenge messages = %d, want 1 (a single nudge, not accumulated)", n)
+		t.Fatalf("repeat-challenge messages = %d, want 1", n)
+	}
+}
+
+func TestRetryAfterSettledTimeoutIsNotARepeat(t *testing.T) {
+	// A timeout that settled (transaction and charge reported) is a failure like
+	// any other, so the identical re-selection is a retry and dispatches.
+	dec := &sameCallDecider{action: "slow", backdownAfter: 2}
+	cat := &fakeCatalog{seed: []Candidate{{Ref: "slow"}}}
+	run := &recordingRunner{errs: map[string]error{"slow": ErrTimeout},
+		results: map[string]RunResult{"slow": {TxID: "tx-slow", Charge: 1}}}
+	tr := &memTranscript{}
+
+	out, err := Run(context.Background(), Job{Budget: 1000}, baseConfig(), newDeps(dec, cat, run, tr))
+	if err != nil {
+		t.Fatal(err)
+	}
+	if out.Status != StatusAnswered {
+		t.Fatalf("status = %q, want answered", out.Status)
+	}
+	if len(run.calls) != 2 {
+		t.Fatalf("dispatched %v, want two (a settled timeout is a failure, retried)", run.calls)
+	}
+	if n := countKind(tr.msgs, "repeat-challenge"); n != 0 {
+		t.Fatalf("repeat-challenge messages = %d, want 0", n)
 	}
 }
 
 func TestRepeatLoopHardStops(t *testing.T) {
-	// A stubborn paraphrase loop that never backs down: repeats are dropped, and
-	// after maxRepeats (default 3) consecutive drops the frame hard-stops. The
-	// action dispatched exactly ONCE; one nudge; terminates well under the turn cap.
-	dec := &paraphrasingDecider{action: "chat/message"}
+	// A stubborn loop that never backs down from one identical call: repeats are
+	// dropped, and after maxRepeats (default 3) consecutive drops the frame
+	// hard-stops. The action dispatched exactly ONCE; one nudge; terminates well
+	// under the turn cap.
+	dec := &sameCallDecider{action: "chat/message"}
 	cat := &fakeCatalog{seed: []Candidate{{Ref: "chat/message"}}}
 	run := &recordingRunner{}
 	tr := &memTranscript{}
@@ -1078,7 +1179,7 @@ func TestBracketRepeatIsolation(t *testing.T) {
 func TestRepeatGuardDisabled(t *testing.T) {
 	// MaxRepeats < 0 disables the guard: a looping action runs every turn until the
 	// turn cap, exactly as before, with no challenge inserted.
-	dec := &paraphrasingDecider{action: "sys@k/time"}
+	dec := &sameCallDecider{action: "sys@k/time"}
 	cat := &fakeCatalog{seed: []Candidate{{Ref: "sys@k/time"}}}
 	run := &recordingRunner{}
 	tr := &memTranscript{}

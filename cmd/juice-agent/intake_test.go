@@ -283,3 +283,25 @@ func TestIntakeFailedJobStillCompletes(t *testing.T) {
 		t.Fatalf("completion = %v, %v; want the failure acknowledged", args, ok)
 	}
 }
+
+// A failed job's explanation is delivered like an answer: a sink gets it with
+// the status and reason; an onward declaring a text field gets it alone.
+func TestIntakeFailedJobDeliversItsExplanation(t *testing.T) {
+	onward := task("t2", "alice@k", "alice@k", "rooms@k/post", nil)
+	onward.AllowedInput = map[string]any{"properties": map[string]any{"message": map[string]any{"type": "string"}}}
+	src := &fakeSource{completed: map[string]map[string]any{},
+		tasks: []juice.Task{task("t1", "alice@k", "alice@k", "sys@k/message", nil), onward}}
+	fail := func(context.Context, agent.Job) (agent.Outcome, error) {
+		return agent.Outcome{Status: agent.StatusFailed, Reason: "budget", Explanation: "I ran out of credits."}, nil
+	}
+	in := NewIntake(src, fail, "agent@k", 10, 2, time.Hour, nil)
+	in.Start(context.Background())
+	in.scan(context.Background())
+	in.Shutdown()
+	if args, ok := src.done("t1"); !ok || args["answer"] != "I ran out of credits." || args["status"] != "failed" || args["reason"] != "budget" {
+		t.Fatalf("sink completion = %v, %v; want the explanation with status and reason", args, ok)
+	}
+	if args, ok := src.done("t2"); !ok || args["message"] != "I ran out of credits." || len(args) != 1 {
+		t.Fatalf("onward completion = %v, %v; want the explanation in the declared field alone", args, ok)
+	}
+}

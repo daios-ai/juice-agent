@@ -228,8 +228,11 @@ funds; the agent pays for the tools it calls while working.
 
 If delivery fails transiently, the daemon retains the answer and retries at later polls without
 rerunning the job. A rejected completion can leave the task `waiting`; inspect it with
-`juice task show`. A failed job also attempts to complete its task, supplying a status and reason
-instead of an answer.
+`juice task show`. A failed job also completes its task, and explains itself: the daemon asks the
+model once what it attempted, what went wrong and what would be needed, and delivers that text as
+the answer beside the status and reason (`turn-cap`, `budget`, `repeat-loop`, …). The explanation
+is one more reasoning call, paid from the job's budget; when the budget cannot pay for it, the
+completion carries the status and reason alone.
 
 A task still waiting after a daemon restart may be executed again. A tool call the kernel reports
 as `timeout` is already dispatched and awaiting settlement, so the daemon does not dispatch it
@@ -254,7 +257,8 @@ A successful outcome looks like:
 | --- | --- |
 | `status` | `answered`, `failed`, or `interrupted`. |
 | `answer` | Reply object for an answered job. |
-| `reason` | Explanation for a failed or interrupted job. |
+| `reason` | Failure class of a failed or interrupted job (`turn-cap`, `budget`, `repeat-loop`, …). |
+| `explanation` | The model's account of a failed job: what it tried, what went wrong, what would be needed. Absent when the budget could not pay for it. |
 | `spent` | Tool charges in base units; an unsettled call counts at its quoted price. |
 | `turns` | Number of reasoning turns. |
 

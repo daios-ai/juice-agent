@@ -76,6 +76,16 @@ func (e *Executor) Execute(ctx context.Context, job agent.Job) (agent.Outcome, e
 		logf("loop_error", map[string]any{"job": job.ID, "error": loopErr.Error()})
 	}
 
+	// A failed job explains itself to the requester: one reasoning call over the
+	// root view, paid from the budget like the rating pass. The account joins the
+	// persona's view, so the next job sees that the agent said it failed and why.
+	if out.Status == agent.StatusFailed {
+		out.Explanation = explainFailure(ctx, tr.Messages(), out.Reason, jk, logf)
+		if out.Explanation != "" {
+			_ = tr.Append(ctx, agent.Message{Role: agent.RoleAssistant, Kind: "explanation", Content: out.Explanation})
+		}
+	}
+
 	// All() is this job's records across frames: bracketed calls are rated, and
 	// an earlier job's transactions, already rated once (kernel D11), never are.
 	if e.RateTasks {
@@ -85,7 +95,8 @@ func (e *Executor) Execute(ctx context.Context, job agent.Job) (agent.Outcome, e
 	// finds no budget, so nothing is paid after the figure is taken.
 	meter.Close()
 	out.Spent = meter.Spent
-	logf("task_end", map[string]any{"job": job.ID, "status": out.Status, "reason": out.Reason, "turns": out.Turns, "spent": out.Spent})
+	logf("task_end", map[string]any{"job": job.ID, "status": out.Status, "reason": out.Reason, "turns": out.Turns, "spent": out.Spent,
+		"explained": out.Explanation != ""})
 	// Record the terminal outcome so recovery can tell a finished job from an
 	// interrupted one.
 	_ = tr.Append(ctx, agent.Message{Role: agent.RoleSystem, Kind: "outcome",

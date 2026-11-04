@@ -245,6 +245,49 @@ flow_budget() {
     assert_eq budget.over_unpaid "$after" "$(jj "$DB" "$KDIR/agent" user me | jfield available)"
 }
 
+flow_explain() {
+    echo "=== FLOW explain (an identical re-selection is a repeat; a failed job explains itself) ==="
+    local dir; dir=$(new_dir)
+    start_kernel "$dir"; create_agent
+    # The agent's reasoning action always selects the action lookup with the same
+    # arguments: the first selection dispatches, every later one is a repeat, and
+    # the job fails with repeat-loop after max_repeats drops. The explanation call
+    # goes to the same endpoint, so its fixed text is what the requester reads.
+    local port lookup; port=$(backend_port); lookup="sys@$(kname "$DB")/lookup"
+    start_backend "$port" 200 "{\"choices\":[{\"message\":{\"content\":\"{\\\"action\\\":\\\"$lookup\\\",\\\"args\\\":{\\\"query\\\":\\\"time\\\"}}\"}}]}" >/dev/null
+    local reason; reason=$(chat_action agent same-chat "http://127.0.0.1:$port/" 0)
+    assert_nonempty explain.reason "$reason"
+    start_agentd "$dir" "\"reason\": \"$reason\"" || { fail explain.agentd "no daemon"; return; }
+
+    local tid; tid=$(message agent "what time is it?")
+    assert_eq explain.done done "$(await_task "$tid" 120)"
+    assert_eq explain.failed failed "$(completion_of "$tid" status)"
+    assert_eq explain.repeat_loop repeat-loop "$(completion_of "$tid" reason)"
+    # One dispatch of the lookup (the opening seed is not a dispatch); three drops.
+    assert_eq explain.one_dispatch 1 "$(grep -c '"event":"dispatch"' "$dir/agentd.log")"
+    assert_eq explain.three_drops 3 "$(grep -c '"event":"repeat_retry"' "$dir/agentd.log")"
+    # The explanation is the endpoint's fixed reply, delivered as the answer.
+    assert_contains explain.explained "$lookup" "$(reply_of "$tid")"
+    assert_contains explain.logged '"explained":true' "$(grep '"event":"task_end"' "$dir/agentd.log" | tail -1)"
+}
+
+flow_explanation() {
+    echo "=== FLOW explanation (real LLM: a job cut short explains why) ==="
+    require_ollama || { skip explanation.explained "Ollama/$CHAT_MODEL unavailable"; return; }
+    local dir; dir=$(new_dir)
+    start_kernel "$dir"; create_agent
+    # One turn is not enough to look up, call and reply, so the job fails on the
+    # turn cap and the model accounts for it in plain text.
+    start_agentd "$dir" '"max_turns": 1' || { fail explanation.agentd "no daemon"; return; }
+    local tid; tid=$(message agent "What is the current time? Reply with an ISO-8601 timestamp.")
+    assert_eq explanation.done done "$(await_task "$tid" 300)"
+    assert_eq explanation.failed failed "$(completion_of "$tid" status)"
+    assert_eq explanation.turn_cap turn-cap "$(completion_of "$tid" reason)"
+    local text; text=$(reply_of "$tid")
+    assert_nonempty explanation.explained "$text"
+    assert_not_contains explanation.plain_text '"action"' "$text"
+}
+
 flow_approval() {
     echo "=== FLOW approval (the kernel withholds an unapproved sender's task) ==="
     local dir; dir=$(new_dir)
@@ -541,9 +584,9 @@ flow_thread_conversation() {
 }
 
 # Mechanism flows (deterministic assertions) run first; LLM flows (real Ollama) follow.
-ALL=(flow_bootstrap flow_init flow_config flow_no_session flow_recovery flow_drain flow_lock flow_tasks flow_budget flow_approval
+ALL=(flow_bootstrap flow_init flow_config flow_no_session flow_recovery flow_drain flow_lock flow_tasks flow_budget flow_explain flow_approval
      flow_personas flow_threads flow_named flow_session_identity flow_usage
-     flow_answer flow_agent_md flow_rating flow_conversation flow_thread_conversation)
+     flow_answer flow_explanation flow_agent_md flow_rating flow_conversation flow_thread_conversation)
 
 if [ "$#" -gt 0 ]; then
     RUN=("$@")

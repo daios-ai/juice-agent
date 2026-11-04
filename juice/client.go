@@ -710,10 +710,17 @@ func (e *KernelError) Error() string {
 	return fmt.Sprintf("http %d: %s", e.Status, e.Message)
 }
 
-// Is lets the pure loop recognise a refused quote pin without importing this
-// package: errors.Is(err, agent.ErrTermsChanged).
+// Is lets the pure loop recognise a refused quote pin and a timeout without
+// importing this package: errors.Is(err, agent.ErrTermsChanged) and
+// errors.Is(err, agent.ErrTimeout).
 func (e *KernelError) Is(target error) bool {
-	return target == agent.ErrTermsChanged && e.Code == "terms_changed"
+	switch target {
+	case agent.ErrTermsChanged:
+		return e.Code == "terms_changed"
+	case agent.ErrTimeout:
+		return e.Code == "timeout"
+	}
+	return false
 }
 
 // Code returns the kernel error code of err, or "" if err is not a KernelError.

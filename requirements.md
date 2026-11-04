@@ -1,6 +1,6 @@
 # Juice Agent Requirements
 
-Version: 0.8.0
+Version: 0.9.0
 Status: implementation requirements
 Codename: `juice-agent`
 
@@ -11,6 +11,13 @@ contract `juicedocs/requirements.md` and the ecosystem standard `juicedocs/ecosy
 A requirement here must violate neither. Citations use the kernel's own labels: *kernel §N* for a
 section, *kernel D/P/G/U N* for a design decision, protocol clause, guarantee, or user story, and
 *ecosystem §N* for the standard.
+
+Revision 0.9.0 narrows the repeat guard and makes a failed job explain itself. A repeat is the
+last dispatched call re-selected with the same arguments after it did not fail; the same action
+over other arguments, and a retry after a failure, dispatch; a `timeout` is a failure when it
+reports a `tx_id` and a parked, still-running call when it does not (§6). A failed job makes one
+more reasoning call, paid from its budget, and delivers the model's account of the failure with its
+status and reason (§3, §10).
 
 Revision 0.8.0 adds the standard's `setup` command (ecosystem §3): `juice-agent setup`, hidden
 from usage, writes the schema; `make install` runs it after placing the binary, and every start runs
@@ -133,7 +140,7 @@ in the kernel's base units.
 | Object    | Fields                                                                        | Rules                                                                                                                                                                                                             |
 | --------- | ----------------------------------------------------------------------------- | --------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------- |
 | `Job`     | `id`, `persona`, `messages`, `budget`                                         | One request for the agent: an id, the persona whose history it continues (§10), its new messages, and a spend ceiling covering every priced call made for it: the actions the model chooses and the harness's own calls of the two affordances (§11). One job = one loop run, appended to its persona's file.                                     |
-| `Outcome` | `status`, `answer`, `reason`, `spent`, `turns`                               | `status ∈ {answered, failed, interrupted}`. `answer` is the reply object (on `answered`). `reason` gives the failure class (`turn-cap`, `repeat-loop`, `budget`, `terms-changed`, `affordance: …`, `decide-error: …`) when not answered. `spent` is what the kernel charged for the job — every call's, the reasoning, lookup, compaction and rating calls included: the sum of each call's reported `charge` (on success, and in a failure's `meta`), `0` for a call refused with `terms_changed`, and the price for a call whose settlement was not reported (a parked call may still draw it); reconstructible from the kernel ledger (the agent is the payer of every one, kernel D4). `turns` is the count of model round-trips: a turn refused for the budget or for moved terms never reaches the model and is not counted. |
+| `Outcome` | `status`, `answer`, `reason`, `explanation`, `spent`, `turns`                | `status ∈ {answered, failed, interrupted}`. `answer` is the reply object (on `answered`). `reason` gives the failure class (`turn-cap`, `repeat-loop`, `budget`, `terms-changed`, `affordance: …`, `decide-error: …`) when not answered. `explanation` is the model's own account of a failed job — what it attempted, what went wrong, what would be needed — written by the policy layer after the loop (§10, "Completion") and empty when the job could not pay for it. `spent` is what the kernel charged for the job — every call's, the reasoning, lookup, compaction and rating calls included: the sum of each call's reported `charge` (on success, and in a failure's `meta`), `0` for a call refused with `terms_changed`, and the price for a call whose settlement was not reported (a parked call may still draw it); reconstructible from the kernel ledger (the agent is the payer of every one, kernel D4). `turns` is the count of model round-trips: a turn refused for the budget or for moved terms never reaches the model and is not counted. |
 
 A job's outcome must be delivered by completing its originating task. The daemon serves jobs from a
 bounded worker pool; each job's loop is serial, jobs in different personas are concurrent, and a
@@ -239,24 +246,31 @@ and child brackets, exposing at each node only the root→node path.
 ## 6. Repeat guard
 
 Budget and the turn cap both fail against a *free, succeeding* action the model re-selects forever
-(observed: the same message posted 31× with no `reply`). An exact-content detector is useless — a
-sampled model paraphrases its own prior output (measured: 19 posts, 16 distinct strings, 0
-byte-identical). The signal must therefore be the **action name**, not its arguments.
+(observed: the same message posted 31× with no `reply`). The guard catches the one case it can
+prove: a call whose outcome is already known.
 
-- A selection whose action equals the last *dispatched* action is a repeat (arguments ignored). The
-  reply tool is exempt.
+- A selection is a repeat iff it names the last *dispatched* action **with the same arguments**
+  (compared as canonical JSON) and that call **did not fail**. The reply tool is exempt. A
+  different argument is new work and dispatches; a retry after a failure is the model's call and
+  dispatches. A kernel `timeout` is a settled failure when it reports a `tx_id` (kernel §8: "a WASM
+  timeout completion is reported as settled, not as a parked dispatch"); one reporting none is a
+  cross-kernel call the kernel parked and will settle (API, Run), which did not fail and is still
+  executing, so re-running it would run it twice.
 - A repeat is **neither persisted nor dispatched**: the loop drops it, ensures a single reworded
-  challenge nudge sits at the tail (*"you just ran `<action>`, which already completed; select
-  `reply` if the task is done"*), and re-queries. Leaving the repeat in context would self-prime an
-  autoregressive model; because the repeat never dispatches, the side effect is bounded to the one
-  legitimate call.
+  challenge nudge sits at the tail (*"you already ran `<action>` with these same arguments; its
+  result is above or still pending; select `reply` if the task is done, otherwise change the
+  arguments or choose another action"*), and re-queries. Leaving the repeat in context would
+  self-prime an autoregressive model; because the repeat never dispatches, the side effect is
+  bounded to the one legitimate call.
 - Each re-query costs a turn, so `max_turns` bounds the rephrase loop. After `max_repeats`
   consecutive drops (`Config.MaxRepeats`, default 3) the frame hard-stops with `reason = repeat-loop`
   (a bracket rolls up `{error: "repeat-loop"}`). State is per-frame. `max_repeats < 0` disables the
   guard.
 
-A known cost: a legitimate run of the same action over different inputs is nudged and, past the
-floor, hard-stopped; exempting specific actions is deferred.
+An earlier rule matched on the action name alone, because a sampled model paraphrases its own
+prior output (measured: 19 posts, 16 distinct strings, 0 byte-identical). That rule failed most
+multi-step tasks, which call one action over several inputs. A paraphrased re-post is now left to
+the turn cap and the budget (§11), which bound it as they bound any zero-price loop.
 
 ## 7. Persistence and compaction
 
@@ -375,9 +389,15 @@ guard, so a task still waiting after a restart is redone and a completed one nev
 task's `allowed_input`: an unconstrained onward (a `sink`) receives `{answer}`, which rides in the
 completion's arguments readable by the sender; a declared text field (`text`, `message`, `answer`,
 `body`, `reply`, `content`, or the only string field) receives the answer; otherwise the reply passes
-unchanged and the kernel validates. A failed job still completes with `{status, reason}`, so the
-sender's process is released. Completion runs as the requester; the agent pays nothing for it
-(kernel D6). A completion that fails transiently is resent at every later poll until the kernel
+unchanged and the kernel validates. A failed job still completes, so the sender's process is
+released, and it explains itself: the policy layer makes one more call of the reasoning
+affordance over the job's root view, asking what the agent attempted, what went wrong and what
+would be needed, in plain text. The reply is the outcome's `explanation` (§3), recorded in the
+persona's file and delivered as the answer is: a sink receives `{answer, status, reason}`, a
+declared text field receives the explanation alone, so a strict onward schema still accepts the
+completion. The call is paid from the job's budget like the rating pass (§11); one that does not fit,
+or fails, is skipped and the task completes with `{status, reason}` alone. Completion runs as the
+requester; the agent pays nothing for it (kernel D6). A completion that fails transiently is resent at every later poll until the kernel
 accepts or refuses it, and the job is never run again for it; a refused completion leaves the task
 `waiting`, visible to the operator.
 
@@ -625,15 +645,15 @@ For an action on another kernel it holds in expectation: the charge adds the imp
 the call's lottery ticket wins, the ticket's face value — the buyer kernel's `lottery` setting,
 readable only by its operator — whose expected value is the quoted payment (kernel P10). A winning
 ticket can therefore carry `spent` past `budget`; no further call is dispatched once it has. The
-harness's own calls (each turn's reasoning, the opening lookup, compaction, rating) are priced like
-any other: `llm/chat` costs the model's price, which the kernel's operator sets per model, `0`
+harness's own calls (each turn's reasoning, the opening lookup, compaction, a failed job's
+explanation, rating) are priced like any other: `llm/chat` costs the model's price, which the kernel's operator sets per model, `0`
 included (kernel `manual/reference/config.md`), and a replacement affordance costs what its owner
 charges. Each is checked against what the job has left before it runs, pinned to the terms the job
 read (§11), run under one `external_key` across its retries, and counted in `spent` at its charge,
 or at its price when its settlement went unreported. A turn that does not fit fails the job with
-`budget`, one whose terms moved with `terms-changed`; an opening lookup, a compaction or a rating
-that does not fit is skipped. The rating pass runs before `spent` is final, and nothing is paid
-after: `spent` is the job's whole cost. The turn cap is the secondary rail for
+`budget`, one whose terms moved with `terms-changed`; an opening lookup, a compaction, an
+explanation or a rating that does not fit is skipped. The explanation and the rating pass run before
+`spent` is final, and nothing is paid after: `spent` is the job's whole cost. The turn cap is the secondary rail for
 zero-price actions. The repeat guard (§6) catches the free-and-succeeding action both miss. Policy-
 layer retries (3×, exponential backoff) apply only to transport-level and retryable kernel errors
 (network, 5xx, 429) — never to `ErrInsufficientFunds`, schema violations, or aborts, and never to a
@@ -653,18 +673,22 @@ remains the financial ground truth.
 ## 12. Testing: three tiers
 
 **Unit (`go test ./...`).** Offline, no kernel, no LLM. `agent` is tested against fake
-`Decider`/`Catalog`/`Runner`/`Transcript`: stop rule, budget refusal, turn cap, repeat guard,
-steering injection, candidate merge (authoritative read, effect exclusion) and recency eviction,
+`Decider`/`Catalog`/`Runner`/`Transcript`: stop rule, budget refusal, turn cap, repeat guard (an
+identical re-selection is dropped and hard-stops; the same action over other arguments, a retry
+after a failure and after a settled timeout dispatch; a re-selection after a parked call is a
+repeat), steering injection, candidate merge (authoritative read, effect exclusion) and recency eviction,
 offered-only dispatch, quote pinning and eviction on moved terms, `spent` from the reported charge,
 a distinct run key per dispatch, subtask bracket roll-up and shared counters. The product package
 covers intake — the persona key in its three cases, namespacing by requester and creating action,
 the unambiguous file-name encoding, attribution, reply shaping, one job per persona with personas
-concurrent, the required-caller filter, a failed job still completing, and the completion resend
-after a transient failure without a second run; persona files — continuation without job-scoped
+concurrent, the required-caller filter, a failed job still completing — with its explanation shaped
+onto a sink and onto a declared text field, and without one as `{status, reason}` — and the
+completion resend after a transient failure without a second run; persona files — continuation without job-scoped
 records, an exact rebuild after compaction across jobs, bracket exclusion and numbering, the hashed
 long name with its header, and `All()` holding only the job's records; the executor — `agent.md` in
-the system prompt, a second job continuing the first, and rating only the job's own calls; one run
-key across a dispatch's retries, a parked `timeout` returned without retry, the usage text's
+the system prompt, a second job continuing the first, rating only the job's own calls, and a failed
+job's explanation (made once, charged to `spent`, recorded before the outcome; skipped when the
+budget cannot pay; never made for an answered job); one run key across a dispatch's retries, a parked `timeout` returned without retry, the usage text's
 wrapping and width rule (the terminal-size query passed in, so no terminal is needed), the rating
 pass, and the §11 contract: login parsing and home resolution under `JUICE_HOME`, defaults with the
 affordances on the login's kernel and per-key overrides, rejection of unknown and retired keys, home
@@ -674,7 +698,8 @@ missing session or a mismatched account. `juice` is tested against `httptest` ke
 session rotation on a `401` written back under the lock, adoption of a token another process
 rotated, refusal of another principal's session, a revoked refresh as no session, quote pinning and
 `terms_changed` recognition, the external key and the reported charge (also from a failure's
-`meta`), a `timeout` as not retryable, reasoning and structured output through the configured
+`meta`), a `timeout` as not retryable and reported to the loop as such, with its settlement when
+it has one, reasoning and structured output through the configured
 reasoning affordance, lookup through the configured action-lookup affordance, the authoritative
 read, each affordance's contract check (the kernel's natives pass; each shortfall is named by path),
 and task listing with `requester` and completion. Every production file has its `_test.go`.
@@ -697,7 +722,10 @@ lock is free once it exits), `tasks` (a task addressed to the agent is completed
 rides in the completion's arguments, the completion runs as the sender, and a task addressed to
 another stays waiting), `budget` (a reasoning action priced at 7 is paid each turn: `spent` is 7 and
 the agent's balance falls by 7; its owner then raises the price above the budget while the daemon
-runs, and the next job fails with `budget`, not `terms-changed`, paying nothing), `approval` (an unapproved sender's task is withheld and listed pending, and
+runs, and the next job fails with `budget`, not `terms-changed`, paying nothing), `explain` (a
+reasoning action that always selects the lookup with the same arguments dispatches it once, is
+dropped three times and fails with `repeat-loop`; the completion carries the explanation that
+endpoint returns beside the status and reason), `approval` (an unapproved sender's task is withheld and listed pending, and
 served once approved), `personas` (one file per sender, the second message in the first's file,
 another sender kept apart, attribution, and the log showing that a persona's first job loads nothing
 and its next loads the history), `threads` (tasks created by applications through an action's
@@ -709,7 +737,8 @@ are attributed `owner via requester`), `named`, `session_identity` (another acco
 the agent's login is not adopted), and `usage` (fits 80 columns and a 50-column pseudo-terminal).
 LLM flows assert robust properties, not exact text, and skip (never fail) when the chat model is
 absent: `answer` (an ISO time, spend within budget and equal to the fall in the agent's balance),
-`agent_md` (`agent.md` reaches the system prompt), `rating` (the time call is rated, and a second job
+`explanation` (a job cut to one turn fails with `turn-cap` and completes with a non-empty plain-text
+explanation), `agent_md` (`agent.md` reaches the system prompt), `rating` (the time call is rated, and a second job
 in the persona raises no rating error), and `conversation` (a persona recalls a codeword given in its
 earlier message, and another sender's persona does not), and `thread_conversation` (a codeword
 given in a room is recalled by another person in that room, and not in another room or by another

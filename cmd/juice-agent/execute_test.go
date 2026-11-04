@@ -41,8 +41,9 @@ type fakeKernel struct {
 	seen    [][]map[string]any         // the chat each selection was asked over
 	runs    []fakeRun                  // every call received
 	byKey   map[string]agent.RunResult // first outcome per key
-	refused int                        // runs refused for a stale quote_hash
-	rated   map[string]int
+	refused   int                        // runs refused for a stale quote_hash
+	rated     map[string]int
+	explained int // explanation calls answered
 }
 
 type fakeRun struct{ action, quoteHash, key string }
@@ -117,6 +118,9 @@ func (k *fakeKernel) answer(action string, args map[string]any) agent.RunResult 
 			content = string(b)
 		case strings.Contains(last, "JSON Schema"):
 			kind, content = "judge", `{"ratings":[{"index":0,"rating":1,"note":"good"}]}`
+		case strings.HasPrefix(last, "You could not complete this task"):
+			kind, content = "explain", "I tried the time action repeatedly and could not finish."
+			k.explained++
 		}
 		return agent.RunResult{TxID: "tx-r" + n, Charge: k.charges[kind], Result: map[string]any{
 			"choices": []any{map[string]any{"message": map[string]any{"content": content}}}}}
@@ -206,6 +210,69 @@ func TestExecutorRunsRatesAndRecordsOutcome(t *testing.T) {
 		t.Fatalf("first message = %+v, want the system prompt carrying agent.md", first)
 	}
 	outcomeRecord(t, dir, "p1")
+}
+
+// loopingKernel re-selects the time action forever: with no change of arguments
+// the repeat guard ends the job as repeat-loop after one dispatch.
+func loopingKernel() *fakeKernel {
+	var script []agent.Selection
+	for i := 0; i < 20; i++ {
+		script = append(script, agent.Selection{Action: "sys@k/time"})
+	}
+	return &fakeKernel{script: script}
+}
+
+func TestAFailedJobExplainsItself(t *testing.T) {
+	// A failed job makes one more reasoning call, paid like the rating pass, and
+	// the model's account is the outcome's explanation; it joins the persona file
+	// before the outcome record, so the next job sees it.
+	dir := t.TempDir()
+	k := loopingKernel()
+	k.reasonPrice, k.charges = 1, map[string]int{"select": 1, "explain": 3}
+	out, err := testExecutor(dir, k).Execute(context.Background(), userJob("t1", "p1", "time?"))
+	if err != nil {
+		t.Fatalf("execute: %v", err)
+	}
+	if out.Status != agent.StatusFailed || out.Reason != "repeat-loop" {
+		t.Fatalf("outcome = %+v, want failed/repeat-loop", out)
+	}
+	if k.explained != 1 || !strings.HasPrefix(out.Explanation, "I tried") {
+		t.Fatalf("explained %d, explanation %q; want one call and its text", k.explained, out.Explanation)
+	}
+	if out.Spent != k.spent || out.Spent < 3 {
+		t.Fatalf("spent %d, kernel charged %d; want the explanation's 3 counted", out.Spent, k.spent)
+	}
+	recs, _ := readRecords(filepath.Join(dir, "p1.jsonl"))
+	if n := len(recs); n < 2 || recs[n-2].Kind != "explanation" || recs[n-2].Content != out.Explanation {
+		t.Fatalf("persona file ends %+v, want the explanation before the outcome", recs[max(0, len(recs)-2):])
+	}
+}
+
+func TestAnExplanationTheBudgetCannotPayIsSkipped(t *testing.T) {
+	// Five selections at 1 each exhaust a budget of 5: the explanation does not
+	// fit, is not made, and the job delivers its reason alone.
+	dir := t.TempDir()
+	k := loopingKernel()
+	k.reasonPrice, k.charges = 1, map[string]int{"select": 1, "explain": 1}
+	var events []string
+	e := testExecutor(dir, k)
+	e.Log = func(ev string, _ map[string]any) { events = append(events, ev) }
+	job := userJob("t1", "p1", "time?")
+	job.Budget = 5
+	out, _ := e.Execute(context.Background(), job)
+	if out.Status != agent.StatusFailed || out.Explanation != "" || k.explained != 0 || out.Spent != 5 ||
+		!slices.Contains(events, "explain_error") {
+		t.Fatalf("outcome %+v, explained %d, events %v; want failed, unexplained at 5, explain_error logged", out, k.explained, events)
+	}
+}
+
+func TestAnAnsweredJobIsNotExplained(t *testing.T) {
+	dir := t.TempDir()
+	k := &fakeKernel{script: []agent.Selection{{Action: "reply", Args: map[string]any{"answer": "noon"}}}}
+	out, _ := testExecutor(dir, k).Execute(context.Background(), userJob("t1", "p1", "time?"))
+	if out.Status != agent.StatusAnswered || out.Explanation != "" || k.explained != 0 {
+		t.Fatalf("outcome %+v, explained %d; want answered with no explanation call", out, k.explained)
+	}
 }
 
 // A second job in a persona continues the first's conversation, with one system
