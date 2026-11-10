@@ -342,3 +342,10 @@ Benchmarks are separate from the unit tests.
 
 The current version and the history of changes are recorded at the top of
 [requirements.md](requirements.md).
+
+## License
+
+`juice-agent` is released under the [MIT License](LICENSE). The kernel documents in
+`juicedocs/` and the logo `juice-logo.svg` are copied from the
+[Juice](https://github.com/daios-ai/juice) repository and remain under the GNU Affero General
+Public License, version 3; see [juicedocs/NOTICE](juicedocs/NOTICE). Copyright (C) 2026 Pedro A. Ortega.

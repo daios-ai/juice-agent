@@ -3,6 +3,7 @@
 Version: 0.9.0
 Status: implementation requirements
 Codename: `juice-agent`
+Copyright (C) 2026 Pedro A. Ortega <pedro.ortega@gmail.com>
 
 This document states what the agent daemon **must** be; `agent-design.md` states why. Where this
 document and the design differ, this document governs the implementation. It depends on, and never

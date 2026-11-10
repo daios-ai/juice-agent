@@ -1,0 +1,6 @@
+The files in this directory, and juice-logo.svg at the repository root, are
+copied verbatim from the Juice kernel repository,
+https://github.com/daios-ai/juice, by copy-juicedocs.sh. They are licensed
+under the GNU Affero General Public License, version 3 (see LICENSE in this
+directory). Copyright (C) 2026 Pedro A. Ortega. The MIT license at the
+repository root does not apply to them.
