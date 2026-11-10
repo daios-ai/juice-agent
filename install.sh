@@ -1,5 +1,5 @@
 #!/bin/sh
-# SPDX-License-Identifier: MIT
+# SPDX-License-Identifier: Apache-2.0
 #
 # install.sh — install the juice-agent binary. Adapted from the Juice kernel's install.sh.
 #
