@@ -2,7 +2,7 @@
 
 # juice-agent
 
-`juice-agent` is a Go daemon that answers tasks through a [Juice](../juice) kernel. It runs as
+`juice-agent` is a Go daemon that answers tasks through a [Juice](https://github.com/daios-ai/juice) kernel. It runs as
 an ordinary kernel account, discovers tools in the kernel's action catalog, and pays for the
 ones it uses. Conversation history is stored locally so the agent can continue earlier work.
 
@@ -231,12 +231,14 @@ rerunning the job. A rejected completion can leave the task `waiting`; inspect i
 `juice task show`. A failed job also completes its task, and explains itself: the daemon asks the
 model once what it attempted, what went wrong and what would be needed, and delivers that text as
 the answer beside the status and reason (`turn-cap`, `budget`, `repeat-loop`, …). The explanation
-is one more reasoning call, paid from the job's budget; when the budget cannot pay for it, the
-completion carries the status and reason alone.
+is one more reasoning call, paid from the job's budget; when the budget cannot pay for it, or the
+call fails, the completion carries the status and reason alone.
 
 A task still waiting after a daemon restart may be executed again. A tool call the kernel reports
-as `timeout` is already dispatched and awaiting settlement, so the daemon does not dispatch it
-again. Inspect its process with `juice process show <process_id>`.
+as `timeout` without a transaction is still running elsewhere and will settle later; the daemon
+refuses to run the identical call again while it is pending. A `timeout` that reports a
+transaction is a settled failure, and the model may retry the call. Inspect a pending call's
+process with `juice process show <process_id>`.
 
 ## Running a single job
 
@@ -326,10 +328,17 @@ unavailable; the remaining flows check daemon and kernel behaviour without a mod
 ### Benchmarks
 
 ```sh
-juice-agent bench agent@work bench/tasks.json 5
+juice-agent bench agent@work bench/tasks.json 5   # or: make bench LOGIN=agent@work
 ```
 
 This runs five repetitions of each task in the versioned suite against a live kernel and model.
 Each repetition uses a fresh conversation. Reports include success rate, spending, latency, and
 turn count, and are written to stdout and `bench/results/`, keyed by agent and suite version.
-Rerunning the same version pair replaces its report. Benchmarks are separate from the unit tests.
+The agent version comes from `git describe`, so tag releases to keep report names clean; a report
+named `*.local.json` is ignored by git. Rerunning the same version pair replaces its report.
+Benchmarks are separate from the unit tests.
+
+### Versions
+
+The current version and the history of changes are recorded at the top of
+[requirements.md](requirements.md).
