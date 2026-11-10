@@ -1,5 +1,5 @@
 {
-  "suite_version": "v1",
+  "suite_version": "v2",
   "tasks": [
     {
       "id": "time-now",
@@ -21,9 +21,9 @@
     },
     {
       "id": "lookup-and-use",
-      "prompt": "Find a Juice action that can fetch a web page, then tell me its owner/name.",
+      "prompt": "Find a Juice action that can fetch a web page, then tell me its full Juice action address.",
       "budget": 40,
-      "check": { "type": "contains", "field": "answer", "value": "sys/web" }
+      "check": { "type": "contains", "field": "answer", "value": "/web" }
     }
   ]
 }
