@@ -1,6 +1,6 @@
 # Juice Agent Requirements
 
-Version: 0.9.0
+Version: 0.10.0
 Status: implementation requirements
 Codename: `juice-agent`
 Copyright (C) 2026 Pedro A. Ortega <pedro.ortega@gmail.com>
@@ -12,6 +12,11 @@ contract `juicedocs/requirements.md` and the ecosystem standard `juicedocs/ecosy
 A requirement here must violate neither. Citations use the kernel's own labels: *kernel §N* for a
 section, *kernel D/P/G/U N* for a design decision, protocol clause, guarantee, or user story, and
 *ecosystem §N* for the standard.
+
+Revision 0.10.0 adds the web installer and the release workflow. `install.sh` downloads the
+released binary for the machine's platform, refuses it unless it matches the release's
+`checksums.txt`, replaces `$JUICE_HOME/bin/juice-agent` only with a binary that runs, runs `setup`,
+and starts no agent (§11). A pushed `v*` tag builds the four platform archives and publishes them.
 
 Revision 0.9.0 narrows the repeat guard and makes a failed job explain itself. A repeat is the
 last dispatched call re-selected with the same arguments after it did not fail; the same action
@@ -492,9 +497,12 @@ process, the lock does not, so a program that signals the pid must first fail to
 
 **Setup** (ecosystem §3). `juice-agent setup`, absent from usage and taking no argument, writes the
 schema and nothing else: juice-agent ships no defaults, and an agent's home and its `config.json`
-are first start's. The installer (`make install`) writes `$JUICE_HOME/bin/juice-agent`, where the
-family's executables live (ecosystem §2), and then runs `juice-agent setup`, so `schemas/` holds the
-installed binary's schema before any agent starts; `serve` and `task` run it at every start.
+are first start's. Both installers, the web installer `install.sh` and `make install`, write
+`$JUICE_HOME/bin/juice-agent`, where the family's executables live (ecosystem §2), and then run
+`juice-agent setup`, so `schemas/` holds the installed binary's schema before any agent starts;
+`serve` and `task` run it at every start. `install.sh` installs a released binary only when its
+SHA-256 matches the release's `checksums.txt` and its `--version` runs, and replaces the old binary
+by rename.
 `make uninstall` removes the binary only.
 
 ### Config keys

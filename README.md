@@ -18,14 +18,35 @@ and write its instructions in `agent.md`.
 
 ## Installation
 
+Install the latest release with one command:
+
+```sh
+curl -fsSL https://raw.githubusercontent.com/daios-ai/juice-agent/main/install.sh | sh
+```
+
+This downloads the binary for your platform (Linux or macOS, amd64 or arm64), refuses it unless it
+matches the release's published checksum, installs it in `$JUICE_HOME/bin`, defaulting to
+`~/.juice/bin`, writes its configuration schema to `$JUICE_HOME/schemas/juice-agent.schema.json`,
+and adds the directory to your `PATH` in your shell profile. Options go after `sh -s --`:
+
+```sh
+curl -fsSL https://raw.githubusercontent.com/daios-ai/juice-agent/main/install.sh | sh -s -- v0.10.0
+curl -fsSL https://raw.githubusercontent.com/daios-ai/juice-agent/main/install.sh | sh -s -- --no-modify-path
+```
+
+A release tag pins a version, and `--no-modify-path` leaves your shell profile alone. `JUICE_HOME`
+moves the installation. Running the installer again upgrades the binary in place. The installer
+starts nothing; the agent needs a Juice kernel and a login, as the quickstart below shows.
+
+To build from source instead, which needs Go 1.22 or later:
+
 ```sh
 make install
 ```
 
-This builds the executable, installs it in `$JUICE_HOME/bin`, defaulting to `~/.juice/bin`, and
-writes its configuration schema to `$JUICE_HOME/schemas/juice-agent.schema.json`.
-Add that directory to your `PATH` if necessary. To build without installing, run `make build`;
-the executable is written to `./juice-agent`.
+This builds the executable, installs it in `$JUICE_HOME/bin`, and writes the schema, as the
+installer does, but leaves your `PATH` alone. To build without installing, run `make build`; the
+executable is written to `./juice-agent`.
 
 ## Quickstart
 
@@ -337,6 +358,15 @@ turn count, and are written to stdout and `bench/results/`, keyed by agent and s
 The agent version comes from `git describe`, so tag releases to keep report names clean; a report
 named `*.local.json` is ignored by git. Rerunning the same version pair replaces its report.
 Benchmarks are separate from the unit tests.
+
+### Releases
+
+Pushing a `v*` tag runs the release workflow, which builds the four platform archives and
+`checksums.txt` and publishes them as the GitHub Release the installer downloads:
+
+```sh
+git tag -a v0.10.0 -m v0.10.0 && git push origin v0.10.0
+```
 
 ### Versions
 

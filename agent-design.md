@@ -4,7 +4,7 @@ Version: 0.1.2
 Status: design document
 Codename: `juice-agent`
 
-This document is aligned with `requirements.md` 0.9.0: all work arrives as kernel tasks, each task
+This document is aligned with `requirements.md` 0.10.0: all work arrives as kernel tasks, each task
 joins a persona keyed from the task alone (§6), the harness depends on two configured actions
 (reasoning and action lookup), and the channel layer, the maker and the learned memory file are gone.
 
