@@ -31,12 +31,21 @@ type fakeKernel struct {
 	rated      map[string]any
 	tasks      []map[string]any
 	completed  map[string]any // task id -> completion body
+	health     map[string]any // GET /health
+	meID       string         // the account /v1/me answers for
+	unnamed    bool           // /v1/me names no principal, as a kernel before contract 0.18
 }
 
 func newFakeKernel() *fakeKernel {
 	return &fakeKernel{token: "tok-1", refreshTok: "ref-1",
 		runResults: map[string]map[string]any{}, runErrs: map[string]map[string]any{},
-		actions: map[string]map[string]any{}, rated: map[string]any{}, completed: map[string]any{}}
+		actions: map[string]map[string]any{}, rated: map[string]any{}, completed: map[string]any{},
+		health: map[string]any{"public_key": "KEY", "network_fingerprint": "NET"}, meID: "u1"}
+}
+
+// name renders a party or an action as a reply names it (API R3a).
+func name(address, principal string) map[string]any {
+	return map[string]any{"address": address, "principal": principal}
 }
 
 func readBody(r *http.Request) map[string]any {
@@ -100,8 +109,15 @@ func (f *fakeKernel) handler() http.Handler {
 		writeJSON(w, 200, map[string]any{})
 	}))
 	mux.HandleFunc("/v1/me", authed(func(w http.ResponseWriter, r *http.Request) {
-		writeJSON(w, 200, map[string]any{"id": "u1", "address": "agent@k", "available": 500})
+		addr := name("agent@k", f.meID+"@KEY")
+		if f.unnamed {
+			addr = name("agent@k", "")
+		}
+		writeJSON(w, 200, map[string]any{"id": f.meID, "address": addr, "available": 500})
 	}))
+	mux.HandleFunc("/health", func(w http.ResponseWriter, r *http.Request) {
+		writeJSON(w, 200, f.health)
+	})
 	mux.HandleFunc("/v1/tasks", authed(func(w http.ResponseWriter, r *http.Request) {
 		if r.URL.Query().Get("status") != "waiting" {
 			writeJSON(w, 400, map[string]string{"error": "want status=waiting", "code": "invalid_input"})
@@ -141,7 +157,7 @@ func writeRecords(t *testing.T, endpoint string, cred map[string]any) string {
 		t.Fatal(err)
 	}
 	cfg := map[string]any{"current": "", "kernels": map[string]any{
-		"k": map[string]any{"endpoint": endpoint, "public_key": "KEY"}}}
+		"k": map[string]any{"endpoint": endpoint, "public_key": "KEY", "world_fingerprint": "NET"}}}
 	b, _ := json.Marshal(cfg)
 	os.WriteFile(filepath.Join(home, "client", "config.json"), b, 0o600)
 	if cred != nil {
@@ -454,7 +470,7 @@ func TestExtractJSON(t *testing.T) {
 // nativeRow is an action read whose schemas are given as JSON.
 func nativeRow(t *testing.T, ref, input, output string) map[string]any {
 	t.Helper()
-	return map[string]any{"action": ref, "description": "native " + ref, "price": 0, "quote_hash": "q-" + ref,
+	return map[string]any{"action": name(ref, "P-"+ref), "description": "native " + ref, "price": 0, "quote_hash": "q-" + ref,
 		"input_schema": schema(t, input), "output_schema": schema(t, output)}
 }
 
@@ -491,11 +507,11 @@ func TestAffordancesAreCheckedAndReadWithTheirTerms(t *testing.T) {
 func TestLookupAndRead(t *testing.T) {
 	f := newFakeKernel()
 	f.runResults[testLookup] = map[string]any{"results": []any{
-		map[string]any{"action": "sys@k/web", "description": "fetch", "price": 9},
+		map[string]any{"action": name("sys@k/web", "P-web"), "description": "fetch", "price": 9},
 	}}
-	f.actions["sys@k/web"] = map[string]any{"action": "sys@k/web", "description": "fetch", "price": 7,
+	f.actions["sys@k/web"] = map[string]any{"action": name("sys@k/web", "P-web"), "description": "fetch", "price": 7,
 		"quote_hash": "q-web", "effect": "", "evidence": map[string]any{"local_experience": map[string]any{"uses": 1}}}
-	f.actions["sys@k/transfer"] = map[string]any{"action": "sys@k/transfer", "effect": "transfer"}
+	f.actions["sys@k/transfer"] = map[string]any{"action": name("sys@k/transfer", "P-transfer"), "effect": "transfer"}
 	c := startFake(t, f)
 	ctx := context.Background()
 
@@ -530,14 +546,15 @@ func TestRatePostsRatingAndNote(t *testing.T) {
 
 func TestTasksListAndComplete(t *testing.T) {
 	f := newFakeKernel()
-	f.tasks = []map[string]any{{"id": "t1", "action": "sys@k/sink", "owner": "alice@k", "requester": "rooms@k",
-		"created_by": "rooms@k/post", "required_caller": "agent@k",
+	f.tasks = []map[string]any{{"id": "t1", "action": name("sys@k/sink", "P-sink"), "owner": name("alice@k", "PA"),
+		"requester": name("rooms@k", "PR"), "created_by": name("rooms@k/post", "PR/post"), "required_caller": name("agent@k", "u1@KEY"),
 		"partial_args": map[string]any{"message": "hi"}, "status": "waiting"}}
 	c := startFake(t, f)
 	ctx := context.Background()
 	tasks, err := c.WaitingTasks(ctx)
-	if err != nil || len(tasks) != 1 || tasks[0].Owner != "alice@k" || tasks[0].Requester != "rooms@k" ||
-		tasks[0].CreatedBy != "rooms@k/post" || tasks[0].RequiredCaller != "agent@k" {
+	if err != nil || len(tasks) != 1 || tasks[0].Owner != (Name{"alice@k", "PA"}) || tasks[0].Requester != (Name{"rooms@k", "PR"}) ||
+		tasks[0].CreatedBy != (Name{"rooms@k/post", "PR/post"}) || tasks[0].RequiredCaller != (Name{"agent@k", "u1@KEY"}) ||
+		tasks[0].ActionRef.Address != "sys@k/sink" {
 		t.Fatalf("tasks = %+v, %v", tasks, err)
 	}
 	if err := c.CompleteTask(ctx, "t1", nil); err != nil {
@@ -553,9 +570,9 @@ func TestTasksListAndComplete(t *testing.T) {
 func TestWaitingTasksReadsEveryPage(t *testing.T) {
 	f := newFakeKernel()
 	for i := 0; i < 449; i++ {
-		f.tasks = append(f.tasks, map[string]any{"id": "funded-" + strconv.Itoa(i), "required_caller": "bob@k", "status": "waiting"})
+		f.tasks = append(f.tasks, map[string]any{"id": "funded-" + strconv.Itoa(i), "required_caller": name("bob@k", "PB"), "status": "waiting"})
 	}
-	f.tasks = append(f.tasks, map[string]any{"id": "mine", "required_caller": "agent@k", "status": "waiting"})
+	f.tasks = append(f.tasks, map[string]any{"id": "mine", "required_caller": name("agent@k", "u1@KEY"), "status": "waiting"})
 	tasks, err := startFake(t, f).WaitingTasks(context.Background())
 	if err != nil || len(tasks) != 450 || tasks[449].ID != "mine" {
 		t.Fatalf("listed %d tasks, %v; want all 450 ending with mine", len(tasks), err)
@@ -592,8 +609,40 @@ func TestIsRetryable(t *testing.T) {
 
 func TestMeReadsIdentity(t *testing.T) {
 	self, err := startFake(t, newFakeKernel()).Me(context.Background())
-	if err != nil || self.Address != "agent@k" || self.ID != "u1" || self.Available != 500 {
+	if err != nil || self.Address != (Name{"agent@k", "u1@KEY"}) || self.ID != "u1" || self.Available != 500 {
 		t.Fatalf("me = %+v, %v", self, err)
+	}
+}
+
+// Verify establishes the identity the agent's state is keyed by: the kernel's
+// recorded key and network, as /health reports them, and the login's account.
+func TestVerifyEstablishesIdentity(t *testing.T) {
+	f := newFakeKernel()
+	c := startFake(t, f)
+	ctx := context.Background()
+	id, self, err := c.Verify(ctx)
+	if err != nil || id != (Identity{Network: "NET", PublicKey: "KEY", Principal: "u1"}) || self.Address.Principal != "u1@KEY" {
+		t.Fatalf("verify = %+v, %+v, %v", id, self, err)
+	}
+	// Another kernel at the recorded address, or the same key on another network.
+	for _, h := range []map[string]any{
+		{"public_key": "OTHER", "network_fingerprint": "NET"},
+		{"public_key": "KEY", "network_fingerprint": "OTHERNET"},
+	} {
+		f.health = h
+		if _, _, err := c.Verify(ctx); err == nil || !strings.Contains(err.Error(), "juice kernel add") {
+			t.Fatalf("health %v: err = %v", h, err)
+		}
+	}
+	// The session answering for another account than the one the credential records.
+	f.health, f.meID = map[string]any{"public_key": "KEY", "network_fingerprint": "NET"}, "u2"
+	if _, _, err := c.Verify(ctx); err == nil || !strings.Contains(err.Error(), "juice auth login agent@k") {
+		t.Fatalf("other account: err = %v", err)
+	}
+	// A kernel that names no principals cannot key the agent's state.
+	f.meID, f.unnamed = "u1", true
+	if _, _, err := c.Verify(ctx); err == nil || !strings.Contains(err.Error(), "contract 0.18") {
+		t.Fatalf("no principal: err = %v", err)
 	}
 }
 

@@ -11,7 +11,8 @@
 // The client holds no secret of its own. It acts as one login, handle@kernel,
 // read from the juice-family client records under $JUICE_HOME/client/ (ecosystem
 // standard §5): the kernel's endpoint from config.json, the session from
-// credentials/<login>.json, which it rotates under that file's lock.
+// credentials/<login>.json, which it rotates under that file's lock. The kernel's
+// recorded key and network are what Verify checks the kernel against.
 package juice
 
 import (
@@ -45,6 +46,8 @@ type Client struct {
 	handle       string
 	kernel       string // the name the kernel calls itself, the login's kernel half
 	principal    string // the account's principal id, as recorded by `juice auth login`
+	publicKey    string // the kernel's public key, as recorded by `juice kernel add`
+	network      string // the kernel's network fingerprint, as recorded by `juice kernel add`
 	reason       string // the reasoning affordance's address (reasonContract)
 	actionLookup string // the action-lookup affordance's address (actionLookupContract)
 	base         string
@@ -90,7 +93,9 @@ func New(login, home, reason, actionLookup string) (*Client, error) {
 	}
 	var records struct {
 		Kernels map[string]struct {
-			Endpoint string `json:"endpoint"`
+			Endpoint    string `json:"endpoint"`
+			PublicKey   string `json:"public_key"`
+			Fingerprint string `json:"world_fingerprint"`
 		} `json:"kernels"`
 	}
 	cfgPath := filepath.Join(home, "client", "config.json")
@@ -102,6 +107,7 @@ func New(login, home, reason, actionLookup string) (*Client, error) {
 	}
 	c := &Client{
 		login: login, handle: handle, kernel: kern, reason: reason, actionLookup: actionLookup,
+		publicKey: rec.PublicKey, network: rec.Fingerprint,
 		base:     strings.TrimRight(rec.Endpoint, "/"),
 		credPath: filepath.Join(home, "client", "credentials", login+".json"),
 		hc:       &http.Client{Timeout: 3 * time.Minute},
@@ -569,7 +575,7 @@ func (c *Client) Read(ctx context.Context, ref string) (agent.Candidate, error) 
 
 // actionRow is an action read (GET /v1/actions?ref=), as far as the client uses it.
 type actionRow struct {
-	ActionRef    string         `json:"action"`
+	ActionRef    Name           `json:"action"`
 	Description  string         `json:"description"`
 	InputSchema  map[string]any `json:"input_schema"`
 	OutputSchema map[string]any `json:"output_schema"`
@@ -580,7 +586,7 @@ type actionRow struct {
 }
 
 func (a actionRow) candidate() agent.Candidate {
-	return agent.Candidate{Ref: a.ActionRef, Description: a.Description, InputSchema: a.InputSchema,
+	return agent.Candidate{Ref: a.ActionRef.Address, Description: a.Description, InputSchema: a.InputSchema,
 		Price: a.Price, QuoteHash: a.QuoteHash, Effect: a.Effect, Evidence: a.Evidence}
 }
 
@@ -633,10 +639,18 @@ func (c *Client) Rate(ctx context.Context, txID string, rating int, note string)
 		map[string]any{"rating": rating, "note": note}, nil)
 }
 
+// Name is how a reply names a party or an action (API R3a): the address a person
+// reads and the kernel accepts back, and the principal, user_id@kernel_key[/name],
+// which is stable under renames and is what the agent stores and compares.
+type Name struct {
+	Address   string `json:"address"`
+	Principal string `json:"principal"`
+}
+
 // Self is the authenticated identity (GET /v1/me).
 type Self struct {
 	ID        string `json:"id"`
-	Address   string `json:"address"`
+	Address   Name   `json:"address"`
 	Available int    `json:"available"`
 	Locked    int    `json:"locked"`
 }
@@ -648,14 +662,55 @@ func (c *Client) Me(ctx context.Context) (Self, error) {
 	return s, err
 }
 
-// Task is a kernel task (D6) as GET /v1/tasks renders it: every party an address.
+// Identity is what the agent's durable state is keyed by (ecosystem standard §5):
+// the kernel's network fingerprint and public key, and the account's principal id.
+type Identity struct {
+	Network   string `json:"network_fingerprint"`
+	PublicKey string `json:"public_key"`
+	Principal string `json:"principal_id"`
+}
+
+// Verify checks that the kernel answering at the recorded endpoint reports the
+// recorded key and network (ecosystem standard §6), and that the session is the
+// account the login names: its address, and the principal id the credential file
+// records. It returns the identity so established and the account.
+func (c *Client) Verify(ctx context.Context) (Identity, Self, error) {
+	var h struct {
+		PublicKey string `json:"public_key"`
+		Network   string `json:"network_fingerprint"`
+	}
+	if err := c.call(ctx, http.MethodGet, "/health", nil, &h, ""); err != nil {
+		return Identity{}, Self{}, fmt.Errorf("read %s/health: %w", c.base, err)
+	}
+	if h.PublicKey != c.publicKey || h.Network != c.network {
+		return Identity{}, Self{}, fmt.Errorf("the kernel at %s reports key %s on network %s, not the recorded key %q on network %q: run juice kernel add <url>",
+			c.base, h.PublicKey, h.Network, c.publicKey, c.network)
+	}
+	self, err := c.Me(ctx)
+	if err != nil {
+		return Identity{}, Self{}, fmt.Errorf("identify %s: %w", c.login, err)
+	}
+	// The credential file's name is a label; the account behind it is the
+	// principal it records.
+	if self.Address.Address != c.login || (c.principal != "" && self.ID != c.principal) {
+		return Identity{}, Self{}, fmt.Errorf("the session for %s belongs to %s (principal %s): run juice auth login %s",
+			c.login, self.Address.Address, self.ID, c.login)
+	}
+	if self.Address.Principal == "" {
+		return Identity{}, Self{}, fmt.Errorf("the kernel at %s names no principals: juice-agent needs kernel contract 0.18 or later", c.base)
+	}
+	return Identity{Network: h.Network, PublicKey: h.PublicKey, Principal: self.ID}, self, nil
+}
+
+// Task is a kernel task (D6) as GET /v1/tasks renders it: every party a Name.
+// created_by is absent on a task from another kernel.
 type Task struct {
 	ID             string         `json:"id"`
-	ActionRef      string         `json:"action"`
-	CreatedBy      string         `json:"created_by"`
-	Requester      string         `json:"requester"`
-	Owner          string         `json:"owner"`
-	RequiredCaller string         `json:"required_caller"`
+	ActionRef      Name           `json:"action"`
+	CreatedBy      Name           `json:"created_by"`
+	Requester      Name           `json:"requester"`
+	Owner          Name           `json:"owner"`
+	RequiredCaller Name           `json:"required_caller"`
 	PartialArgs    map[string]any `json:"partial_args"`
 	AllowedInput   map[string]any `json:"allowed_input"`
 	Status         string         `json:"status"`

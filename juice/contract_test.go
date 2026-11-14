@@ -7,12 +7,13 @@ import (
 )
 
 // The schemas the kernel returns for its own natives (GET /v1/actions?ref=, at
-// kernel dff95e6), verbatim apart from shortened descriptions.
+// kernel dff95e6), verbatim apart from shortened descriptions and the lookup
+// row's action, which names it as an object (API R3a, kernel contract 0.18).
 const (
 	kernelChatInput    = `{"additionalProperties":false,"properties":{"messages":{"description":"history","items":{"additionalProperties":false,"properties":{"content":{"description":"text","type":"string"},"role":{"description":"role","type":"string"}},"required":["role","content"],"type":"object"},"type":"array"}},"required":["messages"],"type":"object"}`
 	kernelChatOutput   = `{"additionalProperties":false,"properties":{"choices":{"description":"reply","items":{"additionalProperties":false,"properties":{"index":{"description":"position","type":"integer"},"message":{"additionalProperties":false,"description":"the reply","properties":{"content":{"description":"text","type":"string"},"role":{"description":"role","type":"string"}},"type":"object"}},"type":"object"},"type":"array"}},"type":"object"}`
 	kernelLookupInput  = `{"additionalProperties":false,"properties":{"limit":{"description":"max","type":"integer"},"query":{"description":"query","type":"string"}},"required":["query"],"type":"object"}`
-	kernelLookupOutput = `{"additionalProperties":false,"properties":{"results":{"description":"ranked","items":{"additionalProperties":false,"properties":{"action":{"description":"address","type":"string"},"action_id":{"description":"id","type":"string"},"description":{"description":"what","type":"string"},"input_schema":{"description":"input","type":"object"},"price":{"description":"price","type":"integer"},"score":{"description":"score","type":"number"}},"type":"object"},"type":"array"}},"type":"object"}`
+	kernelLookupOutput = `{"additionalProperties":false,"properties":{"results":{"description":"ranked","items":{"additionalProperties":false,"properties":{"action":{"additionalProperties":false,"description":"the action","properties":{"address":{"description":"address","type":"string"},"principal":{"description":"principal","type":"string"}},"type":"object"},"action_id":{"description":"id","type":"string"},"description":{"description":"what","type":"string"},"input_schema":{"description":"input","type":"object"},"price":{"description":"price","type":"integer"},"score":{"description":"score","type":"number"}},"type":"object"},"type":"array"}},"type":"object"}`
 	kernelTimeOutput   = `{"additionalProperties":false,"properties":{"iso":{"description":"RFC 3339","type":"string"},"unix":{"description":"epoch","type":"integer"}},"type":"object"}`
 )
 
@@ -47,8 +48,11 @@ func TestContractCheckNamesTheShortfall(t *testing.T) {
 		{"wrong action entirely", reasonContract, `{"type":"object"}`, kernelTimeOutput,
 			"output.properties.choices: missing (want array)"},
 		{"read field missing", actionLookupContract, kernelLookupInput,
-			r(`"action":{"description":"address","type":"string"},`, ``).Replace(kernelLookupOutput),
-			"output.properties.results.items.properties.action: missing (want string)"},
+			r(`"address":{"description":"address","type":"string"},`, ``).Replace(kernelLookupOutput),
+			"output.properties.results.items.properties.action.properties.address: missing (want string)"},
+		{"action named by a string", actionLookupContract, kernelLookupInput,
+			r(`"action":{"additionalProperties":false,"description":"the action","properties":{"address":{"description":"address","type":"string"},"principal":{"description":"principal","type":"string"}},"type":"object"},`, `"action":{"description":"address","type":"string"},`).Replace(kernelLookupOutput),
+			"output.properties.results.items.properties.action: type string (want object)"},
 		{"read field mistyped", actionLookupContract, kernelLookupInput,
 			r(`"input_schema":{"description":"input","type":"object"}`, `"input_schema":{"description":"input","type":"string"}`).Replace(kernelLookupOutput),
 			"output.properties.results.items.properties.input_schema: type string (want object)"},

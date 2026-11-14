@@ -141,8 +141,9 @@ func wrapText(s string, width, indent int) string {
 }
 
 // setup does the shared startup: resolve config, open the login's session,
-// check that it is the account the login names, and assemble the executor. It
-// returns the executor, the client, and the resolved config.
+// check that the kernel and the account are the recorded ones and bind the home
+// to their identity, and assemble the executor. It returns the executor, the
+// client, and the resolved config.
 func setup(ctx context.Context, log *logger, login string) (*Executor, *juice.Client, Config, error) {
 	cfg, err := ResolveConfig(login)
 	if err != nil {
@@ -152,17 +153,16 @@ func setup(ctx context.Context, log *logger, login string) (*Executor, *juice.Cl
 	if err != nil {
 		return nil, nil, cfg, err
 	}
-	self, err := cl.Me(ctx)
+	id, self, err := cl.Verify(ctx)
 	if err != nil {
-		return nil, nil, cfg, fmt.Errorf("identify %s: %w", login, err)
+		return nil, nil, cfg, err
 	}
-	// The credential file's name is a label; the account behind it is the
-	// principal it records. A renamed or recreated account must not be served
-	// under memory and a home that belong to another.
-	if self.Address != login || (cl.Principal() != "" && self.ID != cl.Principal()) {
-		return nil, nil, cfg, fmt.Errorf("the session for %s belongs to %s (principal %s): run juice auth login %s",
-			login, self.Address, self.ID, login)
+	// The home is named by a login, which is a label: it must stay the identity's
+	// it was first served under, before any persona is opened (ecosystem §5, §7).
+	if err := cfg.BindIdentity(id); err != nil {
+		return nil, nil, cfg, err
 	}
+	cfg.Principal = self.Address.Principal
 	log.event("login", map[string]any{"login": login, "available": self.Available})
 	// The two affordances must meet their contracts, or the daemon does not start.
 	// Each job reads their terms again (Executor.Execute).
@@ -234,7 +234,7 @@ func runServe(args []string) error {
 	if marked, err := Recover(cfg.PersonasDir); err == nil && len(marked) > 0 {
 		log.event("recovery", map[string]any{"interrupted": marked})
 	}
-	in := NewIntake(cl, exec.Execute, cfg.Login, cfg.DefaultBudget, cfg.Concurrency,
+	in := NewIntake(cl, exec.Execute, cfg.Principal, cfg.DefaultBudget, cfg.Concurrency,
 		time.Duration(cfg.PollSeconds)*time.Second, log.event)
 	in.Start(runCtx)
 	log.event("serving", map[string]any{"concurrency": cfg.Concurrency, "poll_seconds": cfg.PollSeconds})

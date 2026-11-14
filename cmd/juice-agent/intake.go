@@ -33,7 +33,7 @@ type TaskSource interface {
 type Intake struct {
 	src      TaskSource
 	run      func(context.Context, agent.Job) (agent.Outcome, error)
-	address  string // the agent's own address: only tasks it must complete are its work
+	self     string // the agent's own principal: only tasks it must complete are its work
 	budget   int
 	interval time.Duration
 	workers  int
@@ -63,14 +63,15 @@ type pending struct {
 	allowedInput map[string]any
 }
 
-// NewIntake builds intake over src for the agent at address, running each job
-// through run with budget, on workers workers, polling every interval.
-func NewIntake(src TaskSource, run func(context.Context, agent.Job) (agent.Outcome, error), address string,
+// NewIntake builds intake over src for the agent whose principal is self,
+// running each job through run with budget, on workers workers, polling every
+// interval.
+func NewIntake(src TaskSource, run func(context.Context, agent.Job) (agent.Outcome, error), self string,
 	budget, workers int, interval time.Duration, log func(string, map[string]any)) *Intake {
 	if log == nil {
 		log = func(string, map[string]any) {}
 	}
-	return &Intake{src: src, run: run, address: address, budget: budget, interval: interval, workers: workers, log: log,
+	return &Intake{src: src, run: run, self: self, budget: budget, interval: interval, workers: workers, log: log,
 		queue: make(chan pending, workers*8), stop: make(chan struct{}),
 		seen: map[string]bool{}, active: map[string]bool{}, unsent: map[string]owed{}}
 }
@@ -133,8 +134,15 @@ func (in *Intake) scan(ctx context.Context) {
 	defer in.mu.Unlock()
 	waiting := map[string]bool{}
 	for _, t := range tasks {
-		if t.RequiredCaller != in.address {
+		if t.RequiredCaller.Principal != in.self {
 			continue // a task the agent funded but must not complete is not its work
+		}
+		if t.Requester.Principal == "" || (t.CreatedBy.Address != "" && t.CreatedBy.Principal == "") {
+			// A party named without its principal cannot be keyed: keying it as
+			// empty would join conversations the key keeps apart. A task from
+			// another kernel names no creating action at all and is keyed.
+			in.log("task_skipped", map[string]any{"task_id": t.ID, "reason": "a party without a principal"})
+			continue
 		}
 		waiting[t.ID] = true
 		persona := personaKey(t)
@@ -209,7 +217,9 @@ func (in *Intake) complete(ctx context.Context, id string, o owed) {
 //	no thread_id, direct       → (requester, created_by, "")  when requester = owner
 //	no thread_id, relayed      → (requester, created_by, "task:"+id)
 //
-// The kernel certifies requester, owner and created_by, never a conversation, so
+// Each party is its principal, stable under renames (ecosystem §5); created_by
+// is empty on a task from another kernel. The kernel certifies requester, owner
+// and created_by, never a conversation, so
 // the conversation comes from the application's thread_id. Without one, a
 // direct sender (no intermediary between the payer and the requester) is one
 // conversation, and a relayed task is its own persona: wrongly merging two
@@ -221,10 +231,10 @@ func personaKey(t juice.Task) string {
 	switch thread, _ := t.PartialArgs["thread_id"].(string); {
 	case thread != "":
 		third = "t:" + thread
-	case t.Requester != t.Owner:
+	case t.Requester.Principal != t.Owner.Principal:
 		third = "task:" + t.ID
 	}
-	return url.QueryEscape(t.Requester) + "|" + url.QueryEscape(t.CreatedBy) + "|" + url.QueryEscape(third)
+	return url.QueryEscape(t.Requester.Principal) + "|" + url.QueryEscape(t.CreatedBy.Principal) + "|" + url.QueryEscape(third)
 }
 
 // promptFromTask renders a task's parked request into the job prompt, prefixed
@@ -233,9 +243,9 @@ func personaKey(t juice.Task) string {
 // convention) or a "request" field is used directly; otherwise the whole
 // partial_args is rendered.
 func promptFromTask(t juice.Task) string {
-	sender := t.Owner
-	if t.Requester != t.Owner {
-		sender += " via " + t.Requester
+	sender := t.Owner.Address
+	if t.Requester.Principal != t.Owner.Principal {
+		sender += " via " + t.Requester.Address
 	}
 	text := renderArgs(t.PartialArgs)
 	if msg, ok := t.PartialArgs["message"].(string); ok && msg != "" {

@@ -4,7 +4,7 @@ Version: 0.1.2
 Status: design document
 Codename: `juice-agent`
 
-This document is aligned with `requirements.md` 0.10.0: all work arrives as kernel tasks, each task
+This document is aligned with `requirements.md` 0.11.0: all work arrives as kernel tasks, each task
 joins a persona keyed from the task alone (§6), the harness depends on two configured actions
 (reasoning and action lookup), and the channel layer, the maker and the learned memory file are gone.
 
@@ -357,7 +357,7 @@ in room *team* and her post in room *secret* have identical certified fields, an
 merges the two rooms or splits one room by member. Separation must come from the application, as
 OpenClaw takes it from each platform's chat id and email from `In-Reply-To` (RFC 5322); unlike
 OpenClaw the agent can write no adapter per application, because the set of applications is open. So
-the convention is one argument name, `thread_id`, and the key is:
+the convention is one argument name, `thread_id`, and the key is, each party by its principal:
 
 ```text
 thread_id present          → (requester, created_by, "t:" + thread_id)
@@ -369,7 +369,9 @@ Errors are asymmetric: merging two conversations discloses one audience's turns 
 separating them only loses continuity. The rule therefore fragments whenever continuity is not
 established by certified fields — a direct sender has no intermediary, a relayed task without
 `thread_id` does. The identifier is namespaced by requester and creating action, so an application
-cannot reach another's persona by naming its thread. An application can misstate its own threads;
+cannot reach another's persona by naming its thread. The parties are principals, not addresses: a
+handle can be renamed and re-taken by another account (kernel D15), so an address-keyed persona
+would pass one person's history to another (ecosystem §5). An application can misstate its own threads;
 the agent certifies attribution, never an application's assertions, and under the kernel's ex-post
 trust model (G10) a misbehaving requester is judged afterwards and its approval revoked.
 

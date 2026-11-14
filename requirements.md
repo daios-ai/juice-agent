@@ -1,6 +1,6 @@
 # Juice Agent Requirements
 
-Version: 0.10.0
+Version: 0.11.0
 Status: implementation requirements
 Codename: `juice-agent`
 Copyright (C) 2026 Pedro A. Ortega <pedro.ortega@gmail.com>
@@ -12,6 +12,16 @@ contract `juicedocs/requirements.md` and the ecosystem standard `juicedocs/ecosy
 A requirement here must violate neither. Citations use the kernel's own labels: *kernel §N* for a
 section, *kernel D/P/G/U N* for a design decision, protocol clause, guarantee, or user story, and
 *ecosystem §N* for the standard.
+
+Revision 0.11.0 resynchronises with the kernel contract 0.18. A reply names every party and action
+as an object, `{address, principal, nickname?}` (API R3a): the address is what a person or the model
+reads and what the agent sends back; the principal, `user_id@kernel_key[/name]`, is stable under
+renames and is what the agent stores and compares. Personas are keyed by the requester's and the
+creating action's principals, and the required caller is matched by the agent's own principal
+(§10); conversations kept under the earlier, address-named files are not continued. The agent's
+home is bound to the identity it was first served under, `(network fingerprint, kernel public key,
+principal id)`, recorded in `identity.json` and checked at every start, and the kernel is checked
+against its recorded key and network (ecosystem §5, §6, §7; §11).
 
 Revision 0.10.0 adds the web installer and the release workflow. `install.sh` downloads the
 released binary for the machine's platform, refuses it unless it matches the release's
@@ -347,8 +357,9 @@ messages and never knows a prompt exists.
 ## 10. Intake and personas
 
 **Tasks only.** Intake polls `GET /v1/tasks?status=waiting` every `poll_seconds` and keeps the tasks
-whose `required_caller` is the agent's address (the listing also returns tasks the agent funded). It
-reads every page (`limit` 200, the API's ceiling, until a short page): the listing has no
+whose `required_caller` principal is the agent's own, as `GET /v1/me` names it (a handle is display
+only and never compared, kernel D15; the listing also returns tasks the agent funded). It reads every
+page (`limit` 200, the API's ceiling, until a short page): the listing has no
 required-caller filter, so one page of tasks the agent funded would otherwise hide every task
 addressed to it. The
 kernel lists only tasks from requesters the agent's operator approved (kernel U52); approval is the
@@ -359,13 +370,18 @@ access rule. There is no other intake and no application-specific code.
 but not which conversation it belongs to: two tasks from one person in two rooms of one application
 have identical certified fields, so no function of those fields alone can separate them. The
 conversation therefore comes from the application, in the argument `partial_args.thread_id`, and the
-key is computed from the task alone, with no knowledge of the application:
+key is computed from the task alone, with no knowledge of the application. Each party in it is its
+principal (API R3a), so a renamed requester keeps its persona and a handle taken over by another
+account does not inherit one (ecosystem §5). `created_by` is absent on a task from another kernel
+and keys as empty. A task naming the requester, or a creating action, without its principal is
+skipped and logged, never keyed: keying the requester as empty would join different senders, and
+keying a named creating action as empty would join one requester's threads across its actions:
 
 | Case | Condition | Key |
 | --- | --- | --- |
 | Threaded | `thread_id` is a non-empty string | (requester, created_by, `t:` + thread_id) |
-| Direct | no `thread_id`, requester = owner | (requester, created_by, ∅) |
-| Relayed | no `thread_id`, requester ≠ owner | (requester, created_by, `task:` + task id) |
+| Direct | no `thread_id`, requester = owner (by principal) | (requester, created_by, ∅) |
+| Relayed | no `thread_id`, requester ≠ owner (by principal) | (requester, created_by, `task:` + task id) |
 
 The agent is implicit: one home per login. Wrongly merging two conversations discloses one audience's
 turns to another, while wrongly separating them only loses continuity; the rule therefore fragments
@@ -378,10 +394,12 @@ assertions, and a misbehaving requester is dealt with by revoking its approval (
 
 The persona's file name is each component `url.QueryEscape`d and the three joined by `|`, so the
 separator never occurs inside a component and distinct keys never share a file. A name longer than
-200 bytes is replaced by its SHA-256 hex, and the key is written as the file's first record.
+200 bytes is replaced by its SHA-256 hex, and the key is written as the file's first record. Files
+named by addresses, written before revision 0.11.0, are never continued; recovery still marks one
+interrupted if its last job was.
 
 **Attribution.** Each task becomes one user message, `<owner>: <text>`, or `<owner> via
-<requester>: <text>` when they differ: the owner is the payer the kernel certifies, the requester the
+<requester>: <text>` when their principals differ, each written by its address: the owner is the payer the kernel certifies, the requester the
 principal whose action relayed it. `text` is `partial_args.message`, else `partial_args.request`,
 else the whole `partial_args` as JSON. Owner is attribution within a persona, never part of its key.
 
@@ -431,9 +449,17 @@ outcome as JSON; successive one-shot runs continue that persona.
    personas belong to the first. The daemon keeps its own session and reports that a restart is needed
    to serve the other account.
 4. At startup the daemon fails, naming the command to run, when the kernel is not recorded (`juice
-   kernel add <url>`), when the login holds no session or its refresh is refused (`juice auth login
-   <login>`), or when `GET /v1/me` answers for another address or principal than the login and its
-   credential record name.
+   kernel add <url>`), when `GET /health` reports another public key or network fingerprint than the
+   record's `public_key` and `world_fingerprint` (`juice kernel add <url>`; ecosystem §6), when the
+   login holds no session or its refresh is refused (`juice auth login <login>`), or when `GET
+   /v1/me` answers for another address or principal than the login and its credential record name,
+   or names no principal (a kernel before contract 0.18).
+5. The home is bound to its identity, `(network fingerprint, kernel public key, principal id)`
+   (ecosystem §5): the first start that finds no `identity.json` in the home writes it, and every
+   start, before recovery or any persona is opened, refuses an identity other than the recorded one,
+   naming both. A login reused for another account, or a kernel record re-pointed to another kernel
+   or network, therefore never continues the home's conversations (ecosystem §7). A home made
+   before revision 0.11.0 is bound at its first start under this revision.
 
 ### Filesystem layout (ecosystem §2)
 
@@ -441,6 +467,7 @@ outcome as JSON; successive one-shot runs continue that persona.
 $JUICE_HOME/agents/<login>/        one agent, e.g. agents/research@work/
 ├── agent.md                       human-authored persona and knowledge (§9); never written by the daemon
 ├── config.json                    written whole at first start (ecosystem §3); then the operator's
+├── identity.json                  the identity the home is bound to, written once (§11)
 ├── serve.lock                     held by the serving daemon under an exclusive flock; its pid
 └── personas/                      one append-only JSONL per persona (§7, §10)
 $JUICE_HOME/schemas/juice-agent.schema.json   config.json's JSON Schema, rewritten by setup
@@ -448,8 +475,8 @@ $JUICE_HOME/schemas/juice-agent.schema.json   config.json's JSON Schema, rewritt
 
 1. The root is `$JUICE_HOME` (default `~/.juice`); the home is fixed, never cwd-relative.
 2. The daemon `MkdirAll`s the home and its `personas/` (mode `0700`) at startup and writes a blank
-   `agent.md` if absent. It never truncates a file but `serve.lock`, and writes `config.json` only
-   as the next section says.
+   `agent.md` if absent. It never truncates a file but `serve.lock`, writes `identity.json` once
+   (above), and writes `config.json` only as the next section says.
 3. Files of earlier layouts (`persona.md`, `knowledge.md`, `memory.md`, `data/`) are not read; the
    README states the move.
 4. **Intake always runs.** A non-positive `poll_seconds` or `concurrency` falls back to its default.
@@ -480,7 +507,7 @@ second). A bare `juice-agent` prints usage, wrapped to stderr's width up to 80
 columns (80 when stderr is not a terminal); each command line stays whole, its description wrapped
 below it. Serving resolves the home from the login → creates the
 home and blank files if absent → runs setup (writes the schema) and, when absent, `config.json` or its created
-keys → loads config → opens the session and verifies the account (above)
+keys → loads config → opens the session, verifies the kernel and the account and binds the home to its identity (above)
 → assembles the executor → takes the home's lock → runs startup recovery over `personas/` (mark interrupted jobs) → starts
 intake and the worker pool. Each job settles with the rating pass (§8). `SIGTERM`/`SIGINT` must drain: stop intake, let in-flight turns
 finish, persist, exit 0. There is no `juice-agent stop`. Harness tools are not registered on the
@@ -630,7 +657,13 @@ empty `results` list is a search that matched nothing.
       "items": {
         "type": "object",
         "properties": {
-          "action": {"type": "string", "description": "The action's address, owner@kernel/name"},
+          "action": {
+            "type": "object",
+            "properties": {
+              "address": {"type": "string", "description": "The action's address, owner@kernel/name"}
+            },
+            "additionalProperties": false
+          },
           "description": {"type": "string", "description": "What the action does"},
           "input_schema": {"type": "object", "description": "The action's input, as JSON Schema"}
         },
@@ -688,9 +721,13 @@ after a failure and after a settled timeout dispatch; a re-selection after a par
 repeat), steering injection, candidate merge (authoritative read, effect exclusion) and recency eviction,
 offered-only dispatch, quote pinning and eviction on moved terms, `spent` from the reported charge,
 a distinct run key per dispatch, subtask bracket roll-up and shared counters. The product package
-covers intake — the persona key in its three cases, namespacing by requester and creating action,
+covers intake — the persona key in its three cases from principals (a renamed requester keeps its
+persona, a re-taken handle does not inherit it, a task from another kernel without `created_by`),
+namespacing by requester and creating action,
 the unambiguous file-name encoding, attribution, reply shaping, one job per persona with personas
-concurrent, the required-caller filter, a failed job still completing — with its explanation shaped
+concurrent, the required-caller filter by principal, a task naming its requester or creating action
+without a principal skipped,
+a failed job still completing — with its explanation shaped
 onto a sink and onto a declared text field, and without one as `{status, reason}` — and the
 completion resend after a transient failure without a second run; persona files — continuation without job-scoped
 records, an exact rebuild after compaction across jobs, bracket exclusion and numbering, the hashed
@@ -701,17 +738,19 @@ budget cannot pay; never made for an answered job); one run key across a dispatc
 wrapping and width rule (the terminal-size query passed in, so no terminal is needed), the rating
 pass, and the §11 contract: login parsing and home resolution under `JUICE_HOME`, defaults with the
 affordances on the login's kernel and per-key overrides, rejection of unknown and retired keys, home
-creation at mode 0700 with a blank `agent.md` and no config written, and startup refusal of a
-missing session or a mismatched account. `juice` is tested against `httptest` kernels and a temporary
+creation at mode 0700 with a blank `agent.md` and no config written, startup refusal of a
+missing session or a mismatched account, and the home's identity binding (written at first start,
+accepted again, refused for another principal or kernel key). `juice` is tested against `httptest` kernels and a temporary
 `JUICE_HOME` holding client records, with affordance addresses that are not the kernel's natives:
 session rotation on a `401` written back under the lock, adoption of a token another process
-rotated, refusal of another principal's session, a revoked refresh as no session, quote pinning and
+rotated, refusal of another principal's session, a revoked refresh as no session, the kernel's
+recorded key and network checked against `/health` and the identity so established, quote pinning and
 `terms_changed` recognition, the external key and the reported charge (also from a failure's
 `meta`), a `timeout` as not retryable and reported to the loop as such, with its settlement when
 it has one, reasoning and structured output through the configured
 reasoning affordance, lookup through the configured action-lookup affordance, the authoritative
 read, each affordance's contract check (the kernel's natives pass; each shortfall is named by path),
-and task listing with `requester` and completion. Every production file has its `_test.go`.
+and task listing with every party decoded as address and principal, and completion. Every production file has its `_test.go`.
 
 **Flows (`flows/`).** End-to-end shell scripts against the compiled binary, booting a real kernel
 (`juice kernel serve`, through the kernel repository's own flow harness) with the **real Ollama the
@@ -743,7 +782,8 @@ two people and an application's event in one room share a conversation whose job
 another room, the same room name from another action or another application, a direct message,
 another agent, and each reminder without a `thread_id` are each a conversation of their own; turns
 are attributed `owner via requester`), `named`, `session_identity` (another account's session stored under
-the agent's login is not adopted), and `usage` (fits 80 columns and a 50-column pseudo-terminal).
+the agent's login is not adopted; after the handle is renamed away and taken by a new account logged
+in under the same login, the home refuses to start for it), and `usage` (fits 80 columns and a 50-column pseudo-terminal).
 LLM flows assert robust properties, not exact text, and skip (never fail) when the chat model is
 absent: `answer` (an ISO time, spend within budget and equal to the fall in the agent's balance),
 `explanation` (a job cut to one turn fails with `turn-cap` and completes with a non-empty plain-text

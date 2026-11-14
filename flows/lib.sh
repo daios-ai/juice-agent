@@ -227,6 +227,8 @@ await_task() {
 
 json_str() { python3 -c "import sys,json; print(json.dumps(sys.argv[1]))" "$1"; }
 jfield()   { python3 -c "import sys,json; print(json.loads(sys.stdin.read()).get(sys.argv[1],''))" "$1"; }
+# jaddr field — the address of a reply field naming a party or an action (API R3a).
+jaddr()    { python3 -c "import sys,json; print((json.loads(sys.stdin.read()).get(sys.argv[1]) or {}).get('address',''))" "$1"; }
 
 assert_le()      { [ "$2" -le "$3" ] && ok "$1" || fail "$1" "want $2 <= $3"; }
 assert_match()   { echo "$3" | grep -qE "$2" && ok "$1" || fail "$1" "want /$2/ in [$3]"; }

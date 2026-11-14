@@ -53,22 +53,26 @@ func TestLoggerEmitsStructuredJSON(t *testing.T) {
 // nativeReads are the kernel's action reads for the natives setup checks, with
 // their canonical schemas (descriptions shortened).
 var nativeReads = map[string]string{
-	"sys@k/llm/chat": `{"action":"sys@k/llm/chat","description":"chat","price":0,
+	"sys@k/llm/chat": `{"action":{"address":"sys@k/llm/chat","principal":"P/llm/chat"},"description":"chat","price":0,
 		"input_schema":{"type":"object","properties":{"messages":{"type":"array","description":"history","items":{"type":"object","properties":{"role":{"type":"string","description":"role"},"content":{"type":"string","description":"text"}},"required":["role","content"],"additionalProperties":false}}},"required":["messages"],"additionalProperties":false},
 		"output_schema":{"type":"object","properties":{"choices":{"type":"array","description":"reply","items":{"type":"object","properties":{"message":{"type":"object","description":"the reply","properties":{"content":{"type":"string","description":"text"}},"additionalProperties":false}},"additionalProperties":false}}},"additionalProperties":false}}`,
-	"sys@k/lookup": `{"action":"sys@k/lookup","description":"Semantic search over active actions","price":0,
+	"sys@k/lookup": `{"action":{"address":"sys@k/lookup","principal":"P/lookup"},"description":"Semantic search over active actions","price":0,
 		"input_schema":{"type":"object","properties":{"query":{"type":"string","description":"query"},"limit":{"type":"integer","description":"max"}},"required":["query"],"additionalProperties":false},
-		"output_schema":{"type":"object","properties":{"results":{"type":"array","description":"ranked","items":{"type":"object","properties":{"action":{"type":"string","description":"address"},"description":{"type":"string","description":"what"},"input_schema":{"type":"object","description":"input"}},"additionalProperties":false}}},"additionalProperties":false}}`,
-	"sys@k/time": `{"action":"sys@k/time","description":"Current time","price":0,
+		"output_schema":{"type":"object","properties":{"results":{"type":"array","description":"ranked","items":{"type":"object","properties":{"action":{"type":"object","description":"the action","properties":{"address":{"type":"string","description":"address"},"principal":{"type":"string","description":"principal"}},"additionalProperties":false},"description":{"type":"string","description":"what"},"input_schema":{"type":"object","description":"input"}},"additionalProperties":false}}},"additionalProperties":false}}`,
+	"sys@k/time": `{"action":{"address":"sys@k/time","principal":"P/time"},"description":"Current time","price":0,
 		"input_schema":{"type":"object","properties":{},"additionalProperties":false},
 		"output_schema":{"type":"object","properties":{"iso":{"type":"string","description":"RFC 3339"}},"additionalProperties":false}}`,
 }
 
-// kernelServing answers GET /v1/me as address/id and the natives' action reads,
-// accepting only token tok-1.
-func kernelServing(t *testing.T, address, id string) string {
+// kernelServing answers GET /health as kernel key on network NET, GET /v1/me as
+// address/id and the natives' action reads, accepting only token tok-1.
+func kernelServing(t *testing.T, address, id, key string) string {
 	t.Helper()
 	srv := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		if r.URL.Path == "/health" {
+			json.NewEncoder(w).Encode(map[string]any{"public_key": key, "network_fingerprint": "NET"})
+			return
+		}
 		if r.Header.Get("Authorization") != "Bearer tok-1" {
 			w.WriteHeader(401)
 			w.Write([]byte(`{"error":"unauthenticated","code":"unauthenticated"}`))
@@ -83,17 +87,18 @@ func kernelServing(t *testing.T, address, id string) string {
 			w.Write([]byte("[" + row + "]"))
 			return
 		}
-		json.NewEncoder(w).Encode(map[string]any{"id": id, "address": address})
+		json.NewEncoder(w).Encode(map[string]any{"id": id, "address": map[string]any{"address": address, "principal": id + "@" + key}})
 	}))
 	t.Cleanup(srv.Close)
 	return srv.URL
 }
 
-// writeLogin writes the juice CLI's records for agent@k under root.
-func writeLogin(t *testing.T, root, endpoint, principal string) {
+// writeLogin writes the juice CLI's records for agent@k under root: kernel k
+// recorded with key on network NET, and the login's session for principal.
+func writeLogin(t *testing.T, root, endpoint, principal, key string) {
 	t.Helper()
 	os.MkdirAll(filepath.Join(root, "client", "credentials"), 0o700)
-	cfg, _ := json.Marshal(map[string]any{"kernels": map[string]any{"k": map[string]any{"endpoint": endpoint, "public_key": "KEY"}}})
+	cfg, _ := json.Marshal(map[string]any{"kernels": map[string]any{"k": map[string]any{"endpoint": endpoint, "public_key": key, "world_fingerprint": "NET"}}})
 	os.WriteFile(filepath.Join(root, "client", "config.json"), cfg, 0o600)
 	cred, _ := json.Marshal(map[string]any{"token": "tok-1", "principal_id": principal})
 	os.WriteFile(filepath.Join(root, "client", "credentials", "agent@k.json"), cred, 0o600)
@@ -101,13 +106,13 @@ func writeLogin(t *testing.T, root, endpoint, principal string) {
 
 func TestSetupAcceptsTheLoginsOwnAccount(t *testing.T) {
 	root := setJuiceHome(t)
-	writeLogin(t, root, kernelServing(t, "agent@k", "u1"), "u1")
+	writeLogin(t, root, kernelServing(t, "agent@k", "u1", "KEY"), "u1", "KEY")
 	exec, cl, cfg, err := setup(context.Background(), newLogger(), "agent@k")
 	if err != nil {
 		t.Fatalf("setup: %v", err)
 	}
-	if cl.Login() != "agent@k" || cfg.Home != filepath.Join(root, "agents", "agent@k") {
-		t.Fatalf("login=%q home=%q", cl.Login(), cfg.Home)
+	if cl.Login() != "agent@k" || cfg.Home != filepath.Join(root, "agents", "agent@k") || cfg.Principal != "u1@KEY" {
+		t.Fatalf("login=%q home=%q principal=%q", cl.Login(), cfg.Home, cfg.Principal)
 	}
 	// The loop discovers through the configured action lookup. Its terms are not
 	// fixed at startup: each job reads them (Executor.Execute).
@@ -120,7 +125,7 @@ func TestSetupAcceptsTheLoginsOwnAccount(t *testing.T) {
 // message names the file, the key, the address and the field.
 func TestSetupRefusesAnAffordanceOfTheWrongShape(t *testing.T) {
 	root := setJuiceHome(t)
-	writeLogin(t, root, kernelServing(t, "agent@k", "u1"), "u1")
+	writeLogin(t, root, kernelServing(t, "agent@k", "u1", "KEY"), "u1", "KEY")
 	home := filepath.Join(root, "agents", "agent@k")
 	os.MkdirAll(home, 0o700)
 	os.WriteFile(filepath.Join(home, "config.json"), []byte(`{"action_lookup":"sys@k/time"}`), 0o600)
@@ -134,7 +139,7 @@ func TestSetupRefusesAnAffordanceOfTheWrongShape(t *testing.T) {
 func TestSetupRefusesAnotherAccount(t *testing.T) {
 	for _, tc := range []struct{ address, id string }{{"other@k", "u1"}, {"agent@k", "u2"}} {
 		root := setJuiceHome(t)
-		writeLogin(t, root, kernelServing(t, tc.address, tc.id), "u1")
+		writeLogin(t, root, kernelServing(t, tc.address, tc.id, "KEY"), "u1", "KEY")
 		_, _, _, err := setup(context.Background(), newLogger(), "agent@k")
 		if err == nil || !strings.Contains(err.Error(), "juice auth login agent@k") {
 			t.Fatalf("%+v: err = %v, want a refusal naming juice auth login", tc, err)
@@ -142,9 +147,35 @@ func TestSetupRefusesAnotherAccount(t *testing.T) {
 	}
 }
 
+// The first start binds the home to its identity; a later start under the same
+// login for another account, or a kernel with another key, is refused.
+func TestSetupBindsTheHomeToItsIdentity(t *testing.T) {
+	root := setJuiceHome(t)
+	writeLogin(t, root, kernelServing(t, "agent@k", "u1", "KEY"), "u1", "KEY")
+	if _, _, _, err := setup(context.Background(), newLogger(), "agent@k"); err != nil {
+		t.Fatalf("first start: %v", err)
+	}
+	path := filepath.Join(root, "agents", "agent@k", "identity.json")
+	var id juice.Identity
+	if b, err := os.ReadFile(path); err != nil || json.Unmarshal(b, &id) != nil ||
+		id != (juice.Identity{Network: "NET", PublicKey: "KEY", Principal: "u1"}) {
+		t.Fatalf("identity.json = %+v, %v", id, err)
+	}
+	if _, _, _, err := setup(context.Background(), newLogger(), "agent@k"); err != nil {
+		t.Fatalf("same identity: %v", err)
+	}
+	for _, tc := range []struct{ id, key string }{{"u2", "KEY"}, {"u1", "KEY2"}} {
+		writeLogin(t, root, kernelServing(t, "agent@k", tc.id, tc.key), tc.id, tc.key)
+		_, _, _, err := setup(context.Background(), newLogger(), "agent@k")
+		if err == nil || !strings.Contains(err.Error(), "this home belongs to principal u1 on kernel KEY") {
+			t.Fatalf("%+v: err = %v, want the home's identity named", tc, err)
+		}
+	}
+}
+
 func TestSetupWithoutSessionNamesTheLoginCommand(t *testing.T) {
 	root := setJuiceHome(t)
-	writeLogin(t, root, "http://127.0.0.1:1", "u1")
+	writeLogin(t, root, "http://127.0.0.1:1", "u1", "KEY")
 	os.Remove(filepath.Join(root, "client", "credentials", "agent@k.json"))
 	_, _, _, err := setup(context.Background(), newLogger(), "agent@k")
 	if err == nil || !strings.Contains(err.Error(), "juice auth login agent@k") {

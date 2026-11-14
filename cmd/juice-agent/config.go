@@ -36,6 +36,7 @@ type Config struct {
 	Login       string `json:"-"`
 	Home        string `json:"-"`
 	PersonasDir string `json:"-"`
+	Principal   string `json:"-"` // the account's principal, user_id@kernel_key, set once verified
 }
 
 // DefaultConfig is every setting's default, and the one place each is stated: the
@@ -237,6 +238,33 @@ func (c Config) EnsureHome() error {
 		return err
 	}
 	return f.Close()
+}
+
+// BindIdentity binds the home to id: the first start that finds no identity.json
+// writes it, and every start refuses an identity other than the recorded one, so
+// a login reused for another account, or a kernel record re-pointed to another
+// kernel or network, never continues this home's conversations (ecosystem §5, §7).
+func (c Config) BindIdentity(id juice.Identity) error {
+	path := filepath.Join(c.Home, "identity.json")
+	b, err := json.MarshalIndent(id, "", "  ")
+	if err != nil {
+		return err
+	}
+	if err := writeFile(path, append(b, '\n'), false); err != nil {
+		return err
+	}
+	var held juice.Identity
+	if b, err = os.ReadFile(path); err == nil {
+		err = json.Unmarshal(b, &held)
+	}
+	if err != nil {
+		return fmt.Errorf("%s: %w", path, err)
+	}
+	if held != id {
+		return fmt.Errorf("%s: this home belongs to principal %s on kernel %s, network %s, not principal %s on kernel %s, network %s",
+			path, held.Principal, held.PublicKey, held.Network, id.Principal, id.PublicKey, id.Network)
+	}
+	return nil
 }
 
 // agentPath is agent.md, the one human-authored file: persona and knowledge,

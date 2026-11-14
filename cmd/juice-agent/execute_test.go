@@ -37,10 +37,10 @@ type fakeKernel struct {
 	drop        int            // charge the next calls, then lose their replies
 	affErr      error          // Affordances fails with this
 
-	spent   int                        // every charge made
-	seen    [][]map[string]any         // the chat each selection was asked over
-	runs    []fakeRun                  // every call received
-	byKey   map[string]agent.RunResult // first outcome per key
+	spent     int                        // every charge made
+	seen      [][]map[string]any         // the chat each selection was asked over
+	runs      []fakeRun                  // every call received
+	byKey     map[string]agent.RunResult // first outcome per key
 	refused   int                        // runs refused for a stale quote_hash
 	rated     map[string]int
 	explained int // explanation calls answered
@@ -128,7 +128,7 @@ func (k *fakeKernel) answer(action string, args map[string]any) agent.RunResult 
 		var rows []any
 		for _, s := range k.script {
 			if s.Action != "reply" && s.Action != testLookup { // the lookup's entry is the always-offered one
-				rows = append(rows, map[string]any{"action": s.Action, "description": "scripted"})
+				rows = append(rows, map[string]any{"action": map[string]any{"address": s.Action}, "description": "scripted"})
 			}
 		}
 		return agent.RunResult{TxID: "tx-l" + n, Charge: k.charges["lookup"], Result: map[string]any{"results": rows}}

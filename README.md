@@ -11,7 +11,7 @@ and write its instructions in `agent.md`.
 
 ## Requirements
 
-- A Juice kernel at contract 0.16 or later, with a language model available through its
+- A Juice kernel at contract 0.18 or later, with a language model available through its
   reasoning action. The project uses the kernel's shipped Ollama endpoint with `gemma4:26b`.
 - The `juice` command line, configured to reach that kernel.
 - Go 1.22.2 or later and Make to build from source.
@@ -30,7 +30,7 @@ matches the release's published checksum, installs it in `$JUICE_HOME/bin`, defa
 and adds the directory to your `PATH` in your shell profile. Options go after `sh -s --`:
 
 ```sh
-curl -fsSL https://raw.githubusercontent.com/daios-ai/juice-agent/main/install.sh | sh -s -- v0.10.0
+curl -fsSL https://raw.githubusercontent.com/daios-ai/juice-agent/main/install.sh | sh -s -- v0.11.0
 curl -fsSL https://raw.githubusercontent.com/daios-ai/juice-agent/main/install.sh | sh -s -- --no-modify-path
 ```
 
@@ -114,6 +114,7 @@ Each agent has a directory named after its login under `$JUICE_HOME/agents/`:
 ~/.juice/agents/agent@work/
 ├── agent.md       # your instructions and background knowledge
 ├── config.json    # configuration, written at first launch
+├── identity.json  # the account and kernel this directory belongs to, written at first launch
 └── personas/      # conversation histories
 ```
 
@@ -121,6 +122,12 @@ On first launch, the daemon creates the directory, a blank `agent.md`, `personas
 `config.json` with every setting at its default. It preserves existing files. Edit `agent.md` to
 describe the agent's role, instructions, and relevant background. Changes take effect at the next
 job.
+
+`identity.json` records the account, the kernel's public key and the network the directory was first
+used with. The daemon refuses to start when the login now names another account (for example after
+the handle was renamed and taken by someone else) or the kernel record points to another kernel or
+network, so one account's conversations never reach another. Do not edit it; to start over for a new
+account, move the directory aside.
 
 Installation and every start write `$JUICE_HOME/schemas/juice-agent.schema.json`, which describes
 every setting and its default. The `$schema` key at the top of `config.json` points to it, so an
@@ -165,7 +172,7 @@ Either can be set to another action, as long as that action takes and returns wh
 | Key | It must accept | It must return |
 | --- | --- | --- |
 | `reason` | `messages`: a list of `{role, content}` strings, with roles `system`, `user` and `assistant` | `choices`: a list whose first item's `message.content` is the reply text |
-| `action_lookup` | `query` (string) and `limit` (integer) | `results`: a list of `{action, description, input_schema}` |
+| `action_lookup` | `query` (string) and `limit` (integer) | `results`: a list of `{action, description, input_schema}`, where `action` is an object with the action's `address` |
 
 The action may accept and return more; the agent ignores the rest. It must not limit the length or
 pattern of what the agent sends, and its `limit` must allow 1 to 10. Fields the agent reads must not
@@ -302,6 +309,8 @@ them when needed. It does not need the account's password in configuration.
 | Problem | What to check |
 | --- | --- |
 | Kernel is not recorded | Run `juice kernel add <url>`. |
+| Kernel reports another key or network | The address now answers for a different kernel. Run `juice kernel add <url>` for the intended kernel. |
+| "this home belongs to principal …" | The agent directory was first used with another account, kernel or network. Log in to the original account, or move the directory aside to start fresh. |
 | Session is missing or revoked | Run `juice auth login <login>`. |
 | "another juice-agent is already serving" | A daemon for that login is running. Stop it before starting another. |
 | Session belongs to another account | Log in to the intended account and restart the daemon. It will not adopt another account's session while running. |
@@ -310,6 +319,13 @@ them when needed. It does not need the account's password in configuration.
 Logs include job, persona, action, and transaction identifiers where applicable. The `persona_opened`
 event reports how much earlier history a job loaded. Conversation files under `personas/` retain
 the local record; `juice tx list --as <login>` shows the kernel's record of calls, charges, and ratings.
+
+## Upgrading from 0.10
+
+This version requires kernel contract 0.18. Conversations started before the upgrade begin anew:
+their files under `personas/` are kept but no longer continued, and you may delete them. The
+one-shot `cli` conversation continues. The first start records the account and kernel the agent
+directory belongs to in `identity.json`, so start it with the login's intended account.
 
 ## Upgrading from 0.6
 
@@ -342,7 +358,7 @@ make flows    # integration flows against a real kernel
 ```
 
 Flows use the kernel checkout at `JUICE_SRC` (default `../juice`) and its compiled binary at
-`JUICE_BIN` (default `$JUICE_SRC/juice`). The kernel must support contract 0.16 or later. Flows that
+`JUICE_BIN` (default `$JUICE_SRC/juice`). The kernel must support contract 0.18 or later. Flows that
 exercise model behaviour use the real Ollama endpoint and skip when Ollama or the chat model is
 unavailable; the remaining flows check daemon and kernel behaviour without a model.
 
@@ -365,7 +381,7 @@ Pushing a `v*` tag runs the release workflow, which builds the four platform arc
 `checksums.txt` and publishes them as the GitHub Release the installer downloads:
 
 ```sh
-git tag -a v0.10.0 -m v0.10.0 && git push origin v0.10.0
+git tag -a v0.11.0 -m v0.11.0 && git push origin v0.11.0
 ```
 
 ### Versions

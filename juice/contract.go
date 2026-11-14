@@ -44,7 +44,9 @@ var actionLookupContract = contract{
 	}, "query"),
 	output: obj(map[string]any{
 		"results": arr("Matching actions, best first", obj(map[string]any{
-			"action":       prop("string", "The action's address, owner@kernel/name"),
+			"action": obj(map[string]any{
+				"address": prop("string", "The action's address, owner@kernel/name"),
+			}),
 			"description":  prop("string", "What the action does"),
 			"input_schema": prop("object", "The action's input, as JSON Schema"),
 		})),

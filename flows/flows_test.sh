@@ -206,7 +206,7 @@ flow_tasks() {
     assert_eq tasks.completed_by_daemon done "$(await_task "$tid" 120)"
     local tx; tx=$(kj task show "$tid" | jfield tx_id)
     assert_eq tasks.reply_in_tx_args failed "$(kj tx show "$tx" | python3 -c 'import sys,json; print(json.load(sys.stdin).get("args",{}).get("status",""))' 2>/dev/null)"
-    assert_eq tasks.runs_as_sender "sys@$(kname "$DB")" "$(kj tx show "$tx" | jfield caller)"
+    assert_eq tasks.runs_as_sender "sys@$(kname "$DB")" "$(kj tx show "$tx" | jaddr caller)"
 
     # A task addressed to other is not the agent's work: it stays waiting.
     local oid; oid=$(message other "not for the agent")
@@ -470,6 +470,15 @@ flow_session_identity() {
     # still seen and completed (bob's session would never list it).
     local tid; tid=$(message agent "identity check")
     assert_eq session_identity.still_the_agent done "$(await_task "$tid" 120)"
+
+    # The home stays bound to the account it was first served for: the handle
+    # renamed away and taken by a new account, logged in under the same login,
+    # is refused before any conversation is opened.
+    kill -TERM "$AGENTD_PID" 2>/dev/null; wait "$AGENTD_PID" 2>/dev/null
+    k admin user rename "$(login agent)" "$(login former)" >/dev/null 2>&1 || { fail session_identity.rename "rename failed"; return; }
+    create_user agent agent-pass >/dev/null 2>&1 || { fail session_identity.recreate "new account failed"; return; }
+    local out; out=$(JUICE_HOME="$(client_home agent)" "$AGENTD" task "$(login agent)" "hello" 2>&1)
+    assert_contains session_identity.home_bound "this home belongs to principal" "$out"
 }
 
 # ---- LLM-in-the-loop flows (real model; robust structural assertions) ------
@@ -527,7 +536,7 @@ flow_rating() {
     local rated; rated=$(jj "$DB" "$KDIR/agent" tx list | python3 -c "
 import sys,json
 for t in json.load(sys.stdin):
-    if t.get('action','').endswith('/time') and t.get('rating') is not None:
+    if (t.get('action') or {}).get('address','').endswith('/time') and t.get('rating') is not None:
         print(t['rating'].get('value')); break
 " 2>/dev/null)
     assert_nonempty rating.tx_rated "$rated"

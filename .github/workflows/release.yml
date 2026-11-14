@@ -1,7 +1,7 @@
 name: release
 
 # Tag a version and push it to publish a release:
-#   git tag -a v0.10.0 -m v0.10.0 && git push origin v0.10.0
+#   git tag -a v0.11.0 -m v0.11.0 && git push origin v0.11.0
 # This cross-compiles the pure-Go binary for all supported platforms and
 # uploads version-less assets (juice-agent_<os>_<arch>.tar.gz) plus checksums.txt,
 # which is exactly what install.sh downloads from .../releases/latest/download/.

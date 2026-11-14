@@ -2,6 +2,7 @@ package main
 
 import (
 	"context"
+	"strings"
 	"sync"
 	"testing"
 	"time"
@@ -10,10 +11,19 @@ import (
 	"github.com/daios-ai/juice-agent/juice"
 )
 
-func task(id, requester, owner, createdBy string, args map[string]any) juice.Task {
-	return juice.Task{ID: id, Requester: requester, Owner: owner, CreatedBy: createdBy,
-		RequiredCaller: "agent@k", PartialArgs: args, Status: "waiting"}
+// named gives an address the principal the test kernel's reply carries for it:
+// the handle stands in for the user id and KEY for the kernel's key.
+func named(address string) juice.Name {
+	return juice.Name{Address: address, Principal: strings.Replace(address, "@k", "@KEY", 1)}
 }
+
+func task(id, requester, owner, createdBy string, args map[string]any) juice.Task {
+	return juice.Task{ID: id, Requester: named(requester), Owner: named(owner), CreatedBy: named(createdBy),
+		RequiredCaller: named("agent@k"), PartialArgs: args, Status: "waiting"}
+}
+
+// self is the agent's own principal in these tests.
+const self = "agent@KEY"
 
 // The persona key, for the running example of requirements §10.
 func TestPersonaKeyCases(t *testing.T) {
@@ -25,10 +35,10 @@ func TestPersonaKeyCases(t *testing.T) {
 	bare2 := task("6", "rooms@k", "alice@k", "rooms@k/post", nil)
 	again := task("7", "alice@k", "alice@k", "sys@k/message", nil)
 
-	if got := personaKey(direct); got != "alice%40k|sys%40k%2Fmessage|" {
+	if got := personaKey(direct); got != "alice%40KEY|sys%40KEY%2Fmessage|" {
 		t.Fatalf("direct key = %q", got)
 	}
-	if got := personaKey(team); got != "rooms%40k|rooms%40k%2Fpost|t%3Ateam" {
+	if got := personaKey(team); got != "rooms%40KEY|rooms%40KEY%2Fpost|t%3Ateam" {
 		t.Fatalf("threaded key = %q", got)
 	}
 	if personaKey(direct) != personaKey(again) {
@@ -47,6 +57,21 @@ func TestPersonaKeyCases(t *testing.T) {
 	other := task("8", "bob@k", "alice@k", "bob@k/post", map[string]any{"thread_id": "secret"})
 	if personaKey(other) == personaKey(secret) {
 		t.Fatal("thread ids are namespaced by requester and creating action")
+	}
+	// Parties are keyed by principal: a renamed requester keeps its persona, and a
+	// handle re-taken by another account does not inherit it.
+	renamed := direct
+	renamed.Requester.Address, renamed.Owner.Address = "alicia@k", "alicia@k"
+	retaken := direct
+	retaken.Requester.Principal, retaken.Owner.Principal = "u2@KEY", "u2@KEY"
+	if personaKey(renamed) != personaKey(direct) || personaKey(retaken) == personaKey(direct) {
+		t.Fatal("a persona must follow the requester's principal, never its handle")
+	}
+	// A task from another kernel carries no created_by; it is still keyed.
+	remote := task("9", "dave@p", "dave@p", "", nil)
+	remote.Requester.Principal, remote.Owner.Principal, remote.CreatedBy = "u9@PKEY", "u9@PKEY", juice.Name{}
+	if got := personaKey(remote); got != "u9%40PKEY||" {
+		t.Fatalf("remote key = %q", got)
 	}
 }
 
@@ -174,11 +199,13 @@ func TestIntakeRunsOneJobPerPersonaAndCompletes(t *testing.T) {
 		task("b1", "bob@k", "bob@k", "sys@k/message", map[string]any{"message": "bob here"}),
 	}}
 	other := task("x1", "alice@k", "alice@k", "sys@k/message", nil)
-	other.RequiredCaller = "someone@k" // the agent funded it but must not complete it
-	src.tasks = append(src.tasks, other)
+	other.RequiredCaller = named("someone@k") // the agent funded it but must not complete it
+	impostor := task("x2", "alice@k", "alice@k", "sys@k/message", nil)
+	impostor.RequiredCaller.Principal = "u2@KEY" // the agent's handle, another account
+	src.tasks = append(src.tasks, other, impostor)
 
 	g := &gatedRun{release: make(chan struct{})}
-	in := NewIntake(src, g.run, "agent@k", 50, 4, time.Hour, nil)
+	in := NewIntake(src, g.run, self, 50, 4, time.Hour, nil)
 	ctx := context.Background()
 	in.Start(ctx)
 
@@ -215,6 +242,9 @@ func TestIntakeRunsOneJobPerPersonaAndCompletes(t *testing.T) {
 	if _, ok := src.done("x1"); ok || g.count() != 3 {
 		t.Fatal("a task whose required caller is another must be left alone")
 	}
+	if _, ok := src.done("x2"); ok {
+		t.Fatal("a task whose required caller is another must be left alone")
+	}
 }
 
 func TestIntakeResendsTransientCompletionWithoutRerunning(t *testing.T) {
@@ -223,7 +253,7 @@ func TestIntakeResendsTransientCompletionWithoutRerunning(t *testing.T) {
 		failures: map[string]int{"t1": 1}}
 	g := &gatedRun{release: make(chan struct{})}
 	close(g.release)
-	in := NewIntake(src, g.run, "agent@k", 10, 1, time.Hour, nil)
+	in := NewIntake(src, g.run, self, 10, 1, time.Hour, nil)
 	ctx := context.Background()
 	in.Start(ctx)
 	in.scan(ctx)
@@ -249,7 +279,7 @@ func TestIntakeHoldsPersonaUntilCompleted(t *testing.T) {
 		}}
 	g := &gatedRun{release: make(chan struct{})}
 	close(g.release)
-	in := NewIntake(src, g.run, "agent@k", 10, 2, time.Hour, nil)
+	in := NewIntake(src, g.run, self, 10, 2, time.Hour, nil)
 	ctx := context.Background()
 	in.Start(ctx)
 	owedA1 := func() bool { in.mu.Lock(); defer in.mu.Unlock(); return len(in.unsent) == 1 }
@@ -275,7 +305,7 @@ func TestIntakeFailedJobStillCompletes(t *testing.T) {
 	fail := func(context.Context, agent.Job) (agent.Outcome, error) {
 		return agent.Outcome{Status: agent.StatusFailed, Reason: "turn-cap"}, nil
 	}
-	in := NewIntake(src, fail, "agent@k", 10, 1, time.Hour, nil)
+	in := NewIntake(src, fail, self, 10, 1, time.Hour, nil)
 	in.Start(context.Background())
 	in.scan(context.Background())
 	in.Shutdown()
@@ -294,7 +324,7 @@ func TestIntakeFailedJobDeliversItsExplanation(t *testing.T) {
 	fail := func(context.Context, agent.Job) (agent.Outcome, error) {
 		return agent.Outcome{Status: agent.StatusFailed, Reason: "budget", Explanation: "I ran out of credits."}, nil
 	}
-	in := NewIntake(src, fail, "agent@k", 10, 2, time.Hour, nil)
+	in := NewIntake(src, fail, self, 10, 2, time.Hour, nil)
 	in.Start(context.Background())
 	in.scan(context.Background())
 	in.Shutdown()
@@ -303,5 +333,43 @@ func TestIntakeFailedJobDeliversItsExplanation(t *testing.T) {
 	}
 	if args, ok := src.done("t2"); !ok || args["message"] != "I ran out of credits." || len(args) != 1 {
 		t.Fatalf("onward completion = %v, %v; want the explanation in the declared field alone", args, ok)
+	}
+}
+
+// The required caller is matched by principal, so the agent keeps serving under
+// a new handle. A task naming a party without its principal is never keyed or
+// run: an unnamed creating action would join one requester's threads across its
+// actions. A task from another kernel, which names no creating action, is served.
+func TestIntakeMatchesByPrincipal(t *testing.T) {
+	renamed := task("r1", "alice@k", "alice@k", "sys@k/message", map[string]any{"message": "hi"})
+	renamed.RequiredCaller.Address = "agent2@k"
+	nameless := task("n1", "bob@k", "bob@k", "sys@k/message", nil)
+	nameless.Requester.Principal = ""
+	unnamedAction := task("c1", "rooms@k", "alice@k", "rooms@k/post", map[string]any{"thread_id": "team"})
+	unnamedAction.CreatedBy.Principal = ""
+	remote := task("p1", "dave@p", "dave@p", "", nil)
+	remote.CreatedBy = juice.Name{}
+	src := &fakeSource{completed: map[string]map[string]any{}, tasks: []juice.Task{renamed, nameless, unnamedAction, remote}}
+	g := &gatedRun{release: make(chan struct{})}
+	close(g.release)
+	var skipped []string
+	in := NewIntake(src, g.run, self, 10, 4, time.Hour, func(ev string, f map[string]any) {
+		if ev == "task_skipped" {
+			skipped = append(skipped, f["task_id"].(string))
+		}
+	})
+	in.Start(context.Background())
+	in.scan(context.Background())
+	in.Shutdown()
+	if _, ok := src.done("r1"); !ok {
+		t.Fatal("a task for the agent's principal under a new handle must be served")
+	}
+	if _, ok := src.done("p1"); !ok {
+		t.Fatal("a task from another kernel, naming no creating action, must be served")
+	}
+	_, n1 := src.done("n1")
+	_, c1 := src.done("c1")
+	if n1 || c1 || g.count() != 2 || len(skipped) != 2 {
+		t.Fatalf("runs=%d skipped=%v: a task naming a party without its principal must be skipped", g.count(), skipped)
 	}
 }

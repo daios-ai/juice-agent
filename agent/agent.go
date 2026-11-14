@@ -605,7 +605,7 @@ func ParseLookup(res map[string]any) []Candidate {
 		if !ok {
 			continue
 		}
-		ref, _ := m["action"].(string)
+		ref := rowRef(m)
 		if ref == "" {
 			continue
 		}
@@ -687,6 +687,14 @@ func always(cfg Config, ref string) (Candidate, bool) {
 	return Candidate{}, false
 }
 
+// rowRef is a lookup row's action address. The row names the action as an
+// object (kernel API R3a); the address is what the model reads and selects.
+func rowRef(m map[string]any) string {
+	name, _ := m["action"].(map[string]any)
+	ref, _ := name["address"].(string)
+	return ref
+}
+
 // trimLookup rewrites a lookup result to carry only ref + description +
 // score per candidate, dropping the schemas that bloat the transcript.
 func trimLookup(res map[string]any) map[string]any {
@@ -697,7 +705,7 @@ func trimLookup(res map[string]any) map[string]any {
 		if !ok {
 			continue
 		}
-		slim := map[string]any{"action": m["action"], "description": m["description"]}
+		slim := map[string]any{"action": rowRef(m), "description": m["description"]}
 		if s, ok := m["score"]; ok {
 			slim["score"] = s
 		}

@@ -506,9 +506,9 @@ func indexOf(s []string, v string) int {
 
 func TestParseLookup(t *testing.T) {
 	res := map[string]any{"results": []any{
-		map[string]any{"action": "sys@k/time", "description": "current time", "input_schema": map[string]any{"type": "object"}},
+		map[string]any{"action": map[string]any{"address": "sys@k/time"}, "description": "current time", "input_schema": map[string]any{"type": "object"}},
 		map[string]any{"description": "no action ref — skipped"},
-		map[string]any{"action": "sys@k/web", "description": "fetch a page"},
+		map[string]any{"action": map[string]any{"address": "sys@k/web"}, "description": "fetch a page"},
 	}}
 	got := ParseLookup(res)
 	if len(got) != 2 {
@@ -598,7 +598,7 @@ func TestLookupResultMergesIntoWorkingSet(t *testing.T) {
 	cat := &fakeCatalog{seed: nil}
 	run := &recordingRunner{results: map[string]RunResult{
 		"sys@k/lookup": {Result: map[string]any{"results": []any{
-			map[string]any{"action": "sys@k/web", "description": "fetch"},
+			map[string]any{"action": map[string]any{"address": "sys@k/web"}, "description": "fetch"},
 		}}},
 	}}
 	tr := &memTranscript{}
@@ -678,7 +678,7 @@ func TestLookupResultTrimmedInTranscript(t *testing.T) {
 	}}
 	run := &recordingRunner{results: map[string]RunResult{
 		"sys@k/lookup": {Result: map[string]any{"results": []any{
-			map[string]any{"action": "sys@k/web", "description": "fetch",
+			map[string]any{"action": map[string]any{"address": "sys@k/web"}, "description": "fetch",
 				"input_schema": map[string]any{"type": "object", "properties": map[string]any{"url": map[string]any{}}}},
 		}}},
 	}}
