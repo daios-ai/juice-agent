@@ -41,7 +41,7 @@ func TestFirstStartWritesEveryKey(t *testing.T) {
 	if cfg.Login != "research@work" || cfg.Home != wantHome || cfg.PersonasDir != filepath.Join(wantHome, "personas") {
 		t.Fatalf("login=%q home=%q personas=%q", cfg.Login, cfg.Home, cfg.PersonasDir)
 	}
-	if cfg.MaxTurns != 32 || cfg.DefaultBudget != 100 || cfg.PollSeconds != 5 || cfg.Concurrency != 4 || !cfg.RateTasks {
+	if cfg.MaxTurns != 32 || cfg.DefaultBudget != 50000 || cfg.PollSeconds != 5 || cfg.Concurrency != 4 || !cfg.RateTasks {
 		t.Fatalf("defaults not applied: %+v", cfg)
 	}
 	// The affordances default to the natives of the login's own kernel.
@@ -158,7 +158,7 @@ func TestResolveConfigOverridesDefaultsAndRepairsPoll(t *testing.T) {
 	if err != nil {
 		t.Fatal(err)
 	}
-	if cfg.MaxTurns != 7 || cfg.DefaultBudget != 100 || cfg.Reason != "brain@k/think" || cfg.ActionLookup != "sys@k/lookup" {
+	if cfg.MaxTurns != 7 || cfg.DefaultBudget != 50000 || cfg.Reason != "brain@k/think" || cfg.ActionLookup != "sys@k/lookup" {
 		t.Fatalf("cfg = %+v, want max_turns 7 and reason swapped, the rest defaulted", cfg)
 	}
 	if cfg.PollSeconds != 5 || cfg.Concurrency != 4 {

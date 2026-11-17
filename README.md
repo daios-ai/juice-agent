@@ -30,7 +30,7 @@ matches the release's published checksum, installs it in `$JUICE_HOME/bin`, defa
 and adds the directory to your `PATH` in your shell profile. Options go after `sh -s --`:
 
 ```sh
-curl -fsSL https://raw.githubusercontent.com/daios-ai/juice-agent/main/install.sh | sh -s -- v0.11.0
+curl -fsSL https://raw.githubusercontent.com/daios-ai/juice-agent/main/install.sh | sh -s -- v0.11.1
 curl -fsSL https://raw.githubusercontent.com/daios-ai/juice-agent/main/install.sh | sh -s -- --no-modify-path
 ```
 
@@ -141,7 +141,7 @@ and invalid JSON prevent startup, and the error names the key. The file written 
   "$schema": "../../schemas/juice-agent.schema.json",
   "reason": "sys@work/llm/chat",
   "action_lookup": "sys@work/lookup",
-  "default_budget": 100,
+  "default_budget": 50000,
   "max_turns": 32,
   "concurrency": 4,
   "poll_seconds": 5,
@@ -320,6 +320,12 @@ Logs include job, persona, action, and transaction identifiers where applicable.
 event reports how much earlier history a job loaded. Conversation files under `personas/` retain
 the local record; `juice tx list --as <login>` shows the kernel's record of calls, charges, and ratings.
 
+## Upgrading from 0.11.0
+
+The default `default_budget` is now `50000` base units. An existing agent keeps the value written in
+its `config.json` (`100` for agents set up before this version); edit that file to adopt the new
+default.
+
 ## Upgrading from 0.10
 
 This version requires kernel contract 0.18. Conversations started before the upgrade begin anew:
@@ -381,7 +387,7 @@ Pushing a `v*` tag runs the release workflow, which builds the four platform arc
 `checksums.txt` and publishes them as the GitHub Release the installer downloads:
 
 ```sh
-git tag -a v0.11.0 -m v0.11.0 && git push origin v0.11.0
+git tag -a v0.11.1 -m v0.11.1 && git push origin v0.11.1
 ```
 
 ### Versions

@@ -46,7 +46,7 @@ type Config struct {
 func DefaultConfig() Config {
 	return Config{
 		Schema:        "../../schemas/juice-agent.schema.json", // agents/<login>/config.json → schemas/
-		DefaultBudget: 100,
+		DefaultBudget: 50000,
 		MaxTurns:      32,
 		Concurrency:   4,
 		PollSeconds:   5,

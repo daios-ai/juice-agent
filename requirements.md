@@ -1,6 +1,6 @@
 # Juice Agent Requirements
 
-Version: 0.11.0
+Version: 0.11.1
 Status: implementation requirements
 Codename: `juice-agent`
 Copyright (C) 2026 Pedro A. Ortega <pedro.ortega@gmail.com>
@@ -12,6 +12,9 @@ contract `juicedocs/requirements.md` and the ecosystem standard `juicedocs/ecosy
 A requirement here must violate neither. Citations use the kernel's own labels: *kernel §N* for a
 section, *kernel D/P/G/U N* for a design decision, protocol clause, guarantee, or user story, and
 *ecosystem §N* for the standard.
+
+Revision 0.11.1 raises the default `default_budget` from `100` to `50000` base units (§11); an
+existing `config.json` keeps the value written in it.
 
 Revision 0.11.0 resynchronises with the kernel contract 0.18. A reply names every party and action
 as an object, `{address, principal, nickname?}` (API R3a): the address is what a person or the model
@@ -538,7 +541,7 @@ by rename.
 | ---------------- | ------------------------ | ------------------------------------------------------------------------ |
 | `reason`         | none; first start writes `sys@<kernel>/llm/chat` | the reasoning affordance: any action meeting the reason contract         |
 | `action_lookup`  | none; first start writes `sys@<kernel>/lookup` | the action-lookup affordance: any action meeting its contract            |
-| `default_budget` | `100`                    | base units a job may spend — the primary runaway rail                    |
+| `default_budget` | `50000`                  | base units a job may spend — the primary runaway rail                    |
 | `max_turns`      | `32`                     | secondary rail bounding zero-price loops                                 |
 | `concurrency`    | `4`                      | worker-pool size: personas served at once                                |
 | `poll_seconds`   | `5`                      | interval between task polls                                              |
